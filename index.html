@@ -1,0 +1,131 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>JRA ダート高期待値AI予測</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body class="bg-gray-100 min-h-screen text-gray-800 pb-10">
+
+  <header class="bg-gradient-to-r from-blue-900 to-indigo-800 text-white p-4 shadow-lg sticky top-0 z-50">
+    <div class="max-w-md mx-auto flex justify-between items-center">
+      <h1 class="font-bold text-lg tracking-wide">&#127943; JRA Dirt AI Predictor</h1>
+      <span class="text-xs bg-emerald-500 text-white font-semibold px-2 py-0.5 rounded-full">3連複6点</span>
+    </div>
+  </header>
+
+  <main class="max-w-md mx-auto p-4 space-y-4">
+    <div class="bg-white rounded-xl p-4 shadow-sm border border-gray-200 space-y-3">
+      <div>
+        <p class="text-xs font-semibold text-gray-400">運用ステータス</p>
+        <p class="text-xs font-bold text-indigo-900">期待値ゾーン (0.61 &le; 軸確信度 &le; 0.76) 適用中</p>
+      </div>
+      <hr class="border-gray-100">
+      <button onclick="runTodayPrediction()" id="execBtn" class="w-full bg-gradient-to-r from-emerald-500 to-teal-600 hover:from-emerald-600 hover:to-teal-700 text-white font-bold text-sm py-3 px-4 rounded-xl shadow-md transition transform active:scale-95 flex justify-center items-center gap-2">
+        <span>&#128640;</span>
+        <span>本日の出馬表を取得してAI予測を実行</span>
+      </button>
+    </div>
+
+    <div id="summaryBar" class="hidden bg-emerald-50 border border-emerald-200 p-3 rounded-xl flex justify-between items-center text-xs text-emerald-800 font-bold">
+      <span>★ 本日の勝負対象レース</span>
+      <span id="matchCount" class="text-base text-emerald-600 font-black">0 件</span>
+    </div>
+
+    <div id="resultsContainer" class="space-y-3">
+      <div class="bg-white p-6 rounded-xl border border-dashed border-gray-300 text-center text-xs text-gray-400">
+        上の「本日の出馬表を取得」ボタンを押すと、AIが対象レースを自動解析してここに表示します。
+      </div>
+    </div>
+  </main>
+
+  <script>
+    window.addEventListener('DOMContentLoaded', fetchResults);
+
+    function runTodayPrediction() {
+      const btn = document.getElementById('execBtn');
+      const container = document.getElementById('resultsContainer');
+      btn.disabled = true;
+      btn.classList.add('opacity-50', 'cursor-not-allowed');
+      btn.innerHTML = '<span>&#9203;</span><span>出馬表を取得・AI予測中...</span>';
+      
+      container.innerHTML = `
+        <div class="bg-white p-6 rounded-xl border border-indigo-100 text-center space-y-2">
+          <div class="inline-block animate-spin text-2xl">&#128500;</div>
+          <p class="text-xs font-bold text-indigo-900">当日の出馬表を取得してAIが計算中...</p>
+        </div>`;
+
+      setTimeout(() => { checkLoop(); }, 3000);
+    }
+
+    function checkLoop() {
+      let attempts = 0;
+      const interval = setInterval(() => {
+        attempts++;
+        fetchResults((success) => {
+          if (success || attempts > 15) {
+            clearInterval(interval);
+            resetBtn();
+          }
+        });
+      }, 3000);
+    }
+
+    function resetBtn() {
+      const btn = document.getElementById('execBtn');
+      btn.disabled = false;
+      btn.classList.remove('opacity-50', 'cursor-not-allowed');
+      btn.innerHTML = '<span>&#128640;</span><span>本日の出馬表を取得してAI予測を実行</span>';
+    }
+
+    function fetchResults(callback) {
+      fetch(`today_betting_orders.json?t=${new Date().getTime()}`)
+        .then(res => {
+          if (!res.ok) throw new Error();
+          return res.json();
+        })
+        .then(data => {
+          renderCards(data);
+          if (callback) callback(true);
+        })
+        .catch(() => {
+          if (callback) callback(false);
+        });
+    }
+
+    function renderCards(data) {
+      const container = document.getElementById('resultsContainer');
+      const summaryBar = document.getElementById('summaryBar');
+      const matchCount = document.getElementById('matchCount');
+      container.innerHTML = '';
+
+      if (!data || data.length === 0) {
+        container.innerHTML = `<div class="bg-white p-6 rounded-xl border border-gray-200 text-center text-xs text-gray-500">本日の対象レースの中に勝負条件(0.61〜0.76)に当てはまるレースはありません。</div>`;
+        summaryBar.classList.add('hidden');
+        return;
+      }
+
+      summaryBar.classList.remove('hidden');
+      matchCount.textContent = `${data.length} 件`;
+
+      data.forEach(item => {
+        const betsHtml = item.bets.map(b => `<div class="bg-indigo-50 border border-indigo-100 py-1.5 rounded font-mono font-bold text-indigo-900 text-center text-xs">${b}</div>`).join('');
+        const card = `
+          <div class="bg-white rounded-xl p-4 shadow-md border-l-4 border-emerald-500 space-y-3">
+            <div class="flex justify-between items-center border-b pb-2">
+              <div><span class="text-xs font-semibold text-gray-400">RACE ID</span><p class="font-bold text-sm text-gray-900">${item.race_id}</p></div>
+              <div class="text-right"><span class="text-xs bg-emerald-100 text-emerald-800 font-bold px-2 py-0.5 rounded">勝負対象</span><p class="text-xs text-gray-500 mt-0.5">軸確信度: <span class="font-bold text-emerald-600">${item.axis_proba}</span></p></div>
+            </div>
+            <div class="grid grid-cols-2 gap-2 text-xs">
+              <div class="bg-amber-50 p-2.5 rounded-lg border border-amber-200"><span class="text-amber-800 font-bold block mb-0.5">軸馬 (1位評価)</span><span class="text-base font-black text-amber-900">馬番 【${item.axis_umaban}】</span></div>
+              <div class="bg-blue-50 p-2.5 rounded-lg border border-blue-200"><span class="text-blue-800 font-bold block mb-0.5">相手 (2-5位評価)</span><span class="text-sm font-bold text-blue-900">馬番 ${item.opponent_umabans.join(', ')}</span></div>
+            </div>
+            <div><span class="text-xs font-bold text-gray-600 block mb-1">【3連複 軸1頭相手4頭流し (全6点)】</span><div class="grid grid-cols-3 gap-1.5">${betsHtml}</div></div>
+          </div>`;
+        container.innerHTML += card;
+      });
+    }
+  </script>
+</body>
+</html>
