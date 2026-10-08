@@ -4,7 +4,7 @@ import lightgbm as lgb
 import os
 import json
 
-# 1. レースID（例: 202405010602）から YY/MM/DD と 競馬場名/R を生成
+# RACE ID (例: 202405010602) から YY/MM/DD 開催R を正確に解析
 def parse_race_id(race_id):
     s = str(race_id)
     if len(s) >= 12:
@@ -22,7 +22,6 @@ def parse_race_id(race_id):
         return race_date, formatted_date
     return "24/01/01", f"24/01/01 開催 {s}"
 
-# 2. モデル学習処理
 def train_model(historical_path="historical_race_data.csv"):
     if not os.path.exists(historical_path):
         raise FileNotFoundError("過去データが見つかりません。")
@@ -60,7 +59,6 @@ def train_model(historical_path="historical_race_data.csv"):
     
     return model, features
 
-# 3. 推論・蓄積・JSON書き出し
 def generate_today_predictions(today_path="today_races.csv", historical_path="historical_race_data.csv", min_proba=0.61, max_proba=0.76):
     model, features = train_model(historical_path)
     
@@ -69,13 +67,12 @@ def generate_today_predictions(today_path="today_races.csv", historical_path="hi
 
     today_df = pd.read_csv(today_path)
     
-    # 1. 開催データを historical_race_data.csv に蓄積追加
+    # 全データを蓄積
     hist_df = pd.read_csv(historical_path)
     new_records = today_df[~today_df['race_id'].isin(hist_df['race_id'])]
     if len(new_records) > 0:
         updated_hist = pd.concat([hist_df, new_records], ignore_index=True)
         updated_hist.to_csv(historical_path, index=False, encoding="utf-8-sig")
-        print(f"📊 新規全データ {len(new_records)} 件を蓄積しました。")
 
     for col in ['dist_diff', 'weight_change']:
         if col not in today_df.columns:
@@ -89,7 +86,7 @@ def generate_today_predictions(today_path="today_races.csv", historical_path="hi
 
     betting_results = []
 
-    # 降順（最新のレースから順）に処理
+    # RACE ID を降順（最新順）ソート
     unique_race_ids = sorted(today_df['race_id'].unique(), reverse=True)
 
     for race_id in unique_race_ids:
@@ -111,7 +108,6 @@ def generate_today_predictions(today_path="today_races.csv", historical_path="hi
 
             race_date, formatted_date = parse_race_id(race_id)
 
-            # 着順結果判定
             result_status = "PENDING"
             hit_bet = ""
             payout = 0
@@ -148,7 +144,7 @@ def generate_today_predictions(today_path="today_races.csv", historical_path="hi
     with open("today_betting_orders.json", "w", encoding="utf-8") as f:
         json.dump(betting_results, f, ensure_ascii=False, indent=2)
 
-    print(f"DONE: {len(betting_results)} 件の選定レースを最新順で JSON 出力しました。")
+    print(f"DONE: {len(betting_results)} 件の選定レースを最新順で JSON 出力完了。")
 
 if __name__ == "__main__":
     generate_today_predictions()
