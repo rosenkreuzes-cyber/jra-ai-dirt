@@ -110,12 +110,22 @@
       fetch(`today_betting_orders.json?t=${new Date().getTime()}`)
         .then(res => res.json())
         .then(data => {
-          // 本日と過去データ（日付基準）を分類
-          const todayStr = new Date().toISOString().slice(2, 10).replace(/-/g, '/');
-          allData.today = data.filter(item => item.race_date === todayStr || !item.race_date);
-          allData.history = data.filter(item => item.race_date && item.race_date !== todayStr);
+          // 本日のYY/MM/DD文字列を取得
+          const now = new Date();
+          const yy = String(now.getFullYear()).slice(2);
+          const mm = String(now.getMonth() + 1).padStart(2, '0');
+          const dd = String(now.getDate()).padStart(2, '0');
+          const todayStr = `${yy}/${mm}/${dd}`;
 
-          // 初回はデータが存在する方を優先表示
+          // 本日と過去データへ正しく振り分け
+          allData.today = data.filter(item => item.race_date === todayStr);
+          allData.history = data.filter(item => item.race_date !== todayStr);
+
+          // 最新順（Race ID / 日付の降順）に並び替え
+          allData.today.sort((a, b) => b.race_id.localeCompare(a.race_id));
+          allData.history.sort((a, b) => b.race_id.localeCompare(a.race_id));
+
+          // 本日予想が0件で過去データがある場合は自動で過去タブを表示
           if (allData.today.length === 0 && allData.history.length > 0) {
             switchTab('history');
           } else {
@@ -140,7 +150,7 @@
       if (!data || data.length === 0) {
         container.innerHTML = `
           <div class="bg-white p-6 rounded-xl border border-gray-200 text-center text-xs text-gray-500">
-            ${currentTab === 'today' ? '本日の対象レースはありません。' : '過去の履歴データはありません。'}
+            ${currentTab === 'today' ? '本日の勝負対象レースはありません（全件見送り）。' : '過去の選定データはありません。'}
           </div>`;
         summaryBar.classList.add('hidden');
         return;
@@ -156,7 +166,6 @@
           return `<div class="${bgClass} border border-indigo-100 py-1.5 rounded font-mono font-bold text-center text-xs">${b}</div>`;
         }).join('');
 
-        // 判定バッジ（的中・不的中・未確定）
         let statusBadge = '<span class="text-xs bg-emerald-100 text-emerald-800 font-bold px-2 py-0.5 rounded">勝負対象</span>';
         if (item.result_status === 'HIT') {
           statusBadge = `<span class="text-xs bg-red-500 text-white font-black px-2 py-0.5 rounded">🎯 的中 (+¥${item.payout})</span>`;
@@ -168,7 +177,7 @@
           <div class="bg-white rounded-xl p-4 shadow-md border-l-4 border-emerald-500 space-y-3">
             <div class="flex justify-between items-center border-b pb-2">
               <div>
-                <span class="text-xs font-bold text-indigo-900 block">${item.formatted_date || item.race_id}</span>
+                <span class="text-sm font-black text-indigo-900 block">${item.formatted_date}</span>
                 <span class="text-[10px] font-semibold text-gray-400">ID: ${item.race_id}</span>
               </div>
               <div class="text-right">
