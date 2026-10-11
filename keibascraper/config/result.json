@@ -88,54 +88,44 @@
         },{
             "col_name" : "diff_time",
             "alias": "着差",
-            "selector" : "null",
-            "post_func": {"name": "set_diff_time", "args": ["rank", "rap_time"]},
-            "var_type" : "real"    
-        },{
-            "col_name" : "passage_rank",
-            "alias": "通過順",
-            "selector" : "td:not([class])",
+            "selector" : "td:nth-of-type(9)",
             "var_type" : "text",
             "reg" : ".*"
         },{
+            "col_name" : "passage_rank",
+            "alias": "通過順",
+            "selector" : "td:nth-of-type(10)",
+            "var_type" : "text",
+            "reg" : ".*"
+        },{
+            "col_name" : "first_3f",
+            "alias": "テンの3F",
+            "selector" : "td:nth-of-type(11)",
+            "var_type": "real",
+            "reg" : "(\\d+.\\d+)"
+        },{
             "col_name" : "last_3f",
             "alias": "後3F",
-            "selector" : "td.txt_c span",
+            "selector" : "td:nth-of-type(12)",
             "var_type" : "real",
             "reg" : "(\\d+.\\d+)"
         },{
             "col_name": "weight",
             "alias": "馬体重",
-            "selector": "td:nth-of-type(12)",
+            "selector": "td:nth-of-type(14)",
             "var_type": "integer",
             "reg": "(\\d+)\\([+-]?\\d*\\)"
         },{
             "col_name": "weight_diff",
             "alias": "増減",
-            "selector": "td:nth-of-type(12)",
+            "selector": "td:nth-of-type(14)",
             "var_type": "integer",
             "reg": "\\d+\\(([+-]?\\d+)\\)"
         },{
-            "col_name": "trainer_id",
-            "alias": "厩舎ID",
-            "selector" : "td:nth-of-type(13) a",
-            "pre_func": {"name": "get_url", "args": ["trainer_id"]},
-            "var_type" : "text",
-            "reg" : "/trainer/result/recent/(\\w+)/"
-        },{
-            "col_name": "trainer_name",
-            "alias": "厩舎名",
-            "selector": "td:nth-of-type(13) a",
-            "pre_func": {"name": "get_title", "args": ["trainer_name"]},
-            "var_type": "text",
-            "reg" : "\\D+"
-        },{
-            "col_name": "prize",
-            "alias": "賞金（万円）",
-            "selector": "td.txt_r:last-child",
-            "post_func": {"name": "zero_fill", "args": ["prize"]},
-            "var_type": "real",
-            "reg" : "\\d{1,3},\\d{3}\\.\\d{1}|\\d{1,3}\\.\\d{1}"
+            "col_name" : "pace",
+            "alias": "走破ペース",
+            "selector": "null",
+            "var_type": "text"
         },{
             "col_name": "id", 
             "alias": "結果ID",
