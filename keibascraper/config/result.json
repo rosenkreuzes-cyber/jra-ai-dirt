@@ -88,44 +88,33 @@
         },{
             "col_name" : "diff_time",
             "alias": "着差",
-            "selector" : "td:nth-of-type(9)",
-            "var_type" : "text",
-            "reg" : ".*"
+            "selector": "td:nth-of-type(9)",
+            "var_type": "text",
+            "reg": ".*"
         },{
             "col_name" : "passage_rank",
             "alias": "通過順",
-            "selector" : "td:nth-of-type(10)",
-            "var_type" : "text",
-            "reg" : ".*"
-        },{
-            "col_name" : "first_3f",
-            "alias": "テンの3F",
-            "selector" : "td:nth-of-type(11)",
-            "var_type": "real",
-            "reg" : "(\\d+.\\d+)"
+            "selector": "td:nth-of-type(10)",
+            "var_type": "text",
+            "reg": ".*"
         },{
             "col_name" : "last_3f",
             "alias": "後3F",
-            "selector" : "td:nth-of-type(12)",
+            "selector" : "td.txt_c span",
             "var_type" : "real",
             "reg" : "(\\d+.\\d+)"
         },{
             "col_name": "weight",
             "alias": "馬体重",
-            "selector": "td:nth-of-type(14)",
+            "selector": "td:nth-of-type(12)",
             "var_type": "integer",
             "reg": "(\\d+)\\([+-]?\\d*\\)"
         },{
             "col_name": "weight_diff",
             "alias": "増減",
-            "selector": "td:nth-of-type(14)",
+            "selector": "td:nth-of-type(12)",
             "var_type": "integer",
             "reg": "\\d+\\(([+-]?\\d+)\\)"
-        },{
-            "col_name" : "pace",
-            "alias": "走破ペース",
-            "selector": "null",
-            "var_type": "text"
         },{
             "col_name": "id", 
             "alias": "結果ID",
