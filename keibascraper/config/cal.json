@@ -1,1 +1,19 @@
-
+{
+    "property": {
+        "entry": "cal",
+        "url": "https://sports.yahoo.co.jp/keiba/schedule/monthly?year={year}&month={month}",
+        "mode": "html",
+        "selector": "table.hr-tableSchedule tr > td.hr-tableSchedule__data > p",
+        "validator": "table.hr-tableSchedule tr > td.hr-tableSchedule__data > p"
+    },
+    "columns": [
+        {
+            "col_name": "race_id", 
+            "alias": "レースID",
+            "selector": "a",
+            "pre_func": {"name": "get_url", "args": ["race_id"]},
+            "var_type": "text",
+            "reg" : "/keiba/race/list/(\\d{8})"
+        }
+    ]
+}
