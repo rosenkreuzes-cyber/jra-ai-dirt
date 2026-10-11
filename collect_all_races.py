@@ -1,18 +1,29 @@
 import os
+import sys
 import time
 import random
 import json
 import pandas as pd
+
+# 念のためローカルの抽出済みKeibaScraperパスを検索してシステムパスに追加
+scraper_paths = [
+    os.path.abspath('extracted_scraper/KeibaScraper-main'),
+    os.path.abspath('.')
+]
+for p in scraper_paths:
+    if p not in sys.path and os.path.exists(os.path.join(p, 'keibascraper')):
+        sys.path.insert(0, p)
+
 import keibascraper
 
 try:
     from tqdm import tqdm
 except ImportError:
     import subprocess
-    subprocess.check_call(["pip", "install", "tqdm"])
+    subprocess.check_call([sys.executable, "-m", "pip", "install", "tqdm"])
     from tqdm import tqdm
 
-# 保存先フォルダとチェックポイントの定義
+# 保存先フォルダとチェックポイントの設定
 BASE_DIR = os.getcwd()
 DATA_DIR = os.path.join(BASE_DIR, "collected_all_races")
 os.makedirs(DATA_DIR, exist_ok=True)
@@ -20,8 +31,8 @@ CHECKPOINT_FILE = os.path.join(BASE_DIR, "processed_all_races.json")
 
 def load_all_processed_race_ids():
     """
-    【重要】すでにローカルにあるすべてのCSVファイルとJSONチェックポイントから
-    既存の `race_id` を全自動でスキャンし、二度と再取得させないためのセットを構築します。
+    既存のJSONチェックポイントおよび、すでに保存されている年別CSVファイルから
+    すべてのレースIDを自動スキャンして、二度と再取得させない（完璧なレジューム）ためのセットを構築します。
     """
     processed = set()
     
@@ -34,7 +45,7 @@ def load_all_processed_race_ids():
         except Exception:
             pass
             
-    # 2. collected_all_races フォルダ内の既存CSVからロード
+    # 2. 既存の年別CSVからも自動でレースIDをスキャン
     if os.path.exists(DATA_DIR):
         for filename in os.listdir(DATA_DIR):
             if filename.endswith(".csv") and "all_race_dataset" in filename:
@@ -54,16 +65,16 @@ def save_checkpoint(processed_set):
         json.dump(list(processed_set), f, ensure_ascii=False, indent=2)
 
 def main():
-    print("🚀 【完全レジューム対応】全レース一括収集スクリプトを開始します")
+    print("🚀 【完全決定版】レジューム対応・全レース一括収集パイプライン開始")
     print(f"📁 データ保存先: {DATA_DIR}")
     
     # 既存データをスキャンして既取得IDを完璧に把握
     processed_races = load_all_processed_race_ids()
     print(f"📌 既存のCSV/JSONから引き継いだ処理済みレース数: {len(processed_races)} 件\n")
 
-    # 2026年から2022年へ逆順で巡回
     start_year, end_year = 2022, 2026
     
+    # 2026年から2022年へ逆順で巡回
     for year in range(end_year, start_year - 1, -1):
         year_csv_path = os.path.join(DATA_DIR, f"all_race_dataset_{year}.csv")
         year_records = []
@@ -90,11 +101,9 @@ def main():
             if not race_ids:
                 continue
                 
-            # まだ処理していないレースがどれだけあるかフィルタリング
+            # まだ処理していないレースがどれだけあるか確認
             unprocessed_ids = [rid for rid in race_ids if rid not in processed_races]
-            
             if not unprocessed_ids:
-                # この月のレースはすべて取得済みの場合
                 continue
                 
             print(f"📅 【{year}年{month:02d}月】 未取得レース: {len(unprocessed_ids)}件 / 全{len(race_ids)}件")
@@ -149,7 +158,7 @@ def main():
                         save_checkpoint(processed_races)
                         continue
 
-        # 年ごとにCSVをまとめて上書き保存
+        # 年ごとにCSVをまとめて上書き保存（カスタマイズしたresult.jsonの項目が反映されます）
         if year_records:
             year_df = pd.concat(year_records, ignore_index=True).drop_duplicates(subset=["race_id", "horse_number"])
             year_df.to_csv(year_csv_path, index=False, encoding="utf-8-sig")
