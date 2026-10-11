@@ -1,0 +1,224 @@
+# load.py
+
+import time
+import random
+import requests
+from bs4 import UnicodeDammit
+
+try:
+    from curl_cffi import requests as browser_requests
+except ImportError:  # pragma: no cover - optional transport dependency may be absent
+    browser_requests = None
+
+from keibascraper.helper import load_config
+
+
+DEFAULT_HEADERS = {
+    'User-Agent': (
+        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
+        'AppleWebKit/537.36 (KHTML, like Gecko) '
+        'Chrome/124.0.0.0 Safari/537.36'
+    ),
+    'Accept': (
+        'text/html,application/xhtml+xml,application/xml;q=0.9,'
+        'image/avif,image/webp,image/apng,*/*;q=0.8'
+    ),
+    'Accept-Language': 'ja,en-US;q=0.9,en;q=0.8',
+    'Connection': 'keep-alive',
+}
+
+
+def load(data_type, entity_id):
+    """
+    Load data from netkeiba.com based on the specified data type and entity ID.
+    """
+    loaders = {
+        'entry': EntryLoader,
+        'odds': OddsLoader,
+        'result': ResultLoader,
+        'horse': HorseLoader,
+    }
+
+    loader_class = loaders.get(data_type)
+    if not loader_class:
+        raise ValueError(f"Unexpected data type: {data_type}")
+
+    loader = loader_class(entity_id)
+    return loader.load()
+
+def race_list(year:int, month:int) -> list:
+    """ collect arguments race id. """
+    calc = CalendarLoader(year, month)
+    return calc.load()
+
+
+def _create_session():
+    """Create an HTTP session that can reach netkeiba's Akamai-protected DB pages."""
+    if browser_requests is not None:
+        session = browser_requests.Session(impersonate='chrome124')
+    else:
+        session = requests.Session()
+    session.headers.update(DEFAULT_HEADERS)
+    return session
+
+
+def _response_text(response):
+    """Return response text with reliable Japanese encoding detection across transports."""
+    apparent_encoding = getattr(response, 'apparent_encoding', None)
+    if apparent_encoding:
+        response.encoding = apparent_encoding
+        return response.text
+
+    content = getattr(response, 'content', None)
+    if content:
+        return UnicodeDammit(content).unicode_markup
+
+    return response.text
+
+
+class BaseLoader:
+    def __init__(self, entity_id):
+        self.entity_id = entity_id
+        self.session = _create_session()
+
+    def create_url(self, base_url):
+        return base_url.replace('{ID}', self.entity_id)
+
+    def load_contents(self, url):
+        time.sleep(random.uniform(2, 3))
+        headers = {'Referer': self._referer_for(url)}
+
+        try:
+            response = self.session.get(url, headers=headers, timeout=20)
+            response.raise_for_status()
+            return _response_text(response)
+        except Exception as e:
+            raise RuntimeError(f"Failed to load contents from {url}") from e
+
+    def _referer_for(self, url):
+        if 'db.netkeiba.com' in url:
+            return 'https://db.netkeiba.com/'
+        if 'race.netkeiba.com' in url:
+            return 'https://race.netkeiba.com/'
+        return 'https://www.netkeiba.com/'
+
+    def parse_with_error_handling(self, parse_funcs):
+        results = []
+        for parse_func, args in parse_funcs:
+            try:
+                result = parse_func(*args)
+                results.append(result)
+            except RuntimeError as e:
+                raise RuntimeError(f"Failed to parse data for {self.entity_id}: {e}") from e
+        return results
+
+
+class EntryLoader(BaseLoader):
+    def load(self):
+        from keibascraper.parse import parse_html
+
+        config = load_config('entry')
+        url = self.create_url(config['property']['url'])
+        content = self.load_contents(url)
+
+        parse_funcs = [
+            (parse_html, ('race', content, self.entity_id)),
+            (parse_html, ('entry', content, self.entity_id))
+        ]
+        race, entry = self.parse_with_error_handling(parse_funcs)
+
+        return race, entry
+
+
+class OddsLoader(BaseLoader):
+    def load(self):
+        from keibascraper.parse import parse_json
+
+        config = load_config('odds')
+        url = self.create_url(config['property']['url'])
+        content = self.load_contents(url)
+
+        parse_funcs = [
+            (parse_json, ('odds', content, self.entity_id))
+        ]
+        odds_data, = self.parse_with_error_handling(parse_funcs)
+        return odds_data
+
+
+class ResultLoader(BaseLoader):
+    def load(self):
+        from keibascraper.parse import parse_html
+
+        config = load_config('result')
+        url = self.create_url(config['property']['url'])
+        content = self.load_contents(url)
+
+        parse_funcs = [
+            (parse_html, ('race_db', content, self.entity_id)),
+            (parse_html, ('result', content, self.entity_id))
+        ]
+        race, entry = self.parse_with_error_handling(parse_funcs)
+
+        return race, entry
+
+
+class HorseLoader(BaseLoader):
+    def load(self):
+        from keibascraper.parse import parse_html
+
+        horse_config = load_config('horse')
+        horse_url = self.create_url(horse_config['property']['url'])
+        horse_content = self.load_contents(horse_url)
+
+        history_config = load_config('history')
+        history_url = self.create_url(history_config['property']['url'])
+        history_content = self.load_contents(history_url)
+
+        parse_funcs = [
+            (parse_html, ('horse', horse_content, self.entity_id)),
+            (parse_html, ('history', history_content, self.entity_id))
+        ]
+        horse, history = self.parse_with_error_handling(parse_funcs)
+
+        return horse, history
+
+
+class CalendarLoader:
+    def __init__(self, year, month):
+        self.year = year
+        self.month = month
+
+    def load(self):
+        from keibascraper.parse import parse_html
+
+        url = f"https://sports.yahoo.co.jp/keiba/schedule/monthly?year={self.year}&month={self.month}"
+        content = self.load_contents(url)
+        race_ids = parse_html('cal', content)
+        return self.expand_race_ids(race_ids)
+
+    def load_contents(self, url):
+        try:
+            headers = dict(DEFAULT_HEADERS)
+            headers['Referer'] = 'https://sports.yahoo.co.jp/'
+            response = requests.get(url, headers=headers, timeout=20)
+            response.raise_for_status()
+            return _response_text(response)
+        except requests.RequestException as e:
+            raise RuntimeError(f"Failed to load contents from {url}") from e
+    
+    def expand_race_ids(self, input_data):
+        race_ids = []
+        for item in input_data:
+            race_id = item.get('race_id')
+            if not race_id:
+                print(f"Warning: Item {item} does not contain 'race_id'. Skipping.")
+                continue
+            
+            if len(race_id) == 8:
+                base_id = '20' + race_id
+                expanded_ids = [f"{base_id}{str(i).zfill(2)}" for i in range(1, 13)]
+                race_ids.extend(expanded_ids)
+            else:
+                print(f"Warning: race_id '{race_id}' has invalid length ({len(race_id)}). Skipping.")
+        
+        return race_ids
