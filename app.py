@@ -53,10 +53,11 @@ st.markdown("""
 st.title("🏇 JRA 黄金パターン AI ダッシュボード")
 st.caption("1頭軸マルチ（12点買い）＆ 結果・配当トラッカー")
 
-# --- サイドバー設定 ---
+# --- サイドバー設定（オッズ取得スイッチ ＆ 資金配分） ---
 with st.sidebar:
     st.header("⚙️ 運用・資金設定")
     
+    st.subheader("📊 オッズ取得モード")
     odds_mode = st.radio(
         "取得タイミングを選択",
         ["当日朝 7:00 時点固定", "一括手動取得（ボタン実行）"]
@@ -142,7 +143,7 @@ for r in races:
     </div>
     """, unsafe_allow_html=True)
     
-    # マークダウン形式のテーブルを作成して綺麗に一望表示
+    # マークダウン形式のテーブルで綺麗に一望表示
     table_markdown = "| 買い目 | 点数 | 予測オッズ |\n|:---:|:---:|:---:|\n"
     for bet, odds in zip(bets, dummy_odds):
         table_markdown += f"| **{bet}** | 1点 | {odds} |\n"
