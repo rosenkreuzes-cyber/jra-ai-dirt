@@ -35,21 +35,21 @@ st.markdown("""
 
 # --- タイトル ---
 st.title("🏇 JRA 黄金パターン AI ダッシュボード")
-st.caption("3連複 1頭軸流しフォーメーション（相手4頭 = 6点）専用アシスタント")
+st.caption("3連複 1頭軸流し（相手4頭 = 6点）専用アシスタント")
 
 # --- 軸1頭・相手4頭から6点（軸-相手A-相手B）の組み合わせを生成する関数 ---
 def generate_formation_bets(axis, others):
-    # 相手4頭から2頭を選ぶ組み合わせ（4C2 = 6通り）を生成
     combinations = []
     for pair in itertools.combinations(others, 2):
         comb = sorted([pair[0], pair[1]])
         combinations.append(f"{axis} - {comb[0]} - {comb[1]}")
     return combinations
 
-# レースデータの定義（軸馬 1頭 ＆ 相手 4頭）
+# レースデータの定義（開催日：土曜/日曜を明記）
 races = [
     {
         "title": "📍 東京 10R - 3歳以上2勝クラス",
+        "day": "📅 10月17日(土) 開催",
         "axis": 4,
         "axis_name": "テイエムスパーダ (6番人気)",
         "others": [2, 7, 9, 12],
@@ -57,6 +57,7 @@ races = [
     },
     {
         "title": "📍 中山 11R - アケボノ賞",
+        "day": "📅 10月17日(土) 開催",
         "axis": 12,
         "axis_name": "ゴールドバローズ (7番人気)",
         "others": [1, 3, 5, 8],
@@ -64,6 +65,7 @@ races = [
     },
     {
         "title": "📍 京都 11R - プロキオンステークス(G3)",
+        "day": "📅 10月18日(日) 開催",
         "axis": 7,
         "axis_name": "ヤマニンウルス (2番人気)",
         "others": [4, 6, 11, 14],
@@ -81,7 +83,7 @@ with st.sidebar:
     total_races = len(races)
     total_points = total_races * 6
     st.markdown(f"**1レースあたり:** {6 * bet_unit} 円 (6点)")
-    st.markdown(f"**総投資額 (3レース分):** {total_points * bet_unit} 円")
+    st.markdown(f"**総投資額 (全レース):** {total_points * bet_unit} 円")
 
 # 各レースの表示
 for r in races:
@@ -89,17 +91,18 @@ for r in races:
     
     st.markdown(f"""
     <div class="race-card">
-        <h3>{r["title"]}</h3>
+        <span style="background-color: #2d3748; color: #63b3ed; padding: 2px 8px; border-radius: 4px; font-size: 0.75rem; font-weight: bold;">{r["day"]}</span>
+        <h3 style="margin-top: 8px;">{r["title"]}</h3>
         <p style='margin: 4px 0; font-size: 0.85rem; color: #a0aec0;'>
-            <b>🔥 軸馬:</b> 馬番 <b>{r["axis"]}番</b> ({r["axis_name"]})<br>
-            <b>🎯 相手:</b> 馬番 {r["others"]} （フォーメーション合計 <b>6点</b>）
+            <b>🔥 1頭軸:</b> 馬番 <b>{r["axis"]}番</b> ({r["axis_name"]})<br>
+            <b>🎯 相手:</b> 馬番 {r["others"]} （1頭軸流し <b>6点買い</b>）
         </p>
     </div>
     """, unsafe_allow_html=True)
     
     # 6点の買い目テーブルを作成
     df_bets = pd.DataFrame({
-        '式別': ['3連複 (軸1頭流し)'] * 6,
+        '式別': ['3連複 (1頭軸流し)'] * 6,
         '買い目 (軸 - 相手 - 相手)': bets,
         '点数': [1] * 6,
         '予測オッズ': r["odds_sample"]
