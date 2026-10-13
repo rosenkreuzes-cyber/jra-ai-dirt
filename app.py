@@ -1,5 +1,4 @@
 import streamlit as st
-import pandas as pd
 import itertools
 
 # ページのレイアウト設定
@@ -9,7 +8,7 @@ st.set_page_config(
     layout="centered"
 )
 
-# --- カスタムCSS ---
+# --- カスタムCSS（スマホで見やすいスタイル・スクロール排除） ---
 st.markdown("""
 <style>
     .main {
@@ -28,7 +27,7 @@ st.markdown("""
         padding: 15px;
         border-radius: 10px;
         border-left: 5px solid #ff4b4b;
-        margin-bottom: 20px;
+        margin-bottom: 15px;
     }
     .result-box {
         background-color: #111827;
@@ -46,6 +45,30 @@ st.markdown("""
         font-size: 0.75rem;
         font-weight: bold;
         float: right;
+    }
+    /* テーブル全体のデザイン（スクロールなしで全表示） */
+    .bet-table {
+        width: 100%;
+        border-collapse: collapse;
+        background-color: #161b22;
+        color: #ffffff;
+        font-size: 0.85rem;
+        margin-top: 8px;
+        margin-bottom: 8px;
+        border-radius: 6px;
+        overflow: hidden;
+    }
+    .bet-table th {
+        background-color: #21262d;
+        color: #f6e05e;
+        padding: 8px;
+        text-align: center;
+        border-bottom: 1px solid #30363d;
+    }
+    .bet-table td {
+        padding: 7px 8px;
+        text-align: center;
+        border-bottom: 1px solid #21262d;
     }
 </style>
 """, unsafe_allow_html=True)
@@ -79,34 +102,13 @@ with st.sidebar:
 
 # --- 1頭軸マルチ（12点）の組み合わせ生成関数 ---
 def generate_mult_bets(axis, others):
-    combinations = set()
-    # 相手4頭から2頭を選ぶすべての組み合わせ（4C2 = 6通り）に対し、
-    # 軸が1着・2着・3着に分かれるマルチの組み合わせ（計12点）を生成
-    for p1, p2 in itertools.combinations(others, 2):
-        combinations.add(tuple(sorted([axis, p1, p2])))
-        # マルチの順列を網羅するため、軸を入れ替えたパターンも考慮
-        combinations.add(tuple(sorted([p1, axis, p2])))
-        combinations.add(tuple(sorted([p1, p2, axis])))
-    
-    # 3連複の組み合わせ（順不同の3頭のセット）として12点になるように調整
-    # 軸1頭(固定) + 相手4頭から2頭 = 12通り
-    mult_list = []
-    for pair in itertools.combinations(others, 2):
-        # 3連複の1頭軸マルチは、軸を必ず含む3頭の組み合わせが12通り展開されます
-        pass
-    
-    # 確実に12点を作るロジック
     final_bets = []
-    # 軸馬と相手から2頭を選ぶ組み合わせをベースに12行を作成
-    for i, p1 in enumerate(others):
-        for j, p2 in enumerate(others):
+    for p1 in others:
+        for p2 in others:
             if p1 < p2:
                 final_bets.append(f"{axis} - {p1} - {p2}")
                 final_bets.append(f"{p1} - {axis} - {p2}")
-    
-    # 重複削除して12点にスライス
-    unique_bets = sorted(list(set(final_bets)))[:12]
-    return unique_bets
+    return sorted(list(set(final_bets)))[:12]
 
 # レースデータの定義
 races = [
@@ -150,6 +152,7 @@ st.subheader("🎯 本日の推奨レース（1頭軸マルチ 12点買い）")
 
 for r in races:
     bets = generate_mult_bets(r["axis"], r["others"])
+    dummy_odds = [f"{40.0 + i * 10.5:.1f}倍" for i in range(len(bets))]
     
     st.markdown(f"""
     <div class="race-card">
@@ -163,17 +166,26 @@ for r in races:
     </div>
     """, unsafe_allow_html=True)
     
-    # データの長さを完全に一致させるため、生成されたbetsの数に合わせてダミーオッズを動的生成
-    dummy_odds = [f"{40.0 + i * 10.5:.1f}倍" for i in range(len(bets))]
+    # HTMLテーブルで直に描画することで、スクロールバーを完全に排除して12点すべてを一望
+    table_html = """
+    <table class="bet-table">
+        <tr>
+            <th>買い目</th>
+            <th>点数</th>
+            <th>予測オッズ</th>
+        </tr>
+    """
+    for bet, odds in zip(bets, dummy_odds):
+        table_html += f"""
+        <tr>
+            <td><b>{bet}</b></td>
+            <td>1点</td>
+            <td>{odds}</td>
+        </tr>
+        """
+    table_html += "</table>"
     
-    df_bets = pd.DataFrame({
-        '買い目': bets,
-        '点数': [1] * len(bets),
-        '予測オッズ': dummy_odds
-    })
-    
-    # 幅の指定を安全な形式に変更
-    st.dataframe(df_bets, use_container_width=True, hide_index=True)
+    st.markdown(table_html, unsafe_allow_html=True)
     
     # レース結果 ＆ 配当金表示枠
     st.markdown(f"""
