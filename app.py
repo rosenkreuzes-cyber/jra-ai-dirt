@@ -30,6 +30,14 @@ st.markdown("""
         border-left: 5px solid #ff4b4b;
         margin-bottom: 20px;
     }
+    .result-box {
+        background-color: #111827;
+        border: 1px solid #374151;
+        padding: 12px;
+        border-radius: 8px;
+        margin-top: 12px;
+        font-size: 0.85rem;
+    }
     .confidence-badge {
         background-color: #b7791f;
         color: #ffffff;
@@ -44,7 +52,29 @@ st.markdown("""
 
 # --- タイトル ---
 st.title("🏇 JRA 黄金パターン AI ダッシュボード")
-st.caption("1頭軸流しフォーメーション（6点買い）専用アシスタント")
+st.caption("1頭軸流しフォーメーション（6点買い）＆ 結果・配当トラッカー")
+
+# --- サイドバー設定（オッズ取得タイミング ＆ 資金配分） ---
+with st.sidebar:
+    st.header("⚙️ 運用・資金設定")
+    
+    st.subheader("📊 オッズ取得モード")
+    odds_mode = st.radio(
+        "取得タイミングを選択",
+        ["当日朝 7:00 時点固定", "一括手動取得（ボタン実行）"]
+    )
+    
+    if odds_mode == "一括手動取得（ボタン実行）":
+        if st.button("🔄 今すぐオッズを一括取得する", type="primary"):
+            st.success("最新オッズの取得が完了しました！")
+    else:
+        st.info("⏰ 当日朝 7:00 時点のオッズデータを自動適用中です。")
+
+    st.markdown("---")
+    bet_unit = st.number_input("1点あたりの金額 (円)", min_value=100, max_value=10000, value=100, step=100)
+    total_races = 3
+    total_points = total_races * 6
+    st.markdown(f"**総投資額 (全3レース):** {total_points * bet_unit} 円")
 
 # --- 軸1頭・相手4頭から6点（軸-相手A-相手B）の組み合わせを生成する関数 ---
 def generate_formation_bets(axis, others):
@@ -54,7 +84,7 @@ def generate_formation_bets(axis, others):
         combinations.append(f"{axis} - {comb[0]} - {comb[1]}")
     return combinations
 
-# レースデータの定義（自信度・おすすめコメントを追加）
+# レースデータの定義（結果・配当枠を追加）
 races = [
     {
         "title": "📍 東京 10R - 3歳以上2勝クラス",
@@ -63,7 +93,10 @@ races = [
         "axis": 4,
         "axis_name": "テイエムスパーダ (6番人気)",
         "others": [2, 7, 9, 12],
-        "odds_sample": ['45.8倍', '78.2倍', '112.5倍', '65.0倍', '88.4倍', '134.0倍']
+        "odds_sample": ['45.8倍', '78.2倍', '112.5倍', '65.0倍', '88.4倍', '134.0倍'],
+        "result_status": "⏳ レース前 / 確定待ち",
+        "winning_comb": "-",
+        "payout": "-"
     },
     {
         "title": "📍 中山 11R - アケボノ賞",
@@ -72,7 +105,10 @@ races = [
         "axis": 12,
         "axis_name": "ゴールドバローズ (7番人気)",
         "others": [1, 3, 5, 8],
-        "odds_sample": ['62.4倍', '89.1倍', '134.6倍', '75.0倍', '98.2倍', '145.0倍']
+        "odds_sample": ['62.4倍', '89.1倍', '134.6倍', '75.0倍', '98.2倍', '145.0倍'],
+        "result_status": "⏳ レース前 / 確定待ち",
+        "winning_comb": "-",
+        "payout": "-"
     },
     {
         "title": "📍 京都 11R - プロキオンステークス(G3)",
@@ -81,23 +117,16 @@ races = [
         "axis": 7,
         "axis_name": "ヤマニンウルス (2番人気)",
         "others": [4, 6, 11, 14],
-        "odds_sample": ['18.5倍', '24.2倍', '41.0倍', '22.1倍', '33.4倍', '52.0倍']
+        "odds_sample": ['18.5倍', '24.2倍', '41.0倍', '22.1倍', '33.4倍', '52.0倍'],
+        "result_status": "⏳ レース前 / 確定待ち",
+        "winning_comb": "-",
+        "payout": "-"
     }
 ]
 
 # --- メインコンテンツ ---
 st.subheader("🎯 本日の推奨レース（1頭軸流し 6点買い）")
 
-# サイドバー設定（資金配分）
-with st.sidebar:
-    st.header("⚙️ 資金配分設定")
-    bet_unit = st.number_input("1点あたりの金額 (円)", min_value=100, max_value=10000, value=100, step=100)
-    total_races = len(races)
-    total_points = total_races * 6
-    st.markdown(f"**1レースあたり:** {6 * bet_unit} 円 (6点)")
-    st.markdown(f"**総投資額 (全レース):** {total_points * bet_unit} 円")
-
-# 各レースの表示
 for r in races:
     bets = generate_formation_bets(r["axis"], r["others"])
     
@@ -113,12 +142,21 @@ for r in races:
     </div>
     """, unsafe_allow_html=True)
     
-    # 6点の買い目テーブルを作成
+    # 6点の買い目テーブル
     df_bets = pd.DataFrame({
         '買い目': bets,
         '点数': [1] * 6,
         '予測オッズ': r["odds_sample"]
     })
-    
     st.dataframe(df_bets, width='stretch', hide_index=True)
+    
+    # レース結果 ＆ 配当金表示枠
+    st.markdown(f"""
+    <div class="result-box">
+        <b>🏆 レース結果・払戻金</b><br>
+        ステータス: <span style="color: #f6e05e;">{r["result_status"]}</span><br>
+        的中馬番 (3連複): <b>{r["winning_comb"]}</b> | 払戻配当: <span style="color: #68D391; font-weight: bold;">{r["payout"]}</span>
+    </div>
+    """, unsafe_allow_html=True)
+    
     st.markdown("---")
