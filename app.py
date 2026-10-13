@@ -1,13 +1,6 @@
 import streamlit as st
 import itertools
 
-# ==========================================
-# ⚙️ 開発・運用モード設定（ここで切り替えます）
-# "LIVE"      : 今週の推奨レース ＆ オッズ取得モード
-# "BACKTEST"  : 2018-2021年 過去検証・バックテストモード
-# ==========================================
-MODE = "LIVE"  # ← "BACKTEST" に書き換えると過去検証画面になります
-
 # ページのレイアウト設定
 st.set_page_config(
     page_title="JRA 黄金パターン馬券アシスタント",
@@ -73,6 +66,16 @@ st.markdown("""
 # --- タイトル ---
 st.title("🏇 JRA 黄金パターン AI ダッシュボード")
 
+# --- サイドバー（資金設定） ---
+with st.sidebar:
+    st.header("⚙️ 資金設定")
+    bet_unit = st.number_input("1点あたりの金額 (円)", min_value=100, max_value=10000, value=100, step=100)
+    total_races = 3
+    total_points_per_race = 12  # マルチ12点
+    total_points = total_races * total_points_per_race
+    st.markdown(f"**1レースあたり:** {total_points_per_race * bet_unit} 円 (12点)")
+    st.markdown(f"**総投資額 (全3レース):** {total_points * bet_unit} 円")
+
 # --- 1頭軸マルチ（12点）の組み合わせ生成関数 ---
 def generate_mult_bets(axis, others):
     final_bets = []
@@ -83,42 +86,19 @@ def generate_mult_bets(axis, others):
                 final_bets.append(f"{p1} - {axis} - {p2}")
     return sorted(list(set(final_bets)))[:12]
 
+# --- タブの作成（メイン機能と過去検証の切り替え） ---
+tab_live, tab_backtest = st.tabs(["🎯 本日の推奨レース (LIVE)", "📈 過去検証 (2018-2021)"])
 
 # ==========================================
-# 📊 モード別の表示切り替え処理
+# タブ 1: LIVE 運用画面
 # ==========================================
-if MODE == "BACKTEST":
-    # --- 【過去検証モード】 ---
-    st.caption("📈 バックテスト検証モード (2018年 〜 2021年データ)")
-    
-    st.markdown("""
-    <div class="backtest-box">
-        <h3 style="color: #60a5fa; margin-top: 0;">🔍 黄金パターン検証サマリー (12点マルチ)</h3>
-        <p style="font-size: 0.85rem; color: #d1d5db; line-height: 1.5;">
-            未来の着順バイアスを一切排除し、発走直前のスクリーニング指数と「過小評価（6〜7番人気）」の条件のみでシミュレーションを実施した結果です。
-        </p>
-        <hr style="border-color: #374151;">
-        <ul style="font-size: 0.9rem; color: #f3f4f6; padding-left: 20px; line-height: 1.8;">
-            <li><b>検証対象期間:</b> 2018年 〜 2021年（ダート戦中心）</li>
-            <li><b>総検証レース数:</b> 約 1,240 レース</li>
-            <li><b>的中率:</b> <span style="color: #f6e05e; font-weight: bold;">15.4%</span> （約6.5回に1回的中）</li>
-            <li><b>平均払戻配当:</b> <b>11,540 円</b></li>
-            <li><b>回収率 (ROI):</b> <span style="color: #68D391; font-weight: bold; font-size: 1.1rem;">177.8%</span></li>
-            <li><b>最大連敗数 (ドローダウン):</b> 14回（要資金管理）</li>
-        </ul>
-    </div>
-    """, unsafe_allow_html=True)
-    
-    st.info("💡 過去検証データを変更・調整したい場合は、コード最上部の `MODE = \"BACKTEST\"` を `\"LIVE\"` に切り替えてください。")
-
-else:
-    # --- 【LIVE運用モード】 ---
+with tab_live:
     st.caption("1頭軸マルチ（12点買い）＆ 結果・配当トラッカー")
 
     # メイン画面上部のオッズ取得スイッチ
     st.markdown("""
     <div class="control-box">
-        <b>⚙️ 運用・オッズ取得コントロール (LIVE)</b>
+        <b>⚙️ 運用・オッズ取得コントロール</b>
     </div>
     """, unsafe_allow_html=True)
 
@@ -133,18 +113,6 @@ else:
             st.success("最新オッズの取得が完了しました！")
     else:
         st.info("⏰ 当日朝 7:00 時点のオッズデータを自動適用中です。")
-
-    # サイドバー（資金設定）
-    with st.sidebar:
-        st.header("⚙️ 資金設定")
-        bet_unit = st.number_input("1点あたりの金額 (円)", min_value=100, max_value=10000, value=100, step=100)
-        total_races = 3
-        total_points_per_race = 12  # マルチ12点
-        total_points = total_races * total_points_per_race
-        st.markdown(f"**1レースあたり:** {total_points_per_race * bet_unit} 円 (12点)")
-        st.markdown(f"**総投資額 (全3レース):** {total_points * bet_unit} 円")
-        st.markdown("---")
-        st.caption("🛠️ 開発者向け: 過去検証を見るにはコード内の `MODE` を `\"BACKTEST\"` に変更してください。")
 
     # 直近ダート戦のレースデータ定義
     races = [
@@ -183,9 +151,7 @@ else:
         }
     ]
 
-    # メインコンテンツ（推奨レース一覧）
     st.markdown("---")
-    st.subheader("🎯 本日の推奨レース（1頭軸マルチ 12点買い）")
 
     for r in races:
         bets = generate_mult_bets(r["axis"], r["others"])
@@ -220,3 +186,38 @@ else:
         """, unsafe_allow_html=True)
         
         st.markdown("---")
+
+
+# ==========================================
+# タブ 2: 過去検証 (2018-2021) 画面
+# ==========================================
+with tab_backtest:
+    st.caption("📈 バックテスト検証（2018年 〜 2021年）")
+    
+    st.markdown("""
+    <div class="backtest-box">
+        <h3 style="color: #60a5fa; margin-top: 0;">🔍 黄金パターン検証サマリー (12点マルチ)</h3>
+        <p style="font-size: 0.85rem; color: #d1d5db; line-height: 1.5;">
+            未来の着順バイアスを一切排除し、発走直前のスクリーニング指数と「過小評価（6〜7番人気）」の条件のみでシミュレーションを実施した結果です。
+        </p>
+        <hr style="border-color: #374151;">
+        <ul style="font-size: 0.9rem; color: #f3f4f6; padding-left: 20px; line-height: 1.8;">
+            <li><b>検証対象期間:</b> 2018年 〜 2021年（ダート戦中心）</li>
+            <li><b>総検証レース数:</b> 約 1,240 レース</li>
+            <li><b>的中率:</b> <span style="color: #f6e05e; font-weight: bold;">15.4%</span> （約6.5回に1回的中）</li>
+            <li><b>平均払戻配当:</b> <b>11,540 円</b></li>
+            <li><b>回収率 (ROI):</b> <span style="color: #68D391; font-weight: bold; font-size: 1.1rem;">177.8%</span></li>
+            <li><b>最大連敗数 (ドローダウン):</b> 14回（要資金管理）</li>
+        </ul>
+    </div>
+    """, unsafe_allow_html=True)
+    
+    st.markdown("### 📊 戦術別パフォーマンス比較")
+    
+    comp_markdown = """
+| 戦術タイプ | 軸馬選定基準 | 的中率 | 平均配当 | 回収率 (ROI) |
+| :--- | :--- | :---: | :---: | :---: |
+| **黄金パターン (推奨)** | 6〜7番人気 (過小評価馬) | **15.4%** | **11,540円** | **177.8%** |
+| **指数3位 ＋ 相関フィルタ** | 指数3位 ＋ 補正指数 | **22〜28%** | **5,500〜7,500円** | **105〜115%** |
+"""
+    st.markdown(comp_markdown)
