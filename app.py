@@ -52,7 +52,7 @@ st.markdown("""
 
 # --- タイトル ---
 st.title("🏇 JRA 黄金パターン AI ダッシュボード")
-st.caption("1頭軸マルチフォーメーション（12点買い）＆ 結果・配当トラッカー")
+st.caption("1頭軸フォーメーション（6点買い）＆ 結果・配当トラッカー")
 
 # --- サイドバー設定（オッズ取得タイミング ＆ 資金配分） ---
 with st.sidebar:
@@ -73,21 +73,20 @@ with st.sidebar:
     st.markdown("---")
     bet_unit = st.number_input("1点あたりの金額 (円)", min_value=100, max_value=10000, value=100, step=100)
     total_races = 3
-    total_points_per_race = 12  # マルチ12点
+    total_points_per_race = 6  # 1頭軸・相手4頭 = 6点
     total_points = total_races * total_points_per_race
-    st.markdown(f"**1レースあたり:** {total_points_per_race * bet_unit} 円 (12点)")
+    st.markdown(f"**1レースあたり:** {total_points_per_race * bet_unit} 円 (6点)")
     st.markdown(f"**総投資額 (全3レース):** {total_points * bet_unit} 円")
 
-# --- 軸1頭・相手4頭からマルチ12点の組み合わせを生成する関数 ---
-def generate_mult_bets(axis, others):
-    # 軸が必ず絡む3頭の組み合わせを全自動生成（相手4頭から2頭を選ぶ）
+# --- 軸1頭・相手4頭から6点（軸-相手A-相手B）の組み合わせを生成する関数 ---
+def generate_formation_bets(axis, others):
     combinations = []
     for pair in itertools.combinations(others, 2):
-        comb = sorted([axis, pair[0], pair[1]])
-        combinations.append(f"{comb[0]} - {comb[1]} - {comb[2]}")
-    return sorted(list(set(combinations)))
+        comb = sorted([pair[0], pair[1]])
+        combinations.append(f"{axis} - {comb[0]} - {comb[1]}")
+    return combinations
 
-# レースデータの定義（マルチ用オッズ12点分）
+# レースデータの定義（6点分の予測オッズ）
 races = [
     {
         "title": "📍 東京 10R - 3歳以上2勝クラス",
@@ -96,7 +95,7 @@ races = [
         "axis": 4,
         "axis_name": "テイエムスパーダ (6番人気)",
         "others": [2, 7, 9, 12],
-        "odds_sample": ['45.8倍', '78.2倍', '112.5倍', '65.0倍', '88.4倍', '134.0倍', '52.1倍', '95.6倍', '142.0倍', '68.3倍', '110.2倍', '154.0倍'],
+        "odds_sample": ['45.8倍', '78.2倍', '112.5倍', '65.0倍', '88.4倍', '134.0倍'],
         "result_status": "⏳ レース前 / 確定待ち",
         "winning_comb": "-",
         "payout": "-"
@@ -108,7 +107,7 @@ races = [
         "axis": 12,
         "axis_name": "ゴールドバローズ (7番人気)",
         "others": [1, 3, 5, 8],
-        "odds_sample": ['62.4倍', '89.1倍', '134.6倍', '75.0倍', '98.2倍', '145.0倍', '82.1倍', '112.4倍', '168.0倍', '90.3倍', '125.2倍', '180.2倍'],
+        "odds_sample": ['62.4倍', '89.1倍', '134.6倍', '75.0倍', '98.2倍', '145.0倍'],
         "result_status": "⏳ レース前 / 確定待ち",
         "winning_comb": "-",
         "payout": "-"
@@ -120,7 +119,7 @@ races = [
         "axis": 7,
         "axis_name": "ヤマニンウルス (2番人気)",
         "others": [4, 6, 11, 14],
-        "odds_sample": ['18.5倍', '24.2倍', '41.0倍', '22.1倍', '33.4倍', '52.0倍', '28.5倍', '39.2倍', '64.0倍', '31.0倍', '45.6倍', '56.8倍'],
+        "odds_sample": ['18.5倍', '24.2倍', '41.0倍', '22.1倍', '33.4倍', '52.0倍'],
         "result_status": "⏳ レース前 / 確定待ち",
         "winning_comb": "-",
         "payout": "-"
@@ -128,10 +127,10 @@ races = [
 ]
 
 # --- メインコンテンツ ---
-st.subheader("🎯 本日の推奨レース（1頭軸マルチ 12点買い）")
+st.subheader("🎯 本日の推奨レース（1頭軸流し 6点買い）")
 
 for r in races:
-    bets = generate_mult_bets(r["axis"], r["others"])
+    bets = generate_formation_bets(r["axis"], r["others"])
     
     st.markdown(f"""
     <div class="race-card">
@@ -140,15 +139,15 @@ for r in races:
         <h3 style="margin-top: 8px;">{r["title"]}</h3>
         <p style='margin: 4px 0; font-size: 0.85rem; color: #a0aec0;'>
             <b>🔥 軸馬:</b> 馬番 <b>{r["axis"]}番</b> ({r["axis_name"]})<br>
-            <b>🎯 相手:</b> 馬番 {r["others"]} （1頭軸マルチ <b>12点買い</b>）
+            <b>🎯 相手:</b> 馬番 {r["others"]} （1頭軸流し <b>6点買い</b>）
         </p>
     </div>
     """, unsafe_allow_html=True)
     
-    # 12点の買い目テーブル
+    # 6点の買い目テーブル
     df_bets = pd.DataFrame({
         '買い目': bets,
-        '点数': [1] * 12,
+        '点数': [1] * 6,
         '予測オッズ': r["odds_sample"]
     })
     st.dataframe(df_bets, width='stretch', hide_index=True)
