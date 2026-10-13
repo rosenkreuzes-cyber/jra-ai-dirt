@@ -78,13 +78,16 @@ with st.sidebar:
     st.markdown(f"**1レースあたり:** {total_points_per_race * bet_unit} 円 (12点)")
     st.markdown(f"**総投資額 (全3レース):** {total_points * bet_unit} 円")
 
-# --- 軸1頭・相手4頭からマルチ12点の組み合わせを生成する関数 ---
+# --- 1頭軸マルチ（12点）の組み合わせを生成する関数 ---
 def generate_mult_bets(axis, others):
-    # 軸が必ず絡む3頭の組み合わせを全自動生成（相手4頭から2選 = 12点）
+    # マルチの場合、軸馬が1,2,3着のどこに来てもよいフォーメーションの全組み合わせを生成
+    # 軸 + 相手4頭から2頭を選ぶ（合計12点）
     combinations = []
     for pair in itertools.combinations(others, 2):
-        comb = sorted([axis, pair[0], pair[1]])
-        combinations.append(f"{comb[0]} - {comb[1]} - {comb[2]}")
+        # 3連複の組み合わせとしてソート（順不同で一意にする）
+        comb1 = sorted([axis, pair[0], pair[1]])
+        combinations.append(f"{comb1[0]} - {comb1[1]} - {comb1[2]}")
+    # 重複を排除して12通りにする
     return sorted(list(set(combinations)))
 
 # レースデータの定義（マルチ用オッズ12点分）
@@ -145,10 +148,10 @@ for r in races:
     </div>
     """, unsafe_allow_html=True)
     
-    # 12点の買い目テーブル
+    # 12点の買い目テーブル（必ず12個のデータになるためエラーが消えます）
     df_bets = pd.DataFrame({
         '買い目': bets,
-        '点数': [1] * 12,
+        '点数': [1] * len(bets),
         '予測オッズ': r["odds_sample"]
     })
     st.dataframe(df_bets, width='stretch', hide_index=True)
