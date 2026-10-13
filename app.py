@@ -8,7 +8,7 @@ st.set_page_config(
     layout="centered"
 )
 
-# --- カスタムCSS（スマホで見やすいスタイル・スクロール排除） ---
+# --- カスタムCSS（スマホで見やすいスタイル） ---
 st.markdown("""
 <style>
     .main {
@@ -45,30 +45,6 @@ st.markdown("""
         font-size: 0.75rem;
         font-weight: bold;
         float: right;
-    }
-    /* テーブル全体のデザイン（スクロールなしで全表示） */
-    .bet-table {
-        width: 100%;
-        border-collapse: collapse;
-        background-color: #161b22;
-        color: #ffffff;
-        font-size: 0.85rem;
-        margin-top: 8px;
-        margin-bottom: 8px;
-        border-radius: 6px;
-        overflow: hidden;
-    }
-    .bet-table th {
-        background-color: #21262d;
-        color: #f6e05e;
-        padding: 8px;
-        text-align: center;
-        border-bottom: 1px solid #30363d;
-    }
-    .bet-table td {
-        padding: 7px 8px;
-        text-align: center;
-        border-bottom: 1px solid #21262d;
     }
 </style>
 """, unsafe_allow_html=True)
@@ -166,26 +142,12 @@ for r in races:
     </div>
     """, unsafe_allow_html=True)
     
-    # HTMLテーブルで直に描画することで、スクロールバーを完全に排除して12点すべてを一望
-    table_html = """
-    <table class="bet-table">
-        <tr>
-            <th>買い目</th>
-            <th>点数</th>
-            <th>予測オッズ</th>
-        </tr>
-    """
+    # マークダウン形式のテーブルを作成して綺麗に一望表示
+    table_markdown = "| 買い目 | 点数 | 予測オッズ |\n|:---:|:---:|:---:|\n"
     for bet, odds in zip(bets, dummy_odds):
-        table_html += f"""
-        <tr>
-            <td><b>{bet}</b></td>
-            <td>1点</td>
-            <td>{odds}</td>
-        </tr>
-        """
-    table_html += "</table>"
+        table_markdown += f"| **{bet}** | 1点 | {odds} |\n"
     
-    st.markdown(table_html, unsafe_allow_html=True)
+    st.markdown(table_markdown)
     
     # レース結果 ＆ 配当金表示枠
     st.markdown(f"""
