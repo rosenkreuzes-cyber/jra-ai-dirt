@@ -29,6 +29,13 @@ st.markdown("""
         border-left: 5px solid #ff4b4b;
         margin-bottom: 15px;
     }
+    .control-box {
+        background-color: #161b22;
+        border: 1px solid #30363d;
+        padding: 12px;
+        border-radius: 8px;
+        margin-bottom: 20px;
+    }
     .result-box {
         background-color: #111827;
         border: 1px solid #374151;
@@ -53,23 +60,28 @@ st.markdown("""
 st.title("🏇 JRA 黄金パターン AI ダッシュボード")
 st.caption("1頭軸マルチ（12点買い）＆ 結果・配当トラッカー")
 
-# --- サイドバー設定（オッズ取得スイッチ ＆ 資金配分） ---
-with st.sidebar:
-    st.header("⚙️ 運用・資金設定")
-    
-    st.subheader("📊 オッズ取得モード")
-    odds_mode = st.radio(
-        "取得タイミングを選択",
-        ["当日朝 7:00 時点固定", "一括手動取得（ボタン実行）"]
-    )
-    
-    if odds_mode == "一括手動取得（ボタン実行）":
-        if st.button("🔄 今すぐオッズを一括取得する", type="primary"):
-            st.success("最新オッズの取得が完了しました！")
-    else:
-        st.info("⏰ 当日朝 7:00 時点のオッズデータを自動適用中です。")
+# --- 【メイン画面上部】オッズ取得スイッチ ＆ 資金設定コントロールボックス ---
+st.markdown("""
+<div class="control-box">
+    <b>⚙️ 運用・オッズ取得コントロール</b>
+</div>
+""", unsafe_allow_html=True)
 
-    st.markdown("---")
+odds_mode = st.radio(
+    "📊 オッズ取得タイミング",
+    ["当日朝 7:00 時点固定", "一括手動取得（ボタン実行）"],
+    horizontal=True
+)
+
+if odds_mode == "一括手動取得（ボタン実行）":
+    if st.button("🔄 今すぐオッズを一括取得する", type="primary", use_container_width=True):
+        st.success("最新オッズの取得が完了しました！")
+else:
+    st.info("⏰ 当日朝 7:00 時点のオッズデータを自動適用中です。")
+
+# サイドバーには資金配分をシンプルに配置
+with st.sidebar:
+    st.header("⚙️ 資金設定")
     bet_unit = st.number_input("1点あたりの金額 (円)", min_value=100, max_value=10000, value=100, step=100)
     total_races = 3
     total_points_per_race = 12  # マルチ12点
@@ -125,6 +137,7 @@ races = [
 ]
 
 # --- メインコンテンツ ---
+st.markdown("---")
 st.subheader("🎯 本日の推奨レース（1頭軸マルチ 12点買い）")
 
 for r in races:
