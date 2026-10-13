@@ -1,6 +1,6 @@
 import streamlit as st
 import pandas as pd
-import numpy as np
+import itertools
 
 # ページのレイアウト設定
 st.set_page_config(
@@ -9,7 +9,7 @@ st.set_page_config(
     layout="centered"
 )
 
-# --- カスタムCSS（スマホで見やすいカード＆テーブル） ---
+# --- カスタムCSS（スマホで見やすいスタイル） ---
 st.markdown("""
 <style>
     .main {
@@ -30,92 +30,80 @@ st.markdown("""
         border-left: 5px solid #ff4b4b;
         margin-bottom: 20px;
     }
-    .bet-table {
-        width: 100%;
-        margin-top: 10px;
-        font-size: 0.85rem;
-    }
 </style>
 """, unsafe_allow_html=True)
 
 # --- タイトル ---
 st.title("🏇 JRA 黄金パターン AI ダッシュボード")
-st.caption("回収率179.72%・過小評価馬に基づく3連複フォーメーション・予測配当")
+st.caption("3連複 1頭軸流しフォーメーション（相手4頭 = 6点）専用アシスタント")
 
-# --- サマリー情報 ---
-col1, col2, col3 = st.columns(3)
-with col1:
-    st.metric(label="対象レース", value="3レース")
-with col2:
-    st.metric(label="総購入点数", value="12点")
-with col3:
-    st.metric(label="平均期待回収率", value="179.7%")
+# --- 軸1頭・相手4頭から6点（軸-相手A-相手B）の組み合わせを生成する関数 ---
+def generate_formation_bets(axis, others):
+    # 相手4頭から2頭を選ぶ組み合わせ（4C2 = 6通り）を生成
+    combinations = []
+    for pair in itertools.combinations(others, 2):
+        comb = sorted([pair[0], pair[1]])
+        combinations.append(f"{axis} - {comb[0]} - {comb[1]}")
+    return combinations
 
-st.markdown("---")
+# レースデータの定義（軸馬 1頭 ＆ 相手 4頭）
+races = [
+    {
+        "title": "📍 東京 10R - 3歳以上2勝クラス",
+        "axis": 4,
+        "axis_name": "テイエムスパーダ (6番人気)",
+        "others": [2, 7, 9, 12],
+        "odds_sample": ['45.8倍', '78.2倍', '112.5倍', '65.0倍', '88.4倍', '134.0倍']
+    },
+    {
+        "title": "📍 中山 11R - アケボノ賞",
+        "axis": 12,
+        "axis_name": "ゴールドバローズ (7番人気)",
+        "others": [1, 3, 5, 8],
+        "odds_sample": ['62.4倍', '89.1倍', '134.6倍', '75.0倍', '98.2倍', '145.0倍']
+    },
+    {
+        "title": "📍 京都 11R - プロキオンステークス(G3)",
+        "axis": 7,
+        "axis_name": "ヤマニンウルス (2番人気)",
+        "others": [4, 6, 11, 14],
+        "odds_sample": ['18.5倍', '24.2倍', '41.0倍', '22.1倍', '33.4倍', '52.0倍']
+    }
+]
 
-# --- レース1 ---
-st.subheader("🎯 本日の推奨レースと買い目詳細")
+# --- メインコンテンツ ---
+st.subheader("🎯 本日の推奨レース（1頭軸流し 6点買い）")
 
-st.markdown("""
-<div class="race-card">
-    <h3>📍 東京 10R - 3歳以上2勝クラス (ダート1600m)</h3>
-    <p style='margin: 4px 0; font-size: 0.85rem; color: #a0aec0;'>
-        <b>黄金パターン軸馬:</b> 4番 テイエムスパーダ (6番人気 / 予測1位)
-    </p>
-</div>
-""", unsafe_allow_html=True)
-
-# レース1の買い目一覧テーブル
-race1_bets = pd.DataFrame({
-    '式別': ['3連複', '3連複', '3連複', '3連複'],
-    '買い目 (軸-相手-相手)': ['4 - 2 - 7', '4 - 2 - 9', '4 - 7 - 12', '4 - 9 - 12'],
-    '点数': [1, 1, 1, 1],
-    '予測オッズ': ['45.8倍', '78.2倍', '112.5倍', '154.0倍']
-})
-st.dataframe(race1_bets, width='stretch', hide_index=True)
-
-
-# --- レース2 ---
-st.markdown("""
-<div class="race-card">
-    <h3>📍 中山 11R - アケボノ賞 (ダート1200m)</h3>
-    <p style='margin: 4px 0; font-size: 0.85rem; color: #a0aec0;'>
-        <b>黄金パターン軸馬:</b> 12番 ゴールドバローズ (7番人気 / 予測2位)
-    </p>
-</div>
-""", unsafe_allow_html=True)
-
-race2_bets = pd.DataFrame({
-    '式別': ['3連複', '3連複', '3連複', '3連複'],
-    '買い目 (軸-相手-相手)': ['12 - 1 - 3', '12 - 1 - 5', '12 - 3 - 8', '12 - 5 - 8'],
-    '点数': [1, 1, 1, 1],
-    '予測オッズ': ['62.4倍', '89.1倍', '134.6倍', '180.2倍']
-})
-st.dataframe(race2_bets, width='stretch', hide_index=True)
-
-
-# --- レース3 ---
-st.markdown("""
-<div class="race-card">
-    <h3>📍 京都 11R - プロキオンステークス(G3) (ダート1400m)</h3>
-    <p style='margin: 4px 0; font-size: 0.85rem; color: #a0aec0;'>
-        <b>黄金パターン軸馬:</b> 7番 ヤマニンウルス (2番人気 / 予測1位)
-    </p>
-</div>
-""", unsafe_allow_html=True)
-
-race3_bets = pd.DataFrame({
-    '式別': ['3連複', '3連複', '3連複', '3連複'],
-    '買い目 (軸-相手-相手)': ['7 - 4 - 6', '7 - 4 - 11', '7 - 6 - 14', '7 - 11 - 14'],
-    '点数': [1, 1, 1, 1],
-    '予測オッズ': ['18.5倍', '24.2倍', '41.0倍', '56.8倍']
-})
-st.dataframe(race3_bets, width='stretch', hide_index=True)
-
-
-# --- サイドバー設定 ---
+# サイドバー設定（資金配分）
 with st.sidebar:
-    st.header("⚙️ 資金配分・設定")
-    budget = st.number_input("1点あたりの投資金額 (円)", min_value=100, max_value=10000, value=100, step=100)
-    st.markdown(f"**総投資額:** {12 * budget} 円")
-    st.info("※実際のオッズ取得と連動して予測オッズがリアルタイムに変動します。")
+    st.header("⚙️ 資金配分設定")
+    bet_unit = st.number_input("1点あたりの金額 (円)", min_value=100, max_value=10000, value=100, step=100)
+    total_races = len(races)
+    total_points = total_races * 6
+    st.markdown(f"**1レースあたり:** {6 * bet_unit} 円 (6点)")
+    st.markdown(f"**総投資額 (3レース分):** {total_points * bet_unit} 円")
+
+# 各レースの表示
+for r in races:
+    bets = generate_formation_bets(r["axis"], r["others"])
+    
+    st.markdown(f"""
+    <div class="race-card">
+        <h3>{r["title"]}</h3>
+        <p style='margin: 4px 0; font-size: 0.85rem; color: #a0aec0;'>
+            <b>🔥 軸馬:</b> 馬番 <b>{r["axis"]}番</b> ({r["axis_name"]})<br>
+            <b>🎯 相手:</b> 馬番 {r["others"]} （フォーメーション合計 <b>6点</b>）
+        </p>
+    </div>
+    """, unsafe_allow_html=True)
+    
+    # 6点の買い目テーブルを作成
+    df_bets = pd.DataFrame({
+        '式別': ['3連複 (軸1頭流し)'] * 6,
+        '買い目 (軸 - 相手 - 相手)': bets,
+        '点数': [1] * 6,
+        '予測オッズ': r["odds_sample"]
+    })
+    
+    st.dataframe(df_bets, width='stretch', hide_index=True)
+    st.markdown("---")
