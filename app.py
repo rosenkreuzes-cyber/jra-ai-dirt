@@ -30,6 +30,15 @@ st.markdown("""
         border-left: 5px solid #ff4b4b;
         margin-bottom: 20px;
     }
+    .confidence-badge {
+        background-color: #b7791f;
+        color: #ffffff;
+        padding: 2px 8px;
+        border-radius: 4px;
+        font-size: 0.75rem;
+        font-weight: bold;
+        float: right;
+    }
 </style>
 """, unsafe_allow_html=True)
 
@@ -45,11 +54,12 @@ def generate_formation_bets(axis, others):
         combinations.append(f"{axis} - {comb[0]} - {comb[1]}")
     return combinations
 
-# レースデータの定義（前の2レースは6〜7番人気を軸に設定）
+# レースデータの定義（自信度・おすすめコメントを追加）
 races = [
     {
         "title": "📍 東京 10R - 3歳以上2勝クラス",
         "day": "📅 10月17日(土) 開催",
+        "confidence": "🔥 自信度: ★★★★☆ (勝負)",
         "axis": 4,
         "axis_name": "テイエムスパーダ (6番人気)",
         "others": [2, 7, 9, 12],
@@ -58,6 +68,7 @@ races = [
     {
         "title": "📍 中山 11R - アケボノ賞",
         "day": "📅 10月17日(土) 開催",
+        "confidence": "🔥 自信度: ★★★★★ (特選)",
         "axis": 12,
         "axis_name": "ゴールドバローズ (7番人気)",
         "others": [1, 3, 5, 8],
@@ -66,6 +77,7 @@ races = [
     {
         "title": "📍 京都 11R - プロキオンステークス(G3)",
         "day": "📅 10月18日(日) 開催",
+        "confidence": "⚡ 自信度: ★★★☆☆ (狙い目)",
         "axis": 7,
         "axis_name": "ヤマニンウルス (2番人気)",
         "others": [4, 6, 11, 14],
@@ -92,6 +104,7 @@ for r in races:
     st.markdown(f"""
     <div class="race-card">
         <span style="background-color: #2d3748; color: #63b3ed; padding: 2px 8px; border-radius: 4px; font-size: 0.75rem; font-weight: bold;">{r["day"]}</span>
+        <span class="confidence-badge">{r["confidence"]}</span>
         <h3 style="margin-top: 8px;">{r["title"]}</h3>
         <p style='margin: 4px 0; font-size: 0.85rem; color: #a0aec0;'>
             <b>🔥 軸馬:</b> 馬番 <b>{r["axis"]}番</b> ({r["axis_name"]})<br>
@@ -100,7 +113,7 @@ for r in races:
     </div>
     """, unsafe_allow_html=True)
     
-    # 6点の買い目テーブルを作成（余計な式別名やカッコを排除）
+    # 6点の買い目テーブルを作成
     df_bets = pd.DataFrame({
         '買い目': bets,
         '点数': [1] * 6,
