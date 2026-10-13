@@ -35,7 +35,7 @@ st.markdown("""
 
 # --- タイトル ---
 st.title("🏇 JRA 黄金パターン AI ダッシュボード")
-st.caption("3連複 1頭軸流し（相手4頭 = 6点）専用アシスタント")
+st.caption("1頭軸流しフォーメーション（6点買い）専用アシスタント")
 
 # --- 軸1頭・相手4頭から6点（軸-相手A-相手B）の組み合わせを生成する関数 ---
 def generate_formation_bets(axis, others):
@@ -45,7 +45,7 @@ def generate_formation_bets(axis, others):
         combinations.append(f"{axis} - {comb[0]} - {comb[1]}")
     return combinations
 
-# レースデータの定義（開催日：土曜/日曜を明記）
+# レースデータの定義（前の2レースは6〜7番人気を軸に設定）
 races = [
     {
         "title": "📍 東京 10R - 3歳以上2勝クラス",
@@ -94,16 +94,15 @@ for r in races:
         <span style="background-color: #2d3748; color: #63b3ed; padding: 2px 8px; border-radius: 4px; font-size: 0.75rem; font-weight: bold;">{r["day"]}</span>
         <h3 style="margin-top: 8px;">{r["title"]}</h3>
         <p style='margin: 4px 0; font-size: 0.85rem; color: #a0aec0;'>
-            <b>🔥 1頭軸:</b> 馬番 <b>{r["axis"]}番</b> ({r["axis_name"]})<br>
-            <b>🎯 相手:</b> 馬番 {r["others"]} （1頭軸流し <b>6点買い</b>）
+            <b>🔥 軸馬:</b> 馬番 <b>{r["axis"]}番</b> ({r["axis_name"]})<br>
+            <b>🎯 相手:</b> 馬番 {r["others"]} （1頭軸流し 6点買い）
         </p>
     </div>
     """, unsafe_allow_html=True)
     
-    # 6点の買い目テーブルを作成
+    # 6点の買い目テーブルを作成（余計な式別名やカッコを排除）
     df_bets = pd.DataFrame({
-        '式別': ['3連複 (1頭軸流し)'] * 6,
-        '買い目 (軸 - 相手 - 相手)': bets,
+        '買い目': bets,
         '点数': [1] * 6,
         '予測オッズ': r["odds_sample"]
     })
