@@ -134,7 +134,7 @@ with tab_live:
             "payout": "-"
         },
         {
-            "title": "📍 中山 11R - ダート 1800m（メイン特選）",
+            "title": "📍 中山 11R - アケボノ賞",
             "day": "📅 10月17日(土) 開催",
             "confidence": "🔥 自信度: ★★★★★ (特選)",
             "axis": 12,
@@ -145,7 +145,7 @@ with tab_live:
             "payout": "-"
         },
         {
-            "title": "📍 京都 11R - ダート 1800m（オープン・重賞）",
+            "title": "📍 京都 11R - プロキオンステークス(G3)",
             "day": "📅 10月18日(日) 開催",
             "confidence": "⚡ 自信度: ★★★☆☆ (狙い目)",
             "axis": 7,
@@ -207,17 +207,17 @@ with tab_backtest:
     </div>
     """, unsafe_allow_html=True)
 
-    # --- 馬場状態の選択コントロール（明示的なキーを設定） ---
+    # --- 馬場状態の選択コントロール ---
     st.markdown("### 🏟️ 馬場状態別・シミュレーション条件切替")
     track_condition = st.selectbox(
         "対象の馬場状態を選択してください",
         ["ダート全体（平均値）", "良馬場（パサパサ・タフな馬場）", "重・不良馬場（湿って速い・特殊馬場）"],
-        key="unique_track_cond_box"
+        key="fixed_track_cond_box"
     )
 
     sim_races = 1240
 
-    # 馬場状態と戦略に応じた【完全独立パラメータ】の定義
+    # --- 重・不良馬場の計算を含めた厳密な条件分岐 ---
     if "黄金パターン" in bt_strategy:
         if "良馬場" in track_condition:
             hit_rate = 16.2
@@ -257,7 +257,7 @@ with tab_backtest:
             max_dd = 8
             desc = "指数3位を軸に据え、相関性の高い補正指数で精度を極限まで高めた堅実・的中率重視戦略。"
 
-    # メトリクス表示（馬場や戦術の変更で確実に値が変化します）
+    # メトリクス表示
     col1, col2, col3 = st.columns(3)
     col1.metric("検証レース数", f"{sim_races:,} レース")
     col2.metric("的中率", f"{hit_rate}%", delta=f"{hit_rate - 15.4:+.1f}% vs 平均")
@@ -314,7 +314,7 @@ with tab_backtest:
     </div>
     """, unsafe_allow_html=True)
 
-    # グラフの乱数シードに的中率とROI、さらに馬場状態の文字長を組み込んで完全に別形状に描き直されるように修正
+    # 累積収支シミュレーション推移
     st.markdown(f"### 📉 累積収支シミュレーション推移 ({track_condition} 反映版)")
     seed_val = int(roi * 10) + int(hit_rate * 100) + len(track_condition)
     np.random.seed(seed_val)
