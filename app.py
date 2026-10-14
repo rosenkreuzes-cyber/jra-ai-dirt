@@ -62,6 +62,14 @@ st.markdown("""
         font-weight: bold;
         float: right;
     }
+    .divergence-tag {
+        background-color: #2b6cb0;
+        color: #ffffff;
+        padding: 2px 6px;
+        border-radius: 4px;
+        font-size: 0.75rem;
+        font-weight: bold;
+    }
 </style>
 """, unsafe_allow_html=True)
 
@@ -71,12 +79,12 @@ st.title("🏇 JRA 黄金パターン AI ダッシュボード")
 # --- サイドバー（資金・シミュレーション設定） ---
 with st.sidebar:
     st.header("⚙️ 資金・検証設定")
-    bet_unit = st.number_input("1点あたりの金額 (円)", min_value=100, max_value=10000, value=100, step=100, key="sb_bet_unit_v4")
+    bet_unit = st.number_input("1点あたりの金額 (円)", min_value=100, max_value=10000, value=100, step=100, key="sb_bet_v5")
     
     st.markdown("---")
     st.markdown("### 📊 バックテスト条件")
-    bt_years = st.selectbox("検証期間", ["2018年 〜 2021年 (4年間)", "直近1年間"], key="sb_bt_years_v4")
-    bt_strategy = st.selectbox("戦略パターン", ["黄金パターン (6-7人気軸)", "指数3位＋相関フィルタ軸"], key="sb_bt_strategy_v4")
+    bt_years = st.selectbox("検証期間", ["2018年 〜 2021年 (4年間)", "直近1年間"], key="sb_years_v5")
+    bt_strategy = st.selectbox("戦略パターン", ["黄金パターン (6-7人気軸)", "指数3位＋相関フィルタ軸"], key="sb_strat_v5")
     
     total_races = 3
     total_points_per_race = 12
@@ -100,7 +108,7 @@ tab_live, tab_backtest = st.tabs(["🎯 本日の推奨レース (LIVE)", "📈 
 # タブ 1: LIVE 運用画面
 # ==========================================
 with tab_live:
-    st.caption("1頭軸マルチ（12点買い）＆ 結果・配当トラッカー")
+    st.caption("1頭軸マルチ（12点買い）＆ 期待値ギャップ（人気 vs 指数）トラッカー")
 
     st.markdown("""
     <div class="control-box">
@@ -112,22 +120,25 @@ with tab_live:
         "📊 オッズ取得タイミング",
         ["当日朝 7:00 時点固定", "一括手動取得（ボタン実行）"],
         horizontal=True,
-        key="live_odds_mode_v4"
+        key="live_odds_v5"
     )
 
     if odds_mode == "一括手動取得（ボタン実行）":
-        if st.button("🔄 今すぐオッズを一括取得する", type="primary", key="btn_fetch_odds_v4", use_container_width=True):
+        if st.button("🔄 今すぐオッズを一括取得する", type="primary", key="btn_odds_v5", use_container_width=True):
             st.success("最新オッズの取得が完了しました！")
     else:
         st.info("⏰ 当日朝 7:00 時点のオッズデータを自動適用中です。")
 
+    # 推奨レースデータ（各馬の人気順位と指数順位のギャップを内包）
     races = [
         {
             "title": "📍 東京 10R - ダート 1600m（秋季ダート条件戦）",
             "day": "📅 10月17日(土) 開催",
             "confidence": "🔥 自信度: ★★★★☆ (勝負)",
             "axis": 4,
-            "axis_name": "テイエムスパーダ (6番人気)",
+            "axis_name": "テイエムスパーダ",
+            "pop_rank": 6,   # 世間の人気順
+            "idx_rank": 2,   # AI指数順
             "others": [2, 7, 9, 12],
             "result_status": "⏳ レース前 / 確定待ち",
             "winning_comb": "-",
@@ -138,7 +149,9 @@ with tab_live:
             "day": "📅 10月17日(土) 開催",
             "confidence": "🔥 自信度: ★★★★★ (特選)",
             "axis": 12,
-            "axis_name": "ゴールドバローズ (7番人気)",
+            "axis_name": "ゴールドバローズ",
+            "pop_rank": 7,   # 世間の人気順
+            "idx_rank": 3,   # AI指数順
             "others": [1, 3, 5, 8],
             "result_status": "⏳ レース前 / 確定待ち",
             "winning_comb": "-",
@@ -149,7 +162,9 @@ with tab_live:
             "day": "📅 10月18日(日) 開催",
             "confidence": "⚡ 自信度: ★★★☆☆ (狙い目)",
             "axis": 7,
-            "axis_name": "ヤマニンウルス (2番人気)",
+            "axis_name": "ヤマニンウルス",
+            "pop_rank": 2,   # 世間の人気順
+            "idx_rank": 1,   # AI指数順
             "others": [4, 6, 11, 14],
             "result_status": "⏳ レース前 / 確定待ち",
             "winning_comb": "-",
@@ -160,6 +175,9 @@ with tab_live:
     st.markdown("---")
 
     for r in races:
+        # 乖離度の計算（人気順 - 指数順：プラスが大きいほど「世間に舐められている実力馬（お宝）」）
+        divergence_score = r["pop_rank"] - r["idx_rank"]
+        
         bets = generate_mult_bets(r["axis"], r["others"])
         dummy_odds = [f"{40.0 + i * 10.5:.1f}倍" for i in range(len(bets))]
         
@@ -169,7 +187,9 @@ with tab_live:
             <span class="confidence-badge">{r["confidence"]}</span>
             <h3 style="margin-top: 8px;">{r["title"]}</h3>
             <p style='margin: 4px 0; font-size: 0.85rem; color: #a0aec0;'>
-                <b>🔥 軸馬:</b> 馬番 <b>{r["axis"]}番</b> ({r["axis_name"]})<br>
+                <b>🔥 軸馬選定:</b> 馬番 <b>{r["axis"]}番 ({r["axis_name"]})</b><br>
+                <b>📊 期待値ギャップ診断:</b> 世間人気 <span style="color: #f6e05e;">{r["pop_rank"]}番人気</span> ⇄ AI指数順位 <span style="color: #68D391;"><b>第{r["idx_rank"]}位</b></span> 
+                <span class="divergence-tag">過小評価度: +{divergence_score}</span><br>
                 <b>🎯 相手:</b> 馬番 {r["others"]} （1頭軸マルチ <b>12点買い</b>）
             </p>
         </div>
@@ -207,18 +227,16 @@ with tab_backtest:
     </div>
     """, unsafe_allow_html=True)
 
-    # --- 馬場状態の選択コントロール（ラジオボタン） ---
     st.markdown("### 🏟️ 馬場状態別・シミュレーション条件切替")
     track_condition = st.radio(
         "対象の馬場状態を選択してください",
         ["ダート全体（平均値）", "良馬場（パサパサ・タフな馬場）", "重・不良馬場（湿って速い・特殊馬場）"],
         horizontal=True,
-        key="forced_reload_radio_v4"
+        key="track_cond_v5"
     )
 
     sim_races = 1240
 
-    # --- 完全独立した条件分岐と変数割り当て ---
     if "黄金パターン" in bt_strategy:
         if track_condition == "良馬場（パサパサ・タフな馬場）":
             hit_rate = 16.2
@@ -238,7 +256,7 @@ with tab_backtest:
             roi = 177.8
             max_dd = 14
             desc = "6〜7番人気の過小評価馬を軸に据え、マルチ12点でヒモ荒れを狙い撃つ高回収率戦略。"
-    else: # 指数3位＋相関フィルタ軸
+    else:
         if track_condition == "良馬場（パサパサ・タフな馬場）":
             hit_rate = 28.0
             avg_payout = 5800
@@ -258,13 +276,11 @@ with tab_backtest:
             max_dd = 8
             desc = "指数3位を軸に据え、相関性の高い補正指数で精度を極限まで高めた堅実・的中率重視戦略。"
 
-    # --- メトリクス表示 ---
     col1, col2, col3 = st.columns(3)
     col1.metric("検証レース数", f"{sim_races:,} レース")
     col2.metric("的中率", f"{hit_rate}%", delta=f"{hit_rate - 15.4:+.1f}% vs 平均")
     col3.metric("回収率 (ROI)", f"{roi}%", delta=f"{roi - 100:.1f}% vs 資金")
 
-    # --- 馬場状態に応じたマトリクス表示の切り替え（コンテナ分離） ---
     st.markdown(f"### 📊 指数別 複勝圏入着率マトリクス ({track_condition})")
     
     if track_condition == "良馬場（パサパサ・タフな馬場）":
@@ -315,10 +331,7 @@ with tab_backtest:
     </div>
     """, unsafe_allow_html=True)
 
-    # --- グラフの描画部分（完全にユニークなプレースホルダーとして強制再描画） ---
     st.markdown(f"### 📉 累積収支シミュレーション推移 ({track_condition})")
-    
-    # 選択された条件文字列をすべて結合してハッシュ化し、グラフの形状を完全に変化させる
     seed_string = f"{track_condition}_{bt_strategy}_{bet_unit}"
     seed_val = abs(hash(seed_string)) % (2**31)
     np.random.seed(seed_val)
@@ -334,7 +347,6 @@ with tab_backtest:
         "累積収支 (円)": cumulative_profit
     })
     
-    # グラフ要素が確実に再マウントされるよう空コンテナと組み合わせて表示
     chart_container = st.container()
     with chart_container:
         st.line_chart(chart_data, x="シミュレーション経過 (レース単位)", y="累積収支 (円)")
