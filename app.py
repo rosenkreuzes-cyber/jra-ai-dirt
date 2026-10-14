@@ -10,7 +10,7 @@ st.set_page_config(
     layout="centered"
 )
 
-# --- カスタムCSS（スマホで見やすいスタイル） ---
+# --- カスタムCSS ---
 st.markdown("""
 <style>
     .main {
@@ -75,8 +75,8 @@ with st.sidebar:
     
     st.markdown("---")
     st.markdown("### 📊 バックテスト条件")
-    bt_years = st.selectbox("検証期間", ["2018年 〜 2021年 (4年間)", "直近1年間"])
-    bt_strategy = st.selectbox("戦略パターン", ["黄金パターン (6-7人気軸)", "指数3位＋相関フィルタ軸"])
+    bt_years = st.selectbox("検証期間", ["2018年 〜 2021年 (4年間)", "直近1年間"], key="sidebar_years")
+    bt_strategy = st.selectbox("戦略パターン", ["黄金パターン (6-7人気軸)", "指数3位＋相関フィルタ軸"], key="sidebar_strat")
     
     total_races = 3
     total_points_per_race = 12
@@ -102,7 +102,6 @@ tab_live, tab_backtest = st.tabs(["🎯 本日の推奨レース (LIVE)", "📈 
 with tab_live:
     st.caption("1頭軸マルチ（12点買い）＆ 結果・配当トラッカー")
 
-    # オッズ取得コントロール
     st.markdown("""
     <div class="control-box">
         <b>⚙️ 運用・オッズ取得コントロール</b>
@@ -122,7 +121,6 @@ with tab_live:
     else:
         st.info("⏰ 当日朝 7:00 時点のオッズデータを自動適用中です。")
 
-    # 直近ダート戦のレースデータ定義
     races = [
         {
             "title": "📍 東京 10R - ダート 1600m（秋季ダート条件戦）",
@@ -177,14 +175,12 @@ with tab_live:
         </div>
         """, unsafe_allow_html=True)
         
-        # マークダウンテーブルでスクロールなし一望表示
         table_markdown = "| 買い目番号 | 3連複フォーメーション | 点数 | 予測オッズ |\n|:---:|:---:|:---:|:---:|\n"
         for idx, (bet, odds) in enumerate(zip(bets, dummy_odds), 1):
             table_markdown += f"| **#{idx}** | {bet} | 1点 | {odds} |\n"
         
         st.markdown(table_markdown)
         
-        # レース結果 ＆ 配当金表示枠
         st.markdown(f"""
         <div class="result-box">
             <b>🏆 レース結果・着順・払戻金トラッカー</b><br>
@@ -211,59 +207,63 @@ with tab_backtest:
     </div>
     """, unsafe_allow_html=True)
 
-    # --- 馬場状態の選択コントロール（最上部に配置して連動させる） ---
+    # --- 馬場状態の選択コントロール（明示的なキーを設定） ---
     st.markdown("### 🏟️ 馬場状態別・シミュレーション条件切替")
     track_condition = st.selectbox(
         "対象の馬場状態を選択してください",
         ["ダート全体（平均値）", "良馬場（パサパサ・タフな馬場）", "重・不良馬場（湿って速い・特殊馬場）"],
-        key="track_cond_select"
+        key="unique_track_cond_box"
     )
 
-    # 戦略と馬場状態に応じた動的シミュレーション数値の算出
+    sim_races = 1240
+
+    # 馬場状態と戦略に応じた【完全独立パラメータ】の定義
     if "黄金パターン" in bt_strategy:
-        sim_races = 1240
         if "良馬場" in track_condition:
             hit_rate = 16.2
             avg_payout = 10800
             roi = 171.5
             max_dd = 13
+            desc = "【良馬場・黄金パターン】タフな馬場で地力が問われ、堅実性と配当が絶妙に噛み合う設定。"
         elif "重・不良馬場" in track_condition:
             hit_rate = 14.5
             avg_payout = 12600
             roi = 183.2
             max_dd = 15
+            desc = "【重・不良馬場・黄金パターン】高速ダートで波乱度が増し、中穴軸の一撃回収率が爆発する設定。"
         else:
             hit_rate = 15.4
             avg_payout = 11540
             roi = 177.8
             max_dd = 14
-        desc = "6〜7番人気の過小評価馬を軸に据え、マルチ12点でヒモ荒れを狙い撃つ高回収率戦略。"
-    else:
-        sim_races = 1240
+            desc = "6〜7番人気の過小評価馬を軸に据え、マルチ12点でヒモ荒れを狙い撃つ高回収率戦略。"
+    else: # 指数3位＋相関フィルタ軸
         if "良馬場" in track_condition:
             hit_rate = 28.0
             avg_payout = 5800
             roi = 115.0
             max_dd = 7
+            desc = "【良馬場・指数3位軸】時計がかかる良馬場で指数上位の信頼度が最大化され、的中率が跳ね上がる設定。"
         elif "重・不良馬場" in track_condition:
-            hit_rate = 25.0
-            avg_payout = 6600
-            roi = 110.0
-            max_dd = 9
+            hit_rate = 24.5
+            avg_payout = 6700
+            roi = 108.5
+            max_dd = 10
+            desc = "【重・不良馬場・指数3位軸】道悪の紛れにより的中率がやや落ちる分、配当が微増する設定。"
         else:
             hit_rate = 26.5
             avg_payout = 6200
             roi = 112.4
             max_dd = 8
-        desc = "指数3位を軸に据え、相関性の高い補正指数で精度を極限まで高めた堅実・的中率重視戦略。"
+            desc = "指数3位を軸に据え、相関性の高い補正指数で精度を極限まで高めた堅実・的中率重視戦略。"
 
-    # メトリクス表示（馬場状態や戦略変更でリアルタイムに数値が切り替わります）
+    # メトリクス表示（馬場や戦術の変更で確実に値が変化します）
     col1, col2, col3 = st.columns(3)
     col1.metric("検証レース数", f"{sim_races:,} レース")
     col2.metric("的中率", f"{hit_rate}%", delta=f"{hit_rate - 15.4:+.1f}% vs 平均")
     col3.metric("回収率 (ROI)", f"{roi}%", delta=f"{roi - 100:.1f}% vs 資金")
 
-    # 馬場状態に応じた指数別入着率テーブルの動的切替
+    # 馬場状態に応じたマトリクス表示の切り替え
     st.markdown(f"### 📊 指数別 複勝圏入着率マトリクス ({track_condition})")
     
     if "良馬場" in track_condition:
@@ -304,7 +304,7 @@ with tab_backtest:
 
     st.markdown(f"""
     <div class="result-box" style="margin-top: 15px;">
-        <b>📌 選択戦略 & 馬場状態の特性解説 ({bt_strategy} / {track_condition})</b><br>
+        <b>📌 選択戦略 & 馬場状態の特性解説</b><br>
         <p style="color: #cbd5e1; margin: 6px 0 0 0; font-size: 0.9rem;">{desc}</p>
         <hr style="border-color: #374151; margin: 10px 0;">
         <b>📊 統計シミュレーション詳細:</b><br>
@@ -314,9 +314,11 @@ with tab_backtest:
     </div>
     """, unsafe_allow_html=True)
 
-    # グラフのシード値に的中率とROIを反映させて、馬場変更ごとにグラフもリアルタイム変化するように連動
+    # グラフの乱数シードに的中率とROI、さらに馬場状態の文字長を組み込んで完全に別形状に描き直されるように修正
     st.markdown(f"### 📉 累積収支シミュレーション推移 ({track_condition} 反映版)")
-    np.random.seed(int(roi * 10) + int(hit_rate * 100))
+    seed_val = int(roi * 10) + int(hit_rate * 100) + len(track_condition)
+    np.random.seed(seed_val)
+    
     payout_factor = (roi / 100.0)
     steps = 50
     investment_per_step = 1200 * (bet_unit / 100)
