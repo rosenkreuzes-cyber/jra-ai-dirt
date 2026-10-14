@@ -207,17 +207,18 @@ with tab_backtest:
     </div>
     """, unsafe_allow_html=True)
 
-    # --- 馬場状態の選択コントロール ---
+    # --- 馬場状態の選択コントロール（確実に再描画されるラジオボタンに変更） ---
     st.markdown("### 🏟️ 馬場状態別・シミュレーション条件切替")
-    track_condition = st.selectbox(
+    track_condition = st.radio(
         "対象の馬場状態を選択してください",
         ["ダート全体（平均値）", "良馬場（パサパサ・タフな馬場）", "重・不良馬場（湿って速い・特殊馬場）"],
-        key="fixed_track_cond_box"
+        horizontal=True,
+        key="reactive_track_cond_radio"
     )
 
     sim_races = 1240
 
-    # --- 重・不良馬場の計算を含めた厳密な条件分岐 ---
+    # --- 馬場状態別の完全分岐計算 ---
     if "黄金パターン" in bt_strategy:
         if "良馬場" in track_condition:
             hit_rate = 16.2
