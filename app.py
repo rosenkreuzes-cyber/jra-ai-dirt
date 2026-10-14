@@ -71,12 +71,12 @@ st.title("🏇 JRA 黄金パターン AI ダッシュボード")
 # --- サイドバー（資金・シミュレーション設定） ---
 with st.sidebar:
     st.header("⚙️ 資金・検証設定")
-    bet_unit = st.number_input("1点あたりの金額 (円)", min_value=100, max_value=10000, value=100, step=100)
+    bet_unit = st.number_input("1点あたりの金額 (円)", min_value=100, max_value=10000, value=100, step=100, key="sb_bet_unit")
     
     st.markdown("---")
     st.markdown("### 📊 バックテスト条件")
-    bt_years = st.selectbox("検証期間", ["2018年 〜 2021年 (4年間)", "直近1年間"], key="sidebar_years")
-    bt_strategy = st.selectbox("戦略パターン", ["黄金パターン (6-7人気軸)", "指数3位＋相関フィルタ軸"], key="sidebar_strat")
+    bt_years = st.selectbox("検証期間", ["2018年 〜 2021年 (4年間)", "直近1年間"], key="sb_bt_years")
+    bt_strategy = st.selectbox("戦略パターン", ["黄金パターン (6-7人気軸)", "指数3位＋相関フィルタ軸"], key="sb_bt_strategy")
     
     total_races = 3
     total_points_per_race = 12
@@ -116,7 +116,7 @@ with tab_live:
     )
 
     if odds_mode == "一括手動取得（ボタン実行）":
-        if st.button("🔄 今すぐオッズを一括取得する", type="primary", use_container_width=True):
+        if st.button("🔄 今すぐオッズを一括取得する", type="primary", key="btn_fetch_odds", use_container_width=True):
             st.success("最新オッズの取得が完了しました！")
     else:
         st.info("⏰ 当日朝 7:00 時点のオッズデータを自動適用中です。")
@@ -207,18 +207,18 @@ with tab_backtest:
     </div>
     """, unsafe_allow_html=True)
 
-    # --- 馬場状態の選択コントロール（確実に再描画されるラジオボタンに変更） ---
+    # --- 馬場状態の選択コントロール（独立したキーを持つラジオボタン） ---
     st.markdown("### 🏟️ 馬場状態別・シミュレーション条件切替")
     track_condition = st.radio(
         "対象の馬場状態を選択してください",
         ["ダート全体（平均値）", "良馬場（パサパサ・タフな馬場）", "重・不良馬場（湿って速い・特殊馬場）"],
         horizontal=True,
-        key="reactive_track_cond_radio"
+        key="main_track_condition_radio_v3"
     )
 
     sim_races = 1240
 
-    # --- 馬場状態別の完全分岐計算 ---
+    # --- 戦略と馬場状態に応じた完全分岐計算 ---
     if "黄金パターン" in bt_strategy:
         if "良馬場" in track_condition:
             hit_rate = 16.2
@@ -258,13 +258,13 @@ with tab_backtest:
             max_dd = 8
             desc = "指数3位を軸に据え、相関性の高い補正指数で精度を極限まで高めた堅実・的中率重視戦略。"
 
-    # メトリクス表示
+    # --- メトリクス表示（選択された馬場状態に応じて即座に数値が変動） ---
     col1, col2, col3 = st.columns(3)
     col1.metric("検証レース数", f"{sim_races:,} レース")
     col2.metric("的中率", f"{hit_rate}%", delta=f"{hit_rate - 15.4:+.1f}% vs 平均")
     col3.metric("回収率 (ROI)", f"{roi}%", delta=f"{roi - 100:.1f}% vs 資金")
 
-    # 馬場状態に応じたマトリクス表示の切り替え
+    # --- 馬場状態に応じたマトリクス表示の切り替え ---
     st.markdown(f"### 📊 指数別 複勝圏入着率マトリクス ({track_condition})")
     
     if "良馬場" in track_condition:
@@ -315,9 +315,9 @@ with tab_backtest:
     </div>
     """, unsafe_allow_html=True)
 
-    # 累積収支シミュレーション推移
+    # --- グラフのシード値にラジオボタンの選択文字を完全にハッシュ化して連動 ---
     st.markdown(f"### 📉 累積収支シミュレーション推移 ({track_condition} 反映版)")
-    seed_val = int(roi * 10) + int(hit_rate * 100) + len(track_condition)
+    seed_val = abs(hash(track_condition + bt_strategy)) % (2**32)
     np.random.seed(seed_val)
     
     payout_factor = (roi / 100.0)
