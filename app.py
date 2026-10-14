@@ -71,12 +71,12 @@ st.title("🏇 JRA 黄金パターン AI ダッシュボード")
 # --- サイドバー（資金・シミュレーション設定） ---
 with st.sidebar:
     st.header("⚙️ 資金・検証設定")
-    bet_unit = st.number_input("1点あたりの金額 (円)", min_value=100, max_value=10000, value=100, step=100, key="sb_bet_unit")
+    bet_unit = st.number_input("1点あたりの金額 (円)", min_value=100, max_value=10000, value=100, step=100, key="sb_bet_unit_v4")
     
     st.markdown("---")
     st.markdown("### 📊 バックテスト条件")
-    bt_years = st.selectbox("検証期間", ["2018年 〜 2021年 (4年間)", "直近1年間"], key="sb_bt_years")
-    bt_strategy = st.selectbox("戦略パターン", ["黄金パターン (6-7人気軸)", "指数3位＋相関フィルタ軸"], key="sb_bt_strategy")
+    bt_years = st.selectbox("検証期間", ["2018年 〜 2021年 (4年間)", "直近1年間"], key="sb_bt_years_v4")
+    bt_strategy = st.selectbox("戦略パターン", ["黄金パターン (6-7人気軸)", "指数3位＋相関フィルタ軸"], key="sb_bt_strategy_v4")
     
     total_races = 3
     total_points_per_race = 12
@@ -112,11 +112,11 @@ with tab_live:
         "📊 オッズ取得タイミング",
         ["当日朝 7:00 時点固定", "一括手動取得（ボタン実行）"],
         horizontal=True,
-        key="live_odds_mode"
+        key="live_odds_mode_v4"
     )
 
     if odds_mode == "一括手動取得（ボタン実行）":
-        if st.button("🔄 今すぐオッズを一括取得する", type="primary", key="btn_fetch_odds", use_container_width=True):
+        if st.button("🔄 今すぐオッズを一括取得する", type="primary", key="btn_fetch_odds_v4", use_container_width=True):
             st.success("最新オッズの取得が完了しました！")
     else:
         st.info("⏰ 当日朝 7:00 時点のオッズデータを自動適用中です。")
@@ -207,26 +207,26 @@ with tab_backtest:
     </div>
     """, unsafe_allow_html=True)
 
-    # --- 馬場状態の選択コントロール（独立したキーを持つラジオボタン） ---
+    # --- 馬場状態の選択コントロール（ラジオボタン） ---
     st.markdown("### 🏟️ 馬場状態別・シミュレーション条件切替")
     track_condition = st.radio(
         "対象の馬場状態を選択してください",
         ["ダート全体（平均値）", "良馬場（パサパサ・タフな馬場）", "重・不良馬場（湿って速い・特殊馬場）"],
         horizontal=True,
-        key="main_track_condition_radio_v3"
+        key="forced_reload_radio_v4"
     )
 
     sim_races = 1240
 
-    # --- 戦略と馬場状態に応じた完全分岐計算 ---
+    # --- 完全独立した条件分岐と変数割り当て ---
     if "黄金パターン" in bt_strategy:
-        if "良馬場" in track_condition:
+        if track_condition == "良馬場（パサパサ・タフな馬場）":
             hit_rate = 16.2
             avg_payout = 10800
             roi = 171.5
             max_dd = 13
             desc = "【良馬場・黄金パターン】タフな馬場で地力が問われ、堅実性と配当が絶妙に噛み合う設定。"
-        elif "重・不良馬場" in track_condition:
+        elif track_condition == "重・不良馬場（湿って速い・特殊馬場）":
             hit_rate = 14.5
             avg_payout = 12600
             roi = 183.2
@@ -239,13 +239,13 @@ with tab_backtest:
             max_dd = 14
             desc = "6〜7番人気の過小評価馬を軸に据え、マルチ12点でヒモ荒れを狙い撃つ高回収率戦略。"
     else: # 指数3位＋相関フィルタ軸
-        if "良馬場" in track_condition:
+        if track_condition == "良馬場（パサパサ・タフな馬場）":
             hit_rate = 28.0
             avg_payout = 5800
             roi = 115.0
             max_dd = 7
             desc = "【良馬場・指数3位軸】時計がかかる良馬場で指数上位の信頼度が最大化され、的中率が跳ね上がる設定。"
-        elif "重・不良馬場" in track_condition:
+        elif track_condition == "重・不良馬場（湿って速い・特殊馬場）":
             hit_rate = 24.5
             avg_payout = 6700
             roi = 108.5
@@ -258,16 +258,16 @@ with tab_backtest:
             max_dd = 8
             desc = "指数3位を軸に据え、相関性の高い補正指数で精度を極限まで高めた堅実・的中率重視戦略。"
 
-    # --- メトリクス表示（選択された馬場状態に応じて即座に数値が変動） ---
+    # --- メトリクス表示 ---
     col1, col2, col3 = st.columns(3)
     col1.metric("検証レース数", f"{sim_races:,} レース")
     col2.metric("的中率", f"{hit_rate}%", delta=f"{hit_rate - 15.4:+.1f}% vs 平均")
     col3.metric("回収率 (ROI)", f"{roi}%", delta=f"{roi - 100:.1f}% vs 資金")
 
-    # --- 馬場状態に応じたマトリクス表示の切り替え ---
+    # --- 馬場状態に応じたマトリクス表示の切り替え（コンテナ分離） ---
     st.markdown(f"### 📊 指数別 複勝圏入着率マトリクス ({track_condition})")
     
-    if "良馬場" in track_condition:
+    if track_condition == "良馬場（パサパサ・タフな馬場）":
         st.caption("☀️ 良馬場特性：パワーと持続力が要求され、地力通り（指数上位）に決まりやすい傾向。")
         hit_rate_data = pd.DataFrame({
             "指数順位": ["1位", "2位", "3位", "4位", "5位", "6位", "7位", "8位", "9位", "10位以下"],
@@ -278,7 +278,7 @@ with tab_backtest:
                 "⭐ 穴馬激走ゾーン", "ヒモ穴", "割引", "厳しい"
             ]
         })
-    elif "重・不良馬場" in track_condition:
+    elif track_condition == "重・不良馬場（湿って速い・特殊馬場）":
         st.caption("🌧️ 重・不良馬場特性：スピードとダッシュ力が優先され、中位〜下位指数（6〜8位）の穴馬が激走しやすい傾向。")
         hit_rate_data = pd.DataFrame({
             "指数順位": ["1位", "2位", "3位", "4位", "5位", "6位", "7位", "8位", "9位", "10位以下"],
@@ -315,9 +315,12 @@ with tab_backtest:
     </div>
     """, unsafe_allow_html=True)
 
-    # --- グラフのシード値にラジオボタンの選択文字を完全にハッシュ化して連動 ---
-    st.markdown(f"### 📉 累積収支シミュレーション推移 ({track_condition} 反映版)")
-    seed_val = abs(hash(track_condition + bt_strategy)) % (2**32)
+    # --- グラフの描画部分（完全にユニークなプレースホルダーとして強制再描画） ---
+    st.markdown(f"### 📉 累積収支シミュレーション推移 ({track_condition})")
+    
+    # 選択された条件文字列をすべて結合してハッシュ化し、グラフの形状を完全に変化させる
+    seed_string = f"{track_condition}_{bt_strategy}_{bet_unit}"
+    seed_val = abs(hash(seed_string)) % (2**31)
     np.random.seed(seed_val)
     
     payout_factor = (roi / 100.0)
@@ -330,4 +333,8 @@ with tab_backtest:
         "シミュレーション経過 (レース単位)": range(1, steps + 1),
         "累積収支 (円)": cumulative_profit
     })
-    st.line_chart(chart_data, x="シミュレーション経過 (レース単位)", y="累積収支 (円)")
+    
+    # グラフ要素が確実に再マウントされるよう空コンテナと組み合わせて表示
+    chart_container = st.container()
+    with chart_container:
+        st.line_chart(chart_data, x="シミュレーション経過 (レース単位)", y="累積収支 (円)")
