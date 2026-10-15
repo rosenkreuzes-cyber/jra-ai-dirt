@@ -42,28 +42,20 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-st.title("🏇 JRA 黄金パターン AI ダッシュボード [厳格・実データ検証版]")
+st.title("🏇 JRA 黄金パターン AI ダッシュボード [厳格・実データファクト分析版]")
 
 # --- サイドバー ---
 with st.sidebar:
-    st.header("⚙️ 資金・検証設定")
+    st.header("⚙️ 設定")
     bet_unit = st.number_input("1点あたりの金額 (円)", min_value=100, max_value=10000, value=100, step=100, key="final_unit")
     
     st.markdown("---")
-    st.markdown("### 📊 分析モード・戦略")
-    bt_strategy = st.selectbox(
+    st.markdown("### 📊 分析モード")
+    analysis_mode = st.selectbox(
         "検証戦略", 
-        ["黄金パターン (6-7人気軸 / 相手4頭)", "指数3位軸 (堅実型 / 相手4頭)"], 
+        ["上位5頭の入着実績ファクト分析", "黄金パターン軸馬傾向検証"], 
         key="final_strat"
     )
-
-# --- 3連複の正確な重複なし（6点）生成ロジック ---
-def generate_exact_sanrenpuku_mult(axis, others):
-    bets = []
-    for pair in itertools.combinations(others, 2):
-        comb = sorted([axis, pair[0], pair[1]])
-        bets.append(f"{comb[0]} - {comb[1]} - {comb[2]}")
-    return sorted(list(set(bets)))
 
 # --- AI指数の算出ロジック ---
 def calculate_ai_indices(horses_data):
@@ -78,10 +70,10 @@ def calculate_ai_indices(horses_data):
     return df.sort_values('idx_rank').reset_index(drop=True)
 
 # --- タブ ---
-tab_live, tab_backtest = st.tabs(["📍 本日のレース & AIスコアリング (LIVE)", "📈 実データ過去検証・バックテスト"])
+tab_live, tab_backtest = st.tabs(["📍 本日のレース & AIスコアリング (LIVE)", "📈 実データ・入着実績ファクト分析"])
 
 with tab_live:
-    st.caption("【厳密検証】重複なし6点フォーメーションとリアルタイムAIスコアリング")
+    st.caption("【厳密検証】リアルタイムAIスコアリングと出走馬評価")
 
     sample_race_horses = [
         {"horse_no": 2, "name": "メイショウモウコ", "pop_rank": 3, "time_index": 78.5, "last3f_index": 72.0, "track_aptitude": 80.0},
@@ -97,20 +89,15 @@ with tab_live:
     
     axis_candidates = scored_df[(scored_df['pop_rank'] >= 5) & (scored_df['pop_rank'] <= 8)]
     recommended_axis = axis_candidates.iloc[0] if not axis_candidates.empty else scored_df.iloc[1]
-    others_list = scored_df[scored_df['horse_no'] != recommended_axis['horse_no']]['horse_no'].tolist()[:4]
-
-    exact_bets = generate_exact_sanrenpuku_mult(int(recommended_axis['horse_no']), others_list)
-    total_investment = len(exact_bets) * bet_unit
 
     st.markdown(f"""
     <div class="race-card">
-        <span style="background-color: #2d3748; color: #63b3ed; padding: 2px 8px; border-radius: 4px; font-size: 0.75rem;">📅 10月17日(土) 開催</span>
+        <span style="background-color: #2d3748; color: #63b3ed; padding: 2px 8px; border-radius: 4px; font-size: 0.75rem;">📅 開催直前情報</span>
         <span class="confidence-badge">🔥 自信度: ★★★★☆</span>
-        <h3 style="margin-top: 8px;">AI自動選定された黄金パターン推奨軸馬</h3>
+        <h3 style="margin-top: 8px;">AI自動選定された注目軸馬候補</h3>
         <p style='margin: 4px 0; font-size: 0.85rem; color: #a0aec0;'>
             <b>🎯 AI推奨軸:</b> 馬番 <b>{int(recommended_axis['horse_no'])}番 ({recommended_axis['name']})</b><br>
-            <b>📊 期待値ギャップ評価:</b> 世間人気 <span style="color: #f6e05e;">{int(recommended_axis['pop_rank'])}番人気</span> ⇄ <b>AI指数順位: 第{int(recommended_axis['idx_rank'])}位</b> (ギャップ: +{int(recommended_axis['divergence'])})<br>
-            <b>📌 厳密フォーメーション (6点):</b> 投資額 {total_investment:,} 円
+            <b>📊 期待値ギャップ評価:</b> 世間人気 <span style="color: #f6e05e;">{int(recommended_axis['pop_rank'])}番人気</span> ⇄ <b>AI指数順位: 第{int(recommended_axis['idx_rank'])}位</b>
         </p>
     </div>
     """, unsafe_allow_html=True)
@@ -121,52 +108,50 @@ with tab_live:
     })
     st.dataframe(display_df, use_container_width=True, hide_index=True)
 
-    table_markdown = "| 買い目番号 | 3連複 厳密フォーメーション (6点) | 点数 |\n|:---:|:---:|:---:|\n"
-    for idx, bet in enumerate(exact_bets, 1):
-        table_markdown += f"| **#{idx}** | {bet} | 1点 |\n"
-    st.markdown(table_markdown)
-
 with tab_backtest:
-    st.markdown("### 📈 実データ連動型バックテスト・エンジン")
+    st.markdown("### 📈 実データ・入着実績ファクト分析")
+    st.caption("架空の回収率や払戻金は一切排除し、実際のJRAダート戦における上位馬の入着傾向を検証します。")
     
     if not is_dataloader_available:
         st.markdown("""
         <div class="error-box">
-            <b>⚠️ エラー: data_loader.py が検出されません。</b><br>
-            実データに基づかない架空の数値表示は行いません。
+            <b>⚠️ エラー: data_loader.py が検出されません。</b>
         </div>
         """, unsafe_allow_html=True)
         st.stop()
 
-    # 正しい実データCSVをロード
     df, status_msg = data_loader.load_historical_jra_data()
     
     if df.empty:
         st.markdown(f"""
         <div class="error-box">
-            <b>⚠️ 実データ未検出（未検証ステータス）</b><br>
-            {status_msg}<br><br>
-            <b>【対応方法】</b> Googleドライブ内にある <code>dirt_races_201812_202107_clean.csv</code> をリポジトリのルートにアップロードしてください。実データが確認できるまでバックテストおよび回収率の算出・表示は停止されます。
+            <b>⚠️ 実データ未検出（未検証ステータス）</b><br>{status_msg}
         </div>
         """, unsafe_allow_html=True)
         st.stop()
     else:
-        bt_results = data_loader.run_strict_backtest(df)
+        with st.spinner("実データの入着傾向を集計中..."):
+            stats = data_loader.run_strict_backtest(df)
+            
+        if not stats:
+            st.markdown("""
+            <div class="error-box"><b>⚠️ データ集計エラー:</b> 必要なカラムが不足しています。</div>
+            """, unsafe_allow_html=True)
+            st.stop()
         
-        st.success("実データCSVの読み込みに成功しました。")
+        st.success("実データの集計が完了しました。")
         
-        col1, col2, col3, col4 = st.columns(4)
-        col1.metric("検証レース数", f"{bt_results['total_races']:,} レース")
-        col2.metric("実測的中率", f"{bt_results['hit_rate']}%")
-        col3.metric("平均払戻", f"{bt_results['avg_payout']:,} 円")
-        col4.metric("実測回収率 (ROI)", f"{bt_results['roi']}%")
+        col1, col2, col3 = st.columns(3)
+        col1.metric("検証対象レース数", f"{stats['total_races']:,} レース")
+        col2.metric("上位5頭の1着制覇率", f"{stats['win_rate']}%")
+        col3.metric("上位5頭の3着内平均頭数", f"{stats['avg_podium']} 頭 / 3頭")
 
         st.markdown(f"""
         <div class="result-box">
-            <b>📐 実データ集計サマリー (<code>dirt_races_201812_202107_clean.csv</code> 連携)</b><br>
-            * 総投資金額: <code>{int(bt_results['total_investment']):,} 円</code><br>
-            * 総払戻金額: <code>{int(bt_results['total_payout']):,} 円</code><br>
+            <b>📐 ファクト分析サマリー (<code>dirt_races_201812_202107_clean.csv</code> 連携)</b><br>
+            * 検証レース総数: <code>{stats['total_races']:,} レース</code><br>
+            * 上位5頭が勝利したレース数: <code>{stats['top5_win_count']:,} レース</code><br>
             <hr style="border-color: #374151; margin: 8px 0;">
-            <b>📌 状態:</b> 架空データを完全に排除し、実際のCSV構造に基づいた厳格な検証モードで稼働中です。
+            <b>📌 運用方針:</b> 利益や回収率の誇大表示を完全排除し、実際の着順データに基づいた客観的な統計のみを表示しています。
         </div>
         """, unsafe_allow_html=True)
