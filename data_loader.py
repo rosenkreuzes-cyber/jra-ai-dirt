@@ -6,37 +6,31 @@ import streamlit as st
 @st.cache_data
 def load_historical_jra_data(filepath="dirt_races_201812_202107_clean.csv"):
     """
-    JRAのダート実績データCSVを確実かつ安全に読み込む。
-    複数の候補パスを自動探索します。
+    JRAのダート実績データCSVを読み込み、エラー時は詳細な例外理由を返す。
     """
-    # 探索するパスの候補リスト
-    candidate_paths = [
-        filepath,
-        "dirt_races_201812_202107_clean.csv",
-        "./dirt_races_201812_202107_clean.csv",
-        "jra_historical_data.csv"
-    ]
-    
     target_path = None
-    for path in candidate_paths:
+    for path in [filepath, "dirt_races_201812_202107_clean.csv", "./dirt_races_201812_202107_clean.csv"]:
         if os.path.exists(path):
             target_path = path
             break
             
     if not target_path:
-        # デバッグ用にカレントディレクトリのファイル一覧をメッセージに含める
         current_files = os.listdir(".") if os.path.exists(".") else []
-        return pd.DataFrame(), f"実データファイルが見つかりません。(探索パス: {candidate_paths}, 現在のフォルダ内ファイル: {current_files})"
+        return pd.DataFrame(), f"ファイルが見つかりません。現在地のファイル一覧: {current_files}"
     
     try:
-        try:
-            df = pd.read_csv(target_path, encoding='utf-8', low_memory=False)
-        except UnicodeDecodeError:
-            df = pd.read_csv(target_path, encoding='cp932', low_memory=False)
-            
+        # まず utf-8 で試行
+        df = pd.read_csv(target_path, encoding='utf-8', low_memory=False)
         return df, "success"
+    except UnicodeDecodeError:
+        try:
+            # 駄目なら cp932 (Shift-JIS) で試行
+            df = pd.read_csv(target_path, encoding='cp932', low_memory=False)
+            return df, "success"
+        except Exception as e:
+            return pd.DataFrame(), f"CP932読込エラー: {str(e)}"
     except Exception as e:
-        return pd.DataFrame(), f"データ読み込みエラー: {str(e)}"
+        return pd.DataFrame(), f"予期せぬ読込エラー: {str(e)}"
 
 @st.cache_data
 def run_strict_backtest(df):
