@@ -44,124 +44,77 @@ st.title("🏇 JRA 黄金パターン AI ダッシュボード [Ver.2 厳密検�
 # --- サイドバー ---
 with st.sidebar:
     st.header("⚙️ 資金・検証設定")
-    bet_unit = st.number_input("1点あたりの金額 (円)", min_value=100, max_value=10000, value=100, step=100, key="s2_unit")
+    bet_unit = st.number_input("1点あたりの金額 (円)", min_value=100, max_value=10000, value=100, step=100, key="s3_unit")
     
     st.markdown("---")
     st.markdown("### 📊 分析モード・戦略")
     bt_strategy = st.selectbox(
         "検証戦略", 
         ["黄金パターン (6-7人気軸 / 相手4頭)", "指数3位軸 (堅実型 / 相手4頭)"], 
-        key="s2_strat"
+        key="s3_strat"
     )
 
-# --- ステップ1: 正確な3連複マルチ（重複なし）生成ロジック ---
+# --- 3連複の正確な重複なし（6点）生成ロジック ---
 def generate_exact_sanrenpuku_mult(axis, others):
-    """
-    軸1頭（固定）＋相手4頭から2頭を選ぶ組み合わせ（計6点）を生成
-    """
     bets = []
     for pair in itertools.combinations(others, 2):
         comb = sorted([axis, pair[0], pair[1]])
         bets.append(f"{comb[0]} - {comb[1]} - {comb[2]}")
     return sorted(list(set(bets)))
 
+# --- 【ステップ3の核心】論理的AI指数の算出ロジック ---
+def calculate_ai_indices(horses_data):
+    """
+    各馬のファクター（走破タイム指数、上がり指数、馬場適性）を合算してAI総合指数を算出し、
+    指数順位（1位が最高得点）を自動決定する。
+    """
+    df = pd.DataFrame(horses_data)
+    # AI総合指数の算出式（重み付けスコアリング）
+    df['ai_score'] = (
+        df['time_index'] * 0.4 + 
+        df['last3f_index'] * 0.3 + 
+        df['track_aptitude'] * 0.3
+    )
+    # 指数順位の算出（高い順に 1, 2, 3...）
+    df['idx_rank'] = df['ai_score'].rank(ascending=False, method='min').astype(int)
+    # 期待値ギャップ（人気順 - 指数順位：プラスが大きいほど過小評価のお宝馬）
+    df['divergence'] = df['pop_rank'] - df['idx_rank']
+    return df.sort_values('idx_rank').reset_index(drop=True)
+
 # --- タブ ---
-tab_live, tab_backtest = st.tabs(["🎯 本日の推奨レース (LIVE)", "📈 過去データ検証・シミュレータ"])
+tab_live, tab_backtest = st.tabs(["📍 本日のレース & AIスコアリング (LIVE)", "📈 過去データ検証・シミュレータ"])
 
 with tab_live:
-    st.caption("【ステップ1適用】重複なし厳密6点フォーメーションによるLIVE予測")
+    st.caption("【ステップ3適用】固定値ではなく、タイム・上がり・適性データから動的にAI指数とギャップを算出します。")
 
-    races = [
-        {
-            "title": "📍 東京 10R - ダート 1600m（秋季ダート条件戦）",
-            "day": "📅 10月17日(土) 開催",
-            "confidence": "🔥 自信度: ★★★★☆ (勝負)",
-            "axis": 4,
-            "axis_name": "テイエムスパーダ",
-            "pop_rank": 6,
-            "idx_rank": 2,
-            "others": [2, 7, 9, 12],
-            "result_status": "⏳ レース前 / 確定待ち",
-            "winning_comb": "-",
-            "payout": "-"
-        }
+    # サンプルレースの出走馬データ（実データ連携の前段階としての構造化データ）
+    sample_race_horses = [
+        {"horse_no": 2, "name": "メイショウモウコ", "pop_rank": 3, "time_index": 78.5, "last3f_index": 72.0, "track_aptitude": 80.0},
+        {"horse_no": 4, "name": "テイエムスパーダ", "pop_rank": 6, "time_index": 84.0, "last3f_index": 82.5, "track_aptitude": 85.0}, # ← AI指数上位の過小評価馬
+        {"horse_no": 7, "name": "サンライズホープ", "pop_rank": 1, "time_index": 88.0, "last3f_index": 75.0, "track_aptitude": 82.0},
+        {"horse_no": 9, "name": "ロードエクレール", "pop_rank": 4, "time_index": 79.0, "last3f_index": 78.0, "track_aptitude": 76.0},
+        {"horse_no": 12, "name": "グレートサンド", "pop_rank": 8, "time_index": 75.0, "last3f_index": 74.0, "track_aptitude": 78.0}
     ]
 
-    for r in races:
-        exact_bets = generate_exact_sanrenpuku_mult(r["axis"], r["others"])
-        total_points = len(exact_bets) # 確実に6点になる
-        total_investment = total_points * bet_unit
-        
-        st.markdown(f"""
-        <div class="race-card">
-            <span style="background-color: #2d3748; color: #63b3ed; padding: 2px 8px; border-radius: 4px; font-size: 0.75rem;">{r["day"]}</span>
-            <span class="confidence-badge">{r["confidence"]}</span>
-            <h3 style="margin-top: 8px;">{r["title"]}</h3>
-            <p style='margin: 4px 0; font-size: 0.85rem; color: #a0aec0;'>
-                <b>🔥 軸馬:</b> 馬番 <b>{r["axis"]}番 ({r["axis_name"]})</b> (人気:{r["pop_rank"]}番 ⇄ 指数順:{r["idx_rank"]}位)<br>
-                <b>🎯 相手選択:</b> 馬番 {r["others"]}<br>
-                <b>📌 買い目点数:</b> <span style="color: #68D391; font-weight: bold;">{total_points} 点</span> （1レース投資額: {total_investment:,} 円）
-            </p>
-        </div>
-        """, unsafe_allow_html=True)
-        
-        table_markdown = "| 買い目番号 | 3連複 厳密フォーメーション (6点) | 点数 | 備考 |\n|:---:|:---:|:---:|:---:|\n"
-        for idx, bet in enumerate(exact_bets, 1):
-            table_markdown += f"| **#{idx}** | {bet} | 1点 | 軸{r["axis"]}含むペア |\n"
-        
-        st.markdown(table_markdown)
+    # AIスコアリングの実行
+    scored_df = calculate_ai_indices(sample_race_horses)
 
-with tab_backtest:
-    st.markdown("### 📈 【ステップ2対応】数学的整合性バックテスト・エンジン")
-    st.caption("投資額（6点×単価）に対し、的中率と平均配当から厳密に期待回収率を算出するモデルです。")
-
-    # --- ステップ2の核心：数学的整合性モデルの定義 ---
-    points_per_race = 6 # 軸1頭＋相手4頭の3連複マルチ（重複なし）＝6点固定
-    investment_per_race = points_per_race * bet_unit
-
-    if "黄金パターン" in bt_strategy:
-        hit_rate = 14.5       # 的中率 (14.5%)
-        avg_payout = 7500     # 的中時の平均払戻金 (7,500円)
-        max_dd = 12
-        strat_desc = "6〜7番人気を軸に据え、的中時の高配当（平均7,500円超え）で回収率の最大化を狙う戦略。"
+    st.markdown("### 📍 東京 10R - ダート 1600m（AIスコアリング結果）")
+    
+    # 黄金パターンに合致する軸馬（指数上位かつ6-7人気近辺）の自動選定
+    # ここでは例として指数が高く、かつ人気が5〜8位の馬を軸候補としてピックアップ
+    axis_candidates = scored_df[(scored_df['pop_rank'] >= 5) & (scored_df['pop_rank'] <= 8)]
+    if not axis_candidates.empty:
+        recommended_axis = axis_candidates.iloc[0]
     else:
-        hit_rate = 26.0       # 的中率 (26.0%)
-        avg_payout = 3200     # 的中時の平均払戻金 (3,200円)
-        max_dd = 6
-        strat_desc = "指数上位を軸に据え、手堅く的中を積み重ねる堅実型戦略。"
+        recommended_axis = scored_df.iloc[1] # フォールバック
 
-    # 【重要】数学的ROIの計算式： (的中確率 × 平均払戻金) / 1レース投資額 × 100
-    expected_return_per_race = (hit_rate / 100.0) * avg_payout
-    calculated_roi = (expected_return_per_race / investment_per_race) * 100
+    # 相手馬（軸以外の上位馬）の選定
+    others_list = scored_df[scored_df['horse_no'] != recommended_axis['horse_no']]['horse_no'].tolist()[:4]
 
-    col1, col2, col3, col4 = st.columns(4)
-    col1.metric("1レース投資額", f"{investment_per_race:,} 円", f"6点 × {bet_unit}円")
-    col2.metric("モデル的中率", f"{hit_rate}%")
-    col3.metric("的中時 平均払戻", f"{avg_payout:,} 円")
-    col4.metric("算出ROI (期待回収率)", f"{calculated_roi:.1f}%", delta=f"{calculated_roi - 100:+.1f}% vs 資金")
+    exact_bets = generate_exact_sanrenpuku_mult(int(recommended_axis['horse_no']), others_list)
+    total_investment = len(exact_bets) * bet_unit
 
     st.markdown(f"""
-    <div class="result-box">
-        <b>📐 期待値・ROI計算の検証ログ (数学的整合性チェック)</b><br>
-        * 1レース期待リターン: <code>{expected_return_per_race:.1f} 円</code> (的中率 {hit_rate}% × 平均払戻 {avg_payout:,}円)<br>
-        * 1レース投資コスト: <code>{investment_per_race:,} 円</code><br>
-        * 計算式: <code>({expected_return_per_race:.1f} ÷ {investment_per_race:,}) × 100 ＝ {calculated_roi:.1f}%</code><br>
-        <hr style="border-color: #374151; margin: 8px 0;">
-        <b>📌 戦略特性:</b> {strat_desc}
-    </div>
-    """, unsafe_allow_html=True)
-
-    # 収支シミュレーション推移グラフ
-    st.markdown("### 📉 厳密な確率モデルに基づく累積収支シミュレーション (50レース)")
-    np.random.seed(42)
-    steps = 50
-    # 各レースの収支 = (当たれば avg_payout、外れれば 0) - investment_per_race
-    race_returns = np.random.choice([0, avg_payout], size=steps, p=[1 - (hit_rate/100), hit_rate/100])
-    net_profit_per_race = race_returns - investment_per_race
-    cumulative_profit = np.cumsum(net_profit_per_race)
-    
-    chart_data = pd.DataFrame({
-        "シミュレーション経過 (レース単位)": range(1, steps + 1),
-        "累積収支 (円)": cumulative_profit
-    })
-    st.line_chart(chart_data, x="シミュレーション経過 (レース単位)", y="累積収支 (円)")
+    <div class="race-card">
+        <span style="background-color: #2d3
