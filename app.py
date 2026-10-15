@@ -144,7 +144,7 @@ with tab_backtest:
         col1, col2, col3 = st.columns(3)
         col1.metric("検証対象レース数", f"{stats['total_races']:,} レース")
         col2.metric("上位5頭の1着制覇率", f"{stats['win_rate']}%")
-        col3.metric("上位5頭の3着内平均頭数", f"{stats['avg_podium']} 頭 / 3頭")
+        col3.metric("上位5頭の3着内平均", f"{stats['avg_podium']} 頭")
 
         st.markdown(f"""
         <div class="result-box">
