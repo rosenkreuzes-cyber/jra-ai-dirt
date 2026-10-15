@@ -1,21 +1,19 @@
 import os
 import pandas as pd
 
-def load_historical_jra_data(filepath="jra_official_ratings_2018_2026.csv"):
+def load_historical_jra_data(filepath="dirt_races_201812_202107_clean.csv"):
     """
-    JRAの公式実績データCSV（2018〜2026年）を読み込む。
-    ファイルが存在しない場合はローカルの別名もフォールバックとして探索する。
+    Googleドライブ内にある実際のJRAダート戦データCSVを読み込む。
     """
     target_path = filepath
     if not os.path.exists(target_path):
-        # 代替パスの確認
+        # 代替として別名の可能性も考慮
         if os.path.exists("jra_historical_data.csv"):
             target_path = "jra_historical_data.csv"
         else:
-            return pd.DataFrame(), f"実データファイル ({filepath}) が見つかりません。"
+            return pd.DataFrame(), f"実データファイル ({filepath}) が見つかりません。リポジトリにアップロードされているか確認してください。"
     
     try:
-        # 文字コードエラーを防ぐため utf-8 / cp932 を自動切替
         try:
             df = pd.read_csv(target_path, encoding='utf-8')
         except UnicodeDecodeError:
@@ -27,18 +25,24 @@ def load_historical_jra_data(filepath="jra_official_ratings_2018_2026.csv"):
 
 def run_strict_backtest(df):
     """
-    読み込んだ実データフレームから検証件数や実績を集計する
+    実際のJRAデータフレームからレース数を集計する
     """
     if df.empty:
         return None
     
-    total_rows = len(df)
+    # レースID単位で集計
+    if 'レースID' in df.columns:
+        total_races = df['レースID'].nunique()
+    elif 'race_id' in df.columns:
+        total_races = df['race_id'].nunique()
+    else:
+        total_races = len(df) // 16 # 1レース平均頭数からの概算
     
     return {
-        "total_races": total_rows,
+        "total_races": total_races,
         "hits": 0,
         "hit_rate": 0.0,
-        "total_investment": total_rows * 600,
+        "total_investment": total_races * 600,
         "total_payout": 0,
         "roi": 0.0,
         "avg_payout": 0
