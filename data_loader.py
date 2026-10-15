@@ -1,8 +1,6 @@
 import os
 import pandas as pd
-import itertools
 import streamlit as st
-import traceback
 
 @st.cache_data
 def load_historical_jra_data(filepath="dirt_races_201812_202107_clean.csv"):
@@ -20,86 +18,62 @@ def load_historical_jra_data(filepath="dirt_races_201812_202107_clean.csv"):
         df = pd.read_csv(target_path, encoding='utf-8', low_memory=False)
         return df, "success"
     except Exception as e:
-        # エラーのフルスタックトレースを文字列として返す
-        error_detail = traceback.format_exc()
-        return pd.DataFrame(), f"読込例外詳細:\n{error_detail}"
+        try:
+            df = pd.read_csv(target_path, encoding='cp932', low_memory=False)
+            return df, "success"
+        except Exception as ex:
+            return pd.DataFrame(), f"読込エラー: {str(ex)}"
 
 @st.cache_data
 def run_strict_backtest(df):
+    """
+    架空の回収率・払戻金を完全廃止し、実データにおける上位馬（例: 上位5頭）の
+    実際の着順入着実績（1着率・2着率・3着内率）を厳密に集計する。
+    """
     if df.empty:
         return None
     
-    try:
-        race_id_col = 'レースID' if 'レースID' in df.columns else 'race_id'
-        rank_col = '着順' if '着順' in df.columns else 'rank'
-        pop_col = '人気' if '人気' in df.columns else 'popularity'
-        horse_no_col = '馬番' if '馬番' in df.columns else 'horse_no'
+    race_id_col = 'レースID' if 'レースID' in df.columns else 'race_id'
+    rank_col = '着順' if '着順' in df.columns else 'rank'
+    pop_col = '人気' if '人気' in df.columns else 'popularity'
+    
+    if race_id_col not in df.columns or rank_col not in df.columns or pop_col not in df.columns:
+        return None
 
-        grouped = df.groupby(race_id_col)
-        total_races = 0
-        hits = 0
-        points_per_race = 6
-        assumed_payout = 7500
+    grouped = df.groupby(race_id_col)
+    total_races = 0
+    
+    top5_win_count = 0      # 上位5頭のなかに1着馬がいたレース数
+    top5_podium_count = 0   # 上位5頭のなかに3着以内馬が入った延べ頭数
+    
+    for r_id, group in grouped:
+        g = group.copy()
+        g[pop_col] = pd.to_numeric(g[pop_col], errors='coerce')
+        g[rank_col] = pd.to_numeric(g[rank_col], errors='coerce')
+        g = g.dropna(subset=[pop_col, rank_col])
         
-        for r_id, group in grouped:
-            if len(group) < 6:
-                continue
-                
-            g = group.copy()
-            g[pop_col] = pd.to_numeric(g[pop_col], errors='coerce')
-            g[rank_col] = pd.to_numeric(g[rank_col], errors='coerce')
-            g[horse_no_col] = pd.to_numeric(g[horse_no_col], errors='coerce')
+        if len(g) < 5:
+            continue
             
-            axis_candidates = g[(g[pop_col] >= 5) & (g[pop_col] <= 8)]
-            if axis_candidates.empty:
-                continue
-                
-            podium = g[g[rank_col] <= 3][horse_no_col].dropna().astype(int).tolist()
-            if len(podium) < 3:
-                continue
-                
-            axis_row = axis_candidates.iloc[0]
-            axis_horse = int(axis_row[horse_no_col])
+        # 人気上位5頭を抽出
+        top5 = g.sort_values(pop_col).head(5)
+        
+        # 1着馬が上位5頭の中に含まれていたか
+        if (top5[rank_col] == 1).any():
+            top5_win_count += 1
             
-            others_pool = g[g[horse_no_col] != axis_horse].sort_values(pop_col)
-            others_list = others_pool[horse_no_col].head(4).dropna().astype(int).tolist()
-            
-            if len(others_list) < 4:
-                continue
-                
-            bets = []
-            for pair in itertools.combinations(others_list, 2):
-                comb = sorted([axis_horse, pair[0], pair[1]])
-                bets.append((comb[0], comb[1], comb[2]))
-                
-            actual_podium_set = set(podium[:3])
-            hit_flag = False
-            for bet in bets:
-                if set(bet) == actual_podium_set:
-                    hit_flag = True
-                    break
-                    
-            if hit_flag:
-                hits += 1
-                
-            total_races += 1
+        # 上位5頭のうち3着以内に入った頭数
+        podium_in_top5 = len(top5[top5[rank_col] <= 3])
+        top5_podium_count += podium_in_top5
+        
+        total_races += 1
 
-        total_investment = total_races * (points_per_race * 100)
-        total_payout = hits * assumed_payout
+    win_rate = round((top5_win_count / total_races) * 100, 2) if total_races > 0 else 0.0
+    avg_podium_in_top5 = round(top5_podium_count / total_races, 2) if total_races > 0 else 0.0
 
-        hit_rate = round((hits / total_races) * 100, 2) if total_races > 0 else 0.0
-        roi = round((total_payout / total_investment) * 100, 1) if total_investment > 0 else 0.0
-        avg_payout = int(total_payout / hits) if hits > 0 else 0
-
-        return {
-            "total_races": total_races,
-            "hits": hits,
-            "hit_rate": hit_rate,
-            "total_investment": total_investment,
-            "total_payout": total_payout,
-            "roi": roi,
-            "avg_payout": avg_payout
-        }
-    except Exception as e:
-        # バックテスト計算中のエラー詳細を例外として投げる
-        raise RuntimeError(f"バックテスト計算エラー: {traceback.format_exc()}")
+    return {
+        "total_races": total_races,
+        "win_rate": win_rate,
+        "avg_podium": avg_podium_in_top5,
+        "top5_win_count": top5_win_count
+    }
