@@ -6,14 +6,27 @@ import streamlit as st
 @st.cache_data
 def load_historical_jra_data(filepath="dirt_races_201812_202107_clean.csv"):
     """
-    JRAのダート実績データCSVを安全に読み込み、高速化のためにキャッシュする。
+    JRAのダート実績データCSVを確実かつ安全に読み込む。
+    複数の候補パスを自動探索します。
     """
-    target_path = filepath
-    if not os.path.exists(target_path):
-        if os.path.exists("jra_historical_data.csv"):
-            target_path = "jra_historical_data.csv"
-        else:
-            return pd.DataFrame(), f"実データファイル ({filepath}) が見つかりません。"
+    # 探索するパスの候補リスト
+    candidate_paths = [
+        filepath,
+        "dirt_races_201812_202107_clean.csv",
+        "./dirt_races_201812_202107_clean.csv",
+        "jra_historical_data.csv"
+    ]
+    
+    target_path = None
+    for path in candidate_paths:
+        if os.path.exists(path):
+            target_path = path
+            break
+            
+    if not target_path:
+        # デバッグ用にカレントディレクトリのファイル一覧をメッセージに含める
+        current_files = os.listdir(".") if os.path.exists(".") else []
+        return pd.DataFrame(), f"実データファイルが見つかりません。(探索パス: {candidate_paths}, 現在のフォルダ内ファイル: {current_files})"
     
     try:
         try:
@@ -28,7 +41,7 @@ def load_historical_jra_data(filepath="dirt_races_201812_202107_clean.csv"):
 @st.cache_data
 def run_strict_backtest(df):
     """
-    実際のダートレースデータから黄金パターン（5〜8人気を軸、他を相手）の厳密な的中判定を行う（キャッシュ対応）。
+    実際のダートレースデータから黄金パターン（5〜8人気を軸、他を相手）の厳密な的中判定を行う。
     """
     if df.empty:
         return None
