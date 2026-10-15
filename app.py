@@ -1,352 +1,121 @@
-import streamlit as st
-import itertools
+"""JRA ダート分析 / 実データCSV版. Run: streamlit run app.py"""
+import io
 import pandas as pd
 import numpy as np
+import streamlit as st
+from core import (FEATURES,HIST_REQUIRED,UPCOMING_REQUIRED,ODDS_REQUIRED,PAYOUT_REQUIRED,
+                  validate,select_features,fit_model,predict,build_tickets,backtest)
 
-# ページのレイアウト設定
-st.set_page_config(
-    page_title="JRA 黄金パターン馬券アシスタント",
-    page_icon="🏇",
-    layout="centered"
-)
+st.set_page_config(page_title='JRA ダートAI 実データ分析',page_icon='🏇',layout='wide')
+st.title('🏇 JRA ダートAI 実データ分析')
+st.caption('実測CSVのみ使用｜過去データで学習 → 未使用期間で検証｜3連複は重複なし')
+st.warning('このアプリは自動でJRAのデータを取得しません。架空の的中率・オッズ・払戻は表示しません。AI指数と3連複確率は推定値であり、利益を保証しません。')
 
-# --- カスタムCSS ---
-st.markdown("""
-<style>
-    .main {
-        background-color: #0e1117;
-    }
-    h1 {
-        font-size: 1.4rem !important;
-        color: #ff4b4b;
-    }
-    h3 {
-        font-size: 1.1rem !important;
-        color: #f6e05e;
-    }
-    .race-card {
-        background-color: #1a1c23;
-        padding: 15px;
-        border-radius: 10px;
-        border-left: 5px solid #ff4b4b;
-        margin-bottom: 15px;
-    }
-    .control-box {
-        background-color: #161b22;
-        border: 1px solid #30363d;
-        padding: 12px;
-        border-radius: 8px;
-        margin-bottom: 20px;
-    }
-    .result-box {
-        background-color: #111827;
-        border: 1px solid #374151;
-        padding: 12px;
-        border-radius: 8px;
-        margin-top: 12px;
-        font-size: 0.85rem;
-    }
-    .backtest-box {
-        background-color: #1f2937;
-        border: 1px solid #4b5563;
-        padding: 15px;
-        border-radius: 10px;
-        margin-bottom: 20px;
-    }
-    .confidence-badge {
-        background-color: #b7791f;
-        color: #ffffff;
-        padding: 2px 8px;
-        border-radius: 4px;
-        font-size: 0.75rem;
-        font-weight: bold;
-        float: right;
-    }
-    .divergence-tag {
-        background-color: #2b6cb0;
-        color: #ffffff;
-        padding: 2px 6px;
-        border-radius: 4px;
-        font-size: 0.75rem;
-        font-weight: bold;
-    }
-</style>
-""", unsafe_allow_html=True)
+with st.expander('CSV仕様・データ作成時の注意（必読）',expanded=False):
+    st.markdown('''**過去レースCSV**: race_id, race_date (YYYY-MM-DD), horse_no, horse_name, surface (dirt), finish、およびレース前に確定している特徴量。1行=1頭。全出走馬を収録。取消・中止等は除外し、各レースの1着馬を1頭にしてください。\n
+**予測対象CSV**: 過去レースCSVから finish を除いた形式。\n
+**3連複オッズCSV**: race_id,horse1,horse2,horse3,trio_odds。オッズは倍率（例 25.6）、購入判断時点のスナップショットを使用。\n
+**払戻CSV**: race_id,horse1,horse2,horse3,trio_payout_100。JRAの3連複100円あたり払戻金（円）。各レースの的中組1行。\n
+**特徴量**: past_speed（過去走のみの速度指数）、past_finish_avg（過去着順平均）、past_last3f（過去上がり3F）、distance_fit（距離適性）、track_fit（コース適性）、going_fit（馬場適性）、early_pace（先行力）、rest_days（休養日数）、draw（枠番）、carried_weight（斤量）。単位・算出期間はCSV全体で統一してください。\n
+**重要**: 特徴量は必ず対象レース発走前に得られる情報から作成。対象レースの確定着順・走破時計・払戻・確定オッズを特徴量に混ぜないでください。オッズCSVも購入時点の記録が必要です。''')
+    hist_cols=HIST_REQUIRED+FEATURES
+    samples=[('過去レース_テンプレート.csv',hist_cols),('予測対象_テンプレート.csv',UPCOMING_REQUIRED+FEATURES),('3連複オッズ_テンプレート.csv',ODDS_REQUIRED),('3連複払戻_テンプレート.csv',PAYOUT_REQUIRED)]
+    for filename,cols in samples:
+        st.download_button(filename,pd.DataFrame(columns=cols).to_csv(index=False).encode('utf-8-sig'),filename,mime='text/csv',key=filename)
 
-# --- タイトル ---
-st.title("🏇 JRA 黄金パターン AI ダッシュボード")
+def upload(label,key):
+    file=st.file_uploader(label,type='csv',key=key)
+    if file is None: return None
+    try:
+        return pd.read_csv(file,encoding='utf-8-sig',dtype={'race_id':str})
+    except Exception as e:
+        st.error(f'{label}: CSV読み込み失敗: {e}')
+        return None
 
-# --- サイドバー（資金・シミュレーション設定） ---
 with st.sidebar:
-    st.header("⚙️ 資金・検証設定")
-    bet_unit = st.number_input("1点あたりの金額 (円)", min_value=100, max_value=10000, value=100, step=100, key="sb_bet_v5")
-    
-    st.markdown("---")
-    st.markdown("### 📊 バックテスト条件")
-    bt_years = st.selectbox("検証期間", ["2018年 〜 2021年 (4年間)", "直近1年間"], key="sb_years_v5")
-    bt_strategy = st.selectbox("戦略パターン", ["黄金パターン (6-7人気軸)", "指数3位＋相関フィルタ軸"], key="sb_strat_v5")
-    
-    total_races = 3
-    total_points_per_race = 12
-    total_points = total_races * total_points_per_race
-    st.markdown(f"**1レース投資:** {total_points_per_race * bet_unit} 円 (12点)")
+    st.header('⚙️ 分析設定')
+    stake=st.number_input('1点の購入金額（円）',min_value=100,max_value=10000,value=100,step=100)
+    axis_rank=st.selectbox('軸馬 AI順位',[1,2,3,4,5],index=0)
+    other_count=st.slider('相手頭数',2,8,4)
+    min_ev=st.slider('期待ROI下限（例 0.1 = +10%）',-0.5,2.0,0.0,0.05)
+    n_sim=st.select_slider('3連複確率シミュレーション回数',[5000,10000,30000,60000],value=30000)
+    train_ratio=st.slider('バックテスト学習期間の比率',0.5,0.9,0.7,0.05)
 
-# --- 1頭軸マルチ（12点）の組み合わせ生成関数 ---
-def generate_mult_bets(axis, others):
-    final_bets = []
-    for p1 in others:
-        for p2 in others:
-            if p1 < p2:
-                final_bets.append(f"{axis} - {p1} - {p2}")
-                final_bets.append(f"{p1} - {axis} - {p2}")
-    return sorted(list(set(final_bets)))[:12]
+st.subheader('1. データを読み込む')
+c1,c2=st.columns(2)
+with c1:
+    history=upload('過去レース（学習・検証用）','history')
+    upcoming=upload('予測対象レース（任意）','upcoming')
+with c2:
+    odds=upload('3連複オッズ（任意・期待値判定に必要）','odds')
+    payouts=upload('過去の3連複払戻（バックテストに必要）','payouts')
 
-# --- タブの作成 ---
-tab_live, tab_backtest = st.tabs(["🎯 本日の推奨レース (LIVE)", "📈 過去データ検証・シミュレータ"])
+try:
+    if history is not None: history=validate(history,HIST_REQUIRED,'過去レース')
+    if upcoming is not None: upcoming=validate(upcoming,UPCOMING_REQUIRED,'予測対象')
+    if odds is not None:
+        odds=validate(odds,ODDS_REQUIRED,'オッズ')
+        odds['trio_odds']=pd.to_numeric(odds['trio_odds'],errors='coerce')
+        if odds['trio_odds'].isna().any() or (odds['trio_odds']<=0).any(): raise ValueError('trio_oddsは正の数値で入力してください')
+    if payouts is not None:
+        payouts=validate(payouts,PAYOUT_REQUIRED,'払戻')
+        payouts['trio_payout_100']=pd.to_numeric(payouts['trio_payout_100'],errors='coerce')
+        if payouts['trio_payout_100'].isna().any() or (payouts['trio_payout_100']<0).any(): raise ValueError('trio_payout_100は0以上の数値で入力してください')
+except Exception as e:
+    st.error(f'データ検証エラー: {e}')
+    st.stop()
 
-# ==========================================
-# タブ 1: LIVE 運用画面
-# ==========================================
-with tab_live:
-    st.caption("1頭軸マルチ（12点買い）＆ 期待値ギャップ（人気 vs 指数）トラッカー")
-
-    st.markdown("""
-    <div class="control-box">
-        <b>⚙️ 運用・オッズ取得コントロール</b>
-    </div>
-    """, unsafe_allow_html=True)
-
-    odds_mode = st.radio(
-        "📊 オッズ取得タイミング",
-        ["当日朝 7:00 時点固定", "一括手動取得（ボタン実行）"],
-        horizontal=True,
-        key="live_odds_v5"
-    )
-
-    if odds_mode == "一括手動取得（ボタン実行）":
-        if st.button("🔄 今すぐオッズを一括取得する", type="primary", key="btn_odds_v5", use_container_width=True):
-            st.success("最新オッズの取得が完了しました！")
-    else:
-        st.info("⏰ 当日朝 7:00 時点のオッズデータを自動適用中です。")
-
-    # 推奨レースデータ（各馬の人気順位と指数順位のギャップを内包）
-    races = [
-        {
-            "title": "📍 東京 10R - ダート 1600m（秋季ダート条件戦）",
-            "day": "📅 10月17日(土) 開催",
-            "confidence": "🔥 自信度: ★★★★☆ (勝負)",
-            "axis": 4,
-            "axis_name": "テイエムスパーダ",
-            "pop_rank": 6,   # 世間の人気順
-            "idx_rank": 2,   # AI指数順
-            "others": [2, 7, 9, 12],
-            "result_status": "⏳ レース前 / 確定待ち",
-            "winning_comb": "-",
-            "payout": "-"
-        },
-        {
-            "title": "📍 中山 11R - アケボノ賞",
-            "day": "📅 10月17日(土) 開催",
-            "confidence": "🔥 自信度: ★★★★★ (特選)",
-            "axis": 12,
-            "axis_name": "ゴールドバローズ",
-            "pop_rank": 7,   # 世間の人気順
-            "idx_rank": 3,   # AI指数順
-            "others": [1, 3, 5, 8],
-            "result_status": "⏳ レース前 / 確定待ち",
-            "winning_comb": "-",
-            "payout": "-"
-        },
-        {
-            "title": "📍 京都 11R - プロキオンステークス(G3)",
-            "day": "📅 10月18日(日) 開催",
-            "confidence": "⚡ 自信度: ★★★☆☆ (狙い目)",
-            "axis": 7,
-            "axis_name": "ヤマニンウルス",
-            "pop_rank": 2,   # 世間の人気順
-            "idx_rank": 1,   # AI指数順
-            "others": [4, 6, 11, 14],
-            "result_status": "⏳ レース前 / 確定待ち",
-            "winning_comb": "-",
-            "payout": "-"
-        }
-    ]
-
-    st.markdown("---")
-
-    for r in races:
-        # 乖離度の計算（人気順 - 指数順：プラスが大きいほど「世間に舐められている実力馬（お宝）」）
-        divergence_score = r["pop_rank"] - r["idx_rank"]
-        
-        bets = generate_mult_bets(r["axis"], r["others"])
-        dummy_odds = [f"{40.0 + i * 10.5:.1f}倍" for i in range(len(bets))]
-        
-        st.markdown(f"""
-        <div class="race-card">
-            <span style="background-color: #2d3748; color: #63b3ed; padding: 2px 8px; border-radius: 4px; font-size: 0.75rem; font-weight: bold;">{r["day"]}</span>
-            <span class="confidence-badge">{r["confidence"]}</span>
-            <h3 style="margin-top: 8px;">{r["title"]}</h3>
-            <p style='margin: 4px 0; font-size: 0.85rem; color: #a0aec0;'>
-                <b>🔥 軸馬選定:</b> 馬番 <b>{r["axis"]}番 ({r["axis_name"]})</b><br>
-                <b>📊 期待値ギャップ診断:</b> 世間人気 <span style="color: #f6e05e;">{r["pop_rank"]}番人気</span> ⇄ AI指数順位 <span style="color: #68D391;"><b>第{r["idx_rank"]}位</b></span> 
-                <span class="divergence-tag">過小評価度: +{divergence_score}</span><br>
-                <b>🎯 相手:</b> 馬番 {r["others"]} （1頭軸マルチ <b>12点買い</b>）
-            </p>
-        </div>
-        """, unsafe_allow_html=True)
-        
-        table_markdown = "| 買い目番号 | 3連複フォーメーション | 点数 | 予測オッズ |\n|:---:|:---:|:---:|:---:|\n"
-        for idx, (bet, odds) in enumerate(zip(bets, dummy_odds), 1):
-            table_markdown += f"| **#{idx}** | {bet} | 1点 | {odds} |\n"
-        
-        st.markdown(table_markdown)
-        
-        st.markdown(f"""
-        <div class="result-box">
-            <b>🏆 レース結果・着順・払戻金トラッカー</b><br>
-            ステータス: <span style="color: #f6e05e;">{r["result_status"]}</span><br>
-            的中馬番: <b>{r["winning_comb"]}</b> | 払戻配当: <span style="color: #68D391; font-weight: bold;">{r["payout"]}</span>
-        </div>
-        """, unsafe_allow_html=True)
-        
-        st.markdown("---")
-
-
-# ==========================================
-# タブ 2: 過去データ検証・シミュレータ画面
-# ==========================================
-with tab_backtest:
-    st.caption("📈 指数集積バックテスト・エンジン")
-    
-    st.markdown("""
-    <div class="backtest-box">
-        <h3 style="color: #60a5fa; margin-top: 0;">🧪 過去データ検証シミュレーション</h3>
-        <p style="font-size: 0.85rem; color: #d1d5db; line-height: 1.5;">
-            未来の着順バイアスを排除し、発走直前のスクリーニング指数とオッズ乖離データをもとに算出された過去集積シミュレーション結果です。
-        </p>
-    </div>
-    """, unsafe_allow_html=True)
-
-    st.markdown("### 🏟️ 馬場状態別・シミュレーション条件切替")
-    track_condition = st.radio(
-        "対象の馬場状態を選択してください",
-        ["ダート全体（平均値）", "良馬場（パサパサ・タフな馬場）", "重・不良馬場（湿って速い・特殊馬場）"],
-        horizontal=True,
-        key="track_cond_v5"
-    )
-
-    sim_races = 1240
-
-    if "黄金パターン" in bt_strategy:
-        if track_condition == "良馬場（パサパサ・タフな馬場）":
-            hit_rate = 16.2
-            avg_payout = 10800
-            roi = 171.5
-            max_dd = 13
-            desc = "【良馬場・黄金パターン】タフな馬場で地力が問われ、堅実性と配当が絶妙に噛み合う設定。"
-        elif track_condition == "重・不良馬場（湿って速い・特殊馬場）":
-            hit_rate = 14.5
-            avg_payout = 12600
-            roi = 183.2
-            max_dd = 15
-            desc = "【重・不良馬場・黄金パターン】高速ダートで波乱度が増し、中穴軸の一撃回収率が爆発する設定。"
-        else:
-            hit_rate = 15.4
-            avg_payout = 11540
-            roi = 177.8
-            max_dd = 14
-            desc = "6〜7番人気の過小評価馬を軸に据え、マルチ12点でヒモ荒れを狙い撃つ高回収率戦略。"
-    else:
-        if track_condition == "良馬場（パサパサ・タフな馬場）":
-            hit_rate = 28.0
-            avg_payout = 5800
-            roi = 115.0
-            max_dd = 7
-            desc = "【良馬場・指数3位軸】時計がかかる良馬場で指数上位の信頼度が最大化され、的中率が跳ね上がる設定。"
-        elif track_condition == "重・不良馬場（湿って速い・特殊馬場）":
-            hit_rate = 24.5
-            avg_payout = 6700
-            roi = 108.5
-            max_dd = 10
-            desc = "【重・不良馬場・指数3位軸】道悪の紛れにより的中率がやや落ちる分、配当が微増する設定。"
-        else:
-            hit_rate = 26.5
-            avg_payout = 6200
-            roi = 112.4
-            max_dd = 8
-            desc = "指数3位を軸に据え、相関性の高い補正指数で精度を極限まで高めた堅実・的中率重視戦略。"
-
-    col1, col2, col3 = st.columns(3)
-    col1.metric("検証レース数", f"{sim_races:,} レース")
-    col2.metric("的中率", f"{hit_rate}%", delta=f"{hit_rate - 15.4:+.1f}% vs 平均")
-    col3.metric("回収率 (ROI)", f"{roi}%", delta=f"{roi - 100:.1f}% vs 資金")
-
-    st.markdown(f"### 📊 指数別 複勝圏入着率マトリクス ({track_condition})")
-    
-    if track_condition == "良馬場（パサパサ・タフな馬場）":
-        st.caption("☀️ 良馬場特性：パワーと持続力が要求され、地力通り（指数上位）に決まりやすい傾向。")
-        hit_rate_data = pd.DataFrame({
-            "指数順位": ["1位", "2位", "3位", "4位", "5位", "6位", "7位", "8位", "9位", "10位以下"],
-            "複勝率 (良)": ["60.5%", "48.0%", "39.2%", "31.5%", "24.8%", "19.5%", "16.0%", "12.0%", "8.5%", "5.0%"],
-            "良馬場での傾向": [
-                "堅軸。崩れにくいが配当は安め", "高い連対率キープ", "信頼度安定。軸・相手の要",
-                "平均的な好走ゾーン", "人気次第で狙い目", "⭐ 黄金パターン（良ではやや手堅い）",
-                "⭐ 穴馬激走ゾーン", "ヒモ穴", "割引", "厳しい"
-            ]
-        })
-    elif track_condition == "重・不良馬場（湿って速い・特殊馬場）":
-        st.caption("🌧️ 重・不良馬場特性：スピードとダッシュ力が優先され、中位〜下位指数（6〜8位）の穴馬が激走しやすい傾向。")
-        hit_rate_data = pd.DataFrame({
-            "指数順位": ["1位", "2位", "3位", "4位", "5位", "6位", "7位", "8位", "9位", "10位以下"],
-            "複勝率 (道悪)": ["55.0%", "44.5%", "37.0%", "30.5%", "26.5%", "23.0%", "20.1%", "16.2%", "12.0%", "8.2%"],
-            "道悪での傾向": [
-                "時計勝負による凡走リスク増", "まずまず安定", "手堅い軸候補", "平均",
-                "道悪適性で一気に跳ねる", "🔥 黄金パターン（道悪で浮上・回収率爆発）",
-                "🔥 馬場替わり大穴激走ゾーン", "高配当の使者", "ヒモに一考", "警戒必要"
-            ]
-        })
-    else:
-        st.caption("📊 ダート全体（全馬場ミックス平均）")
-        hit_rate_data = pd.DataFrame({
-            "指数順位": ["1位", "2位", "3位", "4位", "5位", "6位", "7位", "8位", "9位", "10位以下"],
-            "複勝率 (全体)": ["58.2%", "46.5%", "38.1%", "31.0%", "25.4%", "20.8%", "17.2%", "13.5%", "10.1%", "6.4%"],
-            "全体傾向": [
-                "圧倒的な軸の信頼度", "連対率高く相手・軸に最適", "バランス良く好走",
-                "中位基準", "人気薄なら妙味", "⭐ 黄金パターン主力ゾーン (6-7人気)",
-                "⭐ 過小評価・一撃期待穴ゾーン", "ヒモ穴", "切り捨て推奨", "基本圏外"
-            ]
-        })
-
-    st.table(hit_rate_data)
-
-    st.markdown(f"""
-    <div class="result-box" style="margin-top: 15px;">
-        <b>📌 選択戦略 & 馬場状態の特性解説</b><br>
-        <p style="color: #cbd5e1; margin: 6px 0 0 0; font-size: 0.9rem;">{desc}</p>
-        <hr style="border-color: #374151; margin: 10px 0;">
-        <b>📊 統計シミュレーション詳細:</b><br>
-        * 平均払戻配当: <b>{avg_payout:,} 円</b><br>
-        * 最大連続ハズレ (ドローダウン): <span style="color: #f87171; font-weight: bold;">{max_dd} 回</span><br>
-        * 推奨資金管理: 15連敗耐性（総資金の15%以上を1レース上限にしないこと）
-    </div>
-    """, unsafe_allow_html=True)
-
-    st.markdown(f"### 📉 累積収支シミュレーション推移 ({track_condition})")
-    seed_string = f"{track_condition}_{bt_strategy}_{bet_unit}"
-    seed_val = abs(hash(seed_string)) % (2**31)
-    np.random.seed(seed_val)
-    
-    payout_factor = (roi / 100.0)
-    steps = 50
-    investment_per_step = 1200 * (bet_unit / 100)
-    returns = np.random.choice([0, payout_factor * 1200 * (bet_unit / 100)], size=steps, p=[1 - (hit_rate/100), hit_rate/100])
-    cumulative_profit = np.cumsum(returns - investment_per_step)
-    
-    chart_data = pd.DataFrame({
-        "シミュレーション経過 (レース単位)": range(1, steps + 1),
-        "累積収支 (円)": cumulative_profit
-    })
-    
-    chart_container = st.container()
-    with chart_container:
-        st.line_chart(chart_data, x="シミュレーション経過 (レース単位)", y="累積収支 (円)")
+live, bt = st.tabs(['🎯 予測・買い目','📈 実績バックテスト'])
+with live:
+    if history is None or upcoming is None:
+        st.info('過去レースCSVと予測対象CSVをアップロードしてください。')
+    elif st.button('AI学習・予測を実行',type='primary'):
+        try:
+            # Avoid training on data from prediction date or later.
+            cutoff=upcoming['race_date'].min()
+            train=history[history['race_date']<cutoff].copy()
+            if train.empty: raise ValueError('予測日より前の学習レースがありません')
+            features=select_features(train,upcoming)
+            model=fit_model(train,features)
+            preds=predict(model,upcoming,features)
+            st.success(f'学習: {train.race_id.nunique()}レース / 使用特徴量: {", ".join(features)}')
+            for rid,race in preds.groupby('race_id',sort=False):
+                st.markdown(f'#### レース {rid} ({race.race_date.iloc[0].date()})')
+                st.dataframe(race[['horse_no','horse_name','ai_index','ai_rank','win_share']].sort_values('ai_rank').rename(columns={'horse_no':'馬番','horse_name':'馬名','ai_index':'AI指数','ai_rank':'指数順位','win_share':'モデル内勝率シェア'}),hide_index=True,use_container_width=True)
+                tickets=build_tickets(race,odds,axis_rank,other_count,min_ev,n_sim)
+                if tickets.empty:
+                    st.warning('出走頭数不足のため3連複を生成できません。')
+                    continue
+                st.dataframe(tickets[['買い目','推定的中確率','3連複オッズ','推定期待ROI','購入候補']],hide_index=True,use_container_width=True)
+                if odds is None or tickets['3連複オッズ'].notna().sum()==0:
+                    st.info('購入時点の3連複オッズがないため期待値判定・購入候補は表示できません。')
+                elif tickets['3連複オッズ'].isna().any():
+                    st.warning('一部の買い目にオッズがなく、期待値判定から除外されています。')
+                selected=tickets[tickets['購入候補']]
+                st.write(f'期待値条件を満たす買い目: {len(selected)}点 / 想定投資: {len(selected)*stake:,}円')
+                st.download_button(f'{rid} 買い目CSV',tickets.to_csv(index=False).encode('utf-8-sig'),f'tickets_{rid}.csv',key=f'live_{rid}')
+        except Exception as e:
+            st.error(f'予測失敗: {e}')
+with bt:
+    st.caption('日付で学習期間と未使用の検証期間を分離します。検証データの着順をモデルの特徴量には使いません。')
+    if history is None or payouts is None:
+        st.info('過去レースCSVと確定払戻CSVをアップロードしてください。')
+    elif st.button('実績バックテストを実行',type='primary'):
+        try:
+            if odds is None:
+                st.warning('過去オッズがないため期待値による選別はせず、軸・相手の固定ルールで全買い目を検証します。')
+            preds,bets,stats=backtest(history,payouts,odds,train_ratio,stake,axis_rank,other_count,min_ev,min(n_sim,30000))
+            st.write(f'検証期間の開始日: {stats["学習最終日"]}（この日以降を検証）')
+            cols=st.columns(4)
+            cols[0].metric('検証レース数',stats['検証レース数'])
+            cols[1].metric('購入点数',stats['購入点数'])
+            cols[2].metric('回収率',f'{stats["回収率"]:.1f}%' if pd.notna(stats['回収率']) else '算出不可')
+            cols[3].metric('レース的中率',f'{stats["的中率"]:.1f}%' if pd.notna(stats['的中率']) else '算出不可')
+            st.write(f'投資: {stats["投資額"]:,.0f}円 / 払戻: {stats["払戻額"]:,.0f}円 / 損益: {stats["払戻額"]-stats["投資額"]:,.0f}円 / 最大DD: {stats["最大DD"]:,.0f}円' if pd.notna(stats['最大DD']) else '購入対象なし：収支・最大DDは算出できません。')
+            if not bets.empty:
+                st.line_chart(bets.set_index('race_date')['累積損益'])
+                st.dataframe(bets,hide_index=True,use_container_width=True)
+                st.download_button('バックテスト明細をダウンロード',bets.to_csv(index=False).encode('utf-8-sig'),'backtest_result.csv')
+            st.info('注意：3連複確率はPlackett–Luce近似で、未校正です。表示された期待値は確定的な優位性を示しません。期間を一度分けるだけの検証であり、運用前には時系列ウォークフォワード検証が必要です。')
+        except Exception as e:
+            st.error(f'バックテスト失敗: {e}')
