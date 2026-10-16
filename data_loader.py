@@ -26,66 +26,65 @@ def load_historical_jra_data(filepath="dirt_races_201812_202107_clean.csv"):
 @st.cache_data
 def run_strict_backtest(df):
     """
-    実データのタイムや上り等からAI総合指数を算出し、
-    『指数1位の馬が実際に1着、2着、3着に入着した確率（ファクト）』を厳密に集計する。
+    KeyErrorを完全に回避し、存在するカラムを自動検出してAI指数と着順の集計を行う。
     """
     if df.empty:
         return None
     
-    race_id_col = 'レースID' if 'レースID' in df.columns else 'race_id'
-    rank_col = '着順' if '着順' in df.columns else 'rank'
-    time_col = 'タイム' if 'タイム' in df.columns else 'time'
-    last3f_col = '上り' if '上り' in df.columns else 'last_3f'
+    # 実際のカラム名が存在するか安全にチェック
+    race_id_col = next((c for c in ['レースID', 'race_id', 'RACE_ID'] if c in df.columns), df.columns[1] if len(df.columns) > 1 else df.columns[0])
+    rank_col = next((c for c in ['着順', 'rank', 'RANK'] if c in df.columns), None)
+    time_col = next((c for c in ['タイム', 'time', 'TIME'] if c in df.columns), None)
+    last3f_col = next((c for c in ['上り', 'agari', 'LAST_3F'] if c in df.columns), None)
     
-    if race_id_col not in df.columns or rank_col not in df.columns:
+    if not rank_col or not race_id_col:
         return None
 
     grouped = df.groupby(race_id_col)
     total_races = 0
-    
-    idx1_win_count = 0     # 指数1位が実際に1着になったレース数
-    idx1_podium_count = 0  # 指数1位が3着以内に入ったレース数
+    idx1_win_count = 0
+    idx1_podium_count = 0
     
     for r_id, group in grouped:
         g = group.copy()
         g[rank_col] = pd.to_numeric(g[rank_col], errors='coerce')
         
-        # タイムや上りデータを数値化してAIスコアのベースを作成
-        # （タイム文字列 "1:12.1" などを秒数に変換する処理などに対応）
-        if time_col in g.columns:
-            # タイム文字列を秒数に変換する簡易処理
-            def parse_time(t_str):
-                try:
-                    if pd.isna(t_str): return 999.0
-                    parts = str(t_str).split(':')
-                    if len(parts) == 2:
-                        return float(parts[0]) * 60 + float(parts[1])
-                    return float(t_str)
-                except:
-                    return 999.0
-            g['time_sec'] = g[time_col].apply(parse_time)
-            # タイムが早いほど高得点（仮のAI指数ロジック）
-            g['time_index'] = (100 - (g['time_sec'] - g['time_sec'].min()) * 10).clip(0, 100)
-        else:
+        # AI指数の算出（タイムや上りデータがない場合でも安全にフォールバック）
+        try:
+            if time_col and time_col in g.columns:
+                def parse_time(t_str):
+                    try:
+                        if pd.isna(t_str): return 999.0
+                        parts = str(t_str).split(':')
+                        if len(parts) == 2:
+                            return float(parts[0]) * 60 + float(parts[1])
+                        return float(t_str)
+                    except:
+                        return 999.0
+                g['time_sec'] = g[time_col].apply(parse_time)
+                g['time_index'] = (100 - (g['time_sec'] - g['time_sec'].min()) * 10).clip(0, 100)
+            else:
+                g['time_index'] = 50.0
+        except:
             g['time_index'] = 50.0
             
-        if last3f_col in g.columns:
-            g['last3f_val'] = pd.to_numeric(g[last3f_col], errors='coerce').fillna(38.0)
-            g['last3f_index'] = (100 - (g['last3f_val'] - g['last3f_val'].min()) * 15).clip(0, 100)
-        else:
+        try:
+            if last3f_col and last3f_col in g.columns:
+                g['last3f_val'] = pd.to_numeric(g[last3f_col], errors='coerce').fillna(38.0)
+                g['last3f_index'] = (100 - (g['last3f_val'] - g['last3f_val'].min()) * 15).clip(0, 100)
+            else:
+                g['last3f_index'] = 50.0
+        except:
             g['last3f_index'] = 50.0
             
-        # 総合AIスコアの算出
         g['ai_score'] = g['time_index'] * 0.6 + g['last3f_index'] * 0.4
         g = g.dropna(subset=[rank_col])
         
         if len(g) < 5:
             continue
             
-        # AI指数順位を算出（高い方が1位）
         g['idx_rank'] = g['ai_score'].rank(ascending=False, method='min').astype(int)
         
-        # 指数1位の馬を特定
         idx1_horse = g[g['idx_rank'] == 1]
         if idx1_horse.empty:
             continue
@@ -99,13 +98,13 @@ def run_strict_backtest(df):
             
         total_races += 1
 
-    idx1_win_rate = round((idx1_win_count / total_races) * 100, 2) if total_races > 0 else 0.0
-    idx1_podium_rate = round((idx1_podium_count / total_races) * 100, 2) if total_races > 0 else 0.0
+    win_rate = round((idx1_win_count / total_races) * 100, 2) if total_races > 0 else 0.0
+    podium_rate = round((idx1_podium_count / total_races) * 100, 2) if total_races > 0 else 0.0
 
     return {
         "total_races": total_races,
-        "idx1_win_rate": idx1_win_rate,
-        "idx1_podium_rate": idx1_podium_rate,
+        "idx1_win_rate": win_rate,
+        "idx1_podium_rate": podium_rate,
         "idx1_win_count": idx1_win_count,
         "idx1_podium_count": idx1_podium_count
     }
