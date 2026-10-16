@@ -1,23 +1,19 @@
 import streamlit as st
-import itertools
 import pandas as pd
 import numpy as np
 
-# data_loaderモジュールからデータ読み込み関数をインポート
 try:
     import data_loader
     is_dataloader_available = True
 except ImportError:
     is_dataloader_available = False
 
-# ページのレイアウト設定
 st.set_page_config(
     page_title="JRA 黄金パターン AI ダッシュボード (厳格検証版)",
     page_icon="🏇",
     layout="centered"
 )
 
-# --- カスタムCSS ---
 st.markdown("""
 <style>
     .main { background-color: #0e1117; }
@@ -44,7 +40,6 @@ st.markdown("""
 
 st.title("🏇 JRA 黄金パターン AI ダッシュボード [厳格・実データファクト分析版]")
 
-# --- サイドバー ---
 with st.sidebar:
     st.header("⚙️ 設定")
     bet_unit = st.number_input("1点あたりの金額 (円)", min_value=100, max_value=10000, value=100, step=100, key="final_unit")
@@ -53,11 +48,10 @@ with st.sidebar:
     st.markdown("### 📊 分析モード")
     analysis_mode = st.selectbox(
         "検証戦略", 
-        ["上位5頭の入着実績ファクト分析", "黄金パターン軸馬傾向検証"], 
+        ["AI指数1位の入着実績ファクト分析", "黄金パターン軸馬傾向検証"], 
         key="final_strat"
     )
 
-# --- AI指数の算出ロジック ---
 def calculate_ai_indices(horses_data):
     df = pd.DataFrame(horses_data)
     df['ai_score'] = (
@@ -69,7 +63,6 @@ def calculate_ai_indices(horses_data):
     df['divergence'] = df['pop_rank'] - df['idx_rank']
     return df.sort_values('idx_rank').reset_index(drop=True)
 
-# --- タブ ---
 tab_live, tab_backtest = st.tabs(["📍 本日のレース & AIスコアリング (LIVE)", "📈 実データ・入着実績ファクト分析"])
 
 with tab_live:
@@ -106,52 +99,43 @@ with tab_live:
     display_df = scored_df[['horse_no', 'name', 'pop_rank', 'ai_score', 'idx_rank', 'divergence']].rename(columns={
         'horse_no': '馬番', 'name': '馬名', 'pop_rank': '人気順', 'ai_score': 'AI総合指数', 'idx_rank': 'AI順位', 'divergence': '乖離ギャップ'
     })
-    st.dataframe(display_df, use_container_width=True, hide_index=True)
+    st.markdown(display_df.to_html(index=False, classes="dataframe"), unsafe_allow_html=True)
 
 with tab_backtest:
-    st.markdown("### 📈 実データ・入着実績ファクト分析")
-    st.caption("架空の回収率や払戻金は一切排除し、実際のJRAダート戦における上位馬の入着傾向を検証します。")
+    st.markdown("### 📈 実データに基づくAI指数ファクト分析")
+    st.caption("架空の回収率や払戻金は一切排除し、実際のJRAダート戦におけるAI指数1位馬の入着実績を検証します。")
     
     if not is_dataloader_available:
-        st.markdown("""
-        <div class="error-box">
-            <b>⚠️ エラー: data_loader.py が検出されません。</b>
-        </div>
-        """, unsafe_allow_html=True)
+        st.markdown("""<div class="error-box"><b>⚠️ エラー: data_loader.py が検出されません。</b></div>""", unsafe_allow_html=True)
         st.stop()
 
     df, status_msg = data_loader.load_historical_jra_data()
     
     if df.empty:
-        st.markdown(f"""
-        <div class="error-box">
-            <b>⚠️ 実データ未検出（未検証ステータス）</b><br>{status_msg}
-        </div>
-        """, unsafe_allow_html=True)
+        st.markdown(f"""<div class="error-box"><b>⚠️ 実データ未検出</b><br>{status_msg}</div>""", unsafe_allow_html=True)
         st.stop()
     else:
-        with st.spinner("実データの入着傾向を集計中..."):
+        with st.spinner("AI指数を算出し、実際の着順と照合中..."):
             stats = data_loader.run_strict_backtest(df)
             
         if not stats:
-            st.markdown("""
-            <div class="error-box"><b>⚠️ データ集計エラー:</b> 必要なカラムが不足しています。</div>
-            """, unsafe_allow_html=True)
+            st.markdown("""<div class="error-box"><b>⚠️ データ集計エラーが発生しました。</b></div>""", unsafe_allow_html=True)
             st.stop()
         
-        st.success("実データの集計が完了しました。")
+        st.success("AI指数による実データ検証が完了しました。")
         
         col1, col2, col3 = st.columns(3)
-        col1.metric("検証対象レース数", f"{stats['total_races']:,} レース")
-        col2.metric("上位5頭の1着制覇率", f"{stats['win_rate']}%")
-        col3.metric("上位5頭の3着内平均", f"{stats['avg_podium']} 頭")
+        col1.metric("検証レース数", f"{stats['total_races']:,} レース")
+        col2.metric("AI指数1位の勝率 (1着)", f"{stats['idx1_win_rate']}%")
+        col3.metric("AI指数1位の複勝率 (3着内)", f"{stats['idx1_podium_rate']}%")
 
         st.markdown(f"""
         <div class="result-box">
-            <b>📐 ファクト分析サマリー (<code>dirt_races_201812_202107_clean.csv</code> 連携)</b><br>
+            <b>📐 AI指数ファクト分析サマリー (<code>dirt_races_201812_202107_clean.csv</code>)</b><br>
             * 検証レース総数: <code>{stats['total_races']:,} レース</code><br>
-            * 上位5頭が勝利したレース数: <code>{stats['top5_win_count']:,} レース</code><br>
+            * AI指数1位が1着となったレース数: <code>{stats['idx1_win_count']:,} レース</code> ({stats['idx1_win_rate']}%)<br>
+            * AI指数1位が3着以内に入ったレース数: <code>{stats['idx1_podium_count']:,} レース</code> ({stats['idx1_podium_rate']}%)<br>
             <hr style="border-color: #374151; margin: 8px 0;">
-            <b>📌 運用方針:</b> 利益や回収率の誇大表示を完全排除し、実際の着順データに基づいた客観的な統計のみを表示しています。
+            <b>📌 評価:</b> 架空の回収率や都合の良い数値を一切排除し、AI指数と実際の着順結果の相関を純粋なファクトとして算出しています。
         </div>
         """, unsafe_allow_html=True)
