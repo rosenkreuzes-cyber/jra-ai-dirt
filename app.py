@@ -660,7 +660,25 @@ with t4:
             c2.metric("的中率", f"{hits/n*100:.1f}%" if n else "—")
             c3.metric("回収率", f"{paid/invested*100:.1f}%" if invested else "—")
             c4.metric("累計損益", f"{paid-invested:+,}円")
-            st.dataframe(df_hist.sort_values("日付", ascending=False), hide_index=True, use_container_width=True)
+            # 的中レースを緑、不的中を薄い赤、未登録を淡いグレーで区別。
+            # データそのものは変更せず、表示時のみスタイルを適用する。
+            def color_result_row(row):
+                state = row["状態"]
+                if state == "的中":
+                    bg, fg = "#174b36", "#e7fff0"
+                elif state == "不的中":
+                    bg, fg = "#4a262b", "#ffe9e9"
+                else:
+                    bg, fg = "#303640", "#e2e8f0"
+                return [f"background-color: {bg}; color: {fg};" for _ in row]
+
+            display_hist = df_hist.sort_values("日付", ascending=False)
+            st.caption("🟩 的中　🟥 不的中　⬜ 結果未登録")
+            st.dataframe(
+                display_hist.style.apply(color_result_row, axis=1),
+                hide_index=True,
+                use_container_width=True,
+            )
             st.download_button("📥 履歴CSVをダウンロード", df_hist.to_csv(index=False).encode("utf-8-sig"), "jra_history.csv", "text/csv")
             st.caption("未登録レースは成績計算から除外。購入実績ではなく推奨4点を各設定金額で購入した場合のシミュレーションです。")
     except Exception as e:
