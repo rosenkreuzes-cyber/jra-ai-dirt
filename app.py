@@ -30,14 +30,13 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-st.title("🏇 JRA 黄金パターン AI ダッシュボード [完全対応版]")
+st.title("🏇 JRA 黄金パターン AI ダッシュボード [ダイレクト読込版]")
 
 # --- サイドバー ---
 with st.sidebar:
     st.header("⚙️ 設定")
     bet_unit = st.number_input("1点あたりの金額 (円)", min_value=100, max_value=10000, value=100, step=100, key="box_unit")
-    if st.button("🔄 キャッシュクリア & 再読込"):
-        st.cache_data.clear()
+    if st.button("🔄 アプリを再読込"):
         st.rerun()
 
 # タイム・上り3F解析
@@ -60,8 +59,7 @@ def parse_horse_history(row_str):
         pass
     return time_score, last3f_score
 
-# ワークスペース内のすべてのExcelファイルを全自動で安全に読み込む関数
-@st.cache_data
+# キャッシュを一切使わず毎回ダイレクトにファイルを読み込む関数
 def load_and_parse_excel_races():
     excel_files = glob.glob('*.xlsx')
     races = []
@@ -72,14 +70,12 @@ def load_and_parse_excel_races():
             
         try:
             xls = pd.ExcelFile(filename)
-            # 18日が含まれていれば日曜、それ以外は土曜
             is_sunday = ('18' in filename)
             day_label = "日曜日開催" if is_sunday else "土曜日開催"
             
             for sheet_name in xls.sheet_names:
                 df_data = pd.read_excel(filename, sheet_name=sheet_name, header=1)
                 
-                # 「馬番」カラムの自動検出
                 horse_col = None
                 for col in df_data.columns:
                     if '馬番' in str(col):
@@ -119,7 +115,6 @@ def load_and_parse_excel_races():
                         except:
                             continue
                             
-                        # 馬名カラムの自動検出
                         name_col = None
                         for c in race_df.columns:
                             if '馬名' in str(c):
@@ -144,7 +139,6 @@ def load_and_parse_excel_races():
                         except:
                             pass
 
-                        # 前走データの取得
                         prev_run = ""
                         for c in race_df.columns:
                             if '前走' in str(c):
