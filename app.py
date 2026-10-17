@@ -40,6 +40,12 @@ st.title("🏇 JRA 黄金パターン AI ダッシュボード")
 # --- サイドバー ---
 with st.sidebar:
     st.header("⚙️ 設定")
+    min_coverage = st.slider("最低過去走データ保有率 (%)", 50, 100, 75, 5)
+    min_gap = st.slider("上位4頭と5位の最低指数差", 0.0, 20.0, 3.0, 0.5)
+    min_confidence = st.slider("推奨最低評価点（的中確率ではありません）", 40, 95, 65, 5)
+    max_recommendations = st.slider("1日あたりの推奨上限", 3, 5, 5)
+    min_top_history = st.slider("上位4頭の最低過去走数", 1, 4, 2)
+    min_top_dirt = st.slider("上位4頭の最低ダート経験馬数", 2, 4, 3)
     bet_unit = st.number_input("1点あたりの金額 (円)", min_value=100, max_value=10000, value=100, step=100, key="box_unit")
     if st.button("🔄 Google Driveから最新データを再取得"):
         st.cache_data.clear()
@@ -149,12 +155,12 @@ def parse_sheet_rows(rows, day_label, sheet_name=""):
             columns = {
                 "horse": next(i for i, c in enumerate(cells) if "馬番" in c),
                 "name": next(i for i, c in enumerate(cells) if "馬名" in c),
-                "previous": next((i for i, c in enumerate(cells) if "前走" in c), None),
+                "previous": [i for i, c in enumerate(cells) if re.search(r"前走|前々走|[34]走前", c)],
             }
             continue
         if current is None or columns is None:
             continue
-        hi, ni, pi = columns["horse"], columns["name"], columns["previous"]
+        hi, ni, previous_indices = columns["horse"], columns["name"], columns["previous"]
         if max(hi, ni) >= len(cells):
             continue
         try:
@@ -170,13 +176,38 @@ def parse_sheet_rows(rows, day_label, sheet_name=""):
         odds_match = ODDS_PATTERN.search(field)
         odds = float(odds_match.group(1)) if odds_match else 15.0
         popularity = int(odds_match.group(2)) if odds_match else 5
-        previous = cells[pi] if pi is not None and pi < len(cells) else ""
+        histories = [cells[i] for i in previous_indices if i < len(cells) and cells[i]]
+        valid_histories = [h for h in histories if re.search(r"20\d{2}年\d{1,2}月\d{1,2}日", h)]
+        previous = valid_histories[0] if valid_histories else ""
         time_score, last3f_score = parse_horse_history(previous)
+        # 異なる距離の走破タイムを直接比較しない。着順と頭数を相対評価に使う。
+        history_scores = []
+        dirt_runs = 0
+        for history in valid_histories:
+            finish_match = re.search(r"(?<!\d)(\d{1,2})着", history)
+            field_size = re.search(r"(?<!\d)(\d{1,2})頭", history)
+            is_dirt = bool(re.search(r"\d{3,4}\s*ダ", history))
+            if is_dirt:
+                dirt_runs += 1
+            if finish_match and field_size:
+                rank, field = int(finish_match.group(1)), int(field_size.group(1))
+                if field >= 2 and 1 <= rank <= field:
+                    percentile = 100 * (field - rank) / (field - 1)
+                    history_scores.append((percentile, is_dirt))
+        # ダート実績を優先し、直近の実績に重みを置く。
+        weighted = [(v, 1.0 if is_dirt else 0.65) for v, is_dirt in history_scores]
+        relative_score = (sum(v * w for v, w in weighted) / sum(w for _, w in weighted)) if weighted else None
+        dirt_results = [v for v, is_dirt in history_scores if is_dirt]
+        dirt_score = sum(dirt_results) / len(dirt_results) if dirt_results else None
         current["horses"].append({
             "horse_no": horse_no, "name": name,
             "pop_rank": popularity, "odds": odds,
             "time_index": time_score, "last3f_index": last3f_score,
             "track_aptitude": 75.0,
+            "history_count": len(valid_histories),
+            "dirt_runs": dirt_runs,
+            "relative_score": relative_score,
+            "dirt_score": dirt_score,
         })
     finish()
     return races
@@ -274,14 +305,58 @@ with st.sidebar.expander("📂 Excelファイルから読み込む（代替）")
 
 def calculate_ai_indices(horses_data):
     df = pd.DataFrame(horses_data)
-    df['ai_score'] = (
-        df['time_index'] * 0.5 + 
-        df['last3f_index'] * 0.3 + 
-        df['track_aptitude'] * 0.2
-    )
-    df['idx_rank'] = df['ai_score'].rank(ascending=False, method='min').astype(int)
-    df['divergence'] = df['pop_rank'] - df['idx_rank']
-    return df.sort_values('idx_rank').reset_index(drop=True)
+    # ダート戦なのでダート着順の相対成績を優先。芝のみの馬は不確実性を反映。
+    base = pd.to_numeric(df["relative_score"], errors="coerce")
+    dirt = pd.to_numeric(df["dirt_score"], errors="coerce")
+    runs = pd.to_numeric(df["history_count"], errors="coerce").fillna(0)
+    dirt_runs = pd.to_numeric(df["dirt_runs"], errors="coerce").fillna(0)
+    df["ai_score"] = (0.35 * base + 0.65 * dirt.fillna(base) -
+                      (dirt_runs.eq(0) * 15) -
+                      (runs.lt(2) * 8)).where(base.notna())
+    df = df.sort_values(["ai_score", "horse_no"], ascending=[False, True], na_position="last").reset_index(drop=True)
+    df["idx_rank"] = range(1, len(df) + 1)
+    df["divergence"] = df["pop_rank"] - df["idx_rank"]
+    return df
+
+
+def screen_race(race, min_coverage, min_gap, min_confidence, min_top_history, min_top_dirt):
+    df = calculate_ai_indices(race["horses"])
+    n = len(df)
+    title = race.get("race_title", "")
+    if not race.get("identified", False):
+        return None, "開催場・レース番号が特定できない", df
+    if re.search(r"新馬|メイクデビュー", title):
+        return None, "新馬戦（過去走なし）", df
+    if n < 6:
+        return None, "出走馬6頭未満", df
+    known = int(df["history_count"].gt(0).sum())
+    coverage = known / n * 100
+    if coverage < min_coverage:
+        return None, f"過去走データ保有率不足 ({coverage:.0f}%)", df
+    if df["ai_score"].notna().sum() < 5:
+        return None, "指数算出可能馬が5頭未満", df
+    top = df.head(4)
+    if top["history_count"].lt(min_top_history).any():
+        return None, f"上位4頭に過去走{min_top_history}走未満の馬がいる", df
+    top_dirt = int(top["dirt_runs"].gt(0).sum())
+    if top_dirt < min_top_dirt:
+        return None, f"上位4頭のダート経験馬不足 ({top_dirt}/4)", df
+    gap = float(df.iloc[3]["ai_score"] - df.iloc[4]["ai_score"])
+    if gap < min_gap:
+        return None, f"4位と5位の指数差不足 ({gap:.1f})", df
+    dirt_coverage = float(df["dirt_runs"].gt(0).mean() * 100)
+    top_avg_runs = float(top["history_count"].mean())
+    # 過去走の充実・ダート経験・上位候補の層・5位との差を総合評価。
+    # 検証済みの的中確率ではない。閾値は運用後にバックテストで調整する。
+    quality = min(100., 0.25 * coverage + 0.20 * dirt_coverage +
+                  0.20 * min(100., top_avg_runs / 4 * 100) +
+                  0.15 * (top_dirt / 4 * 100) +
+                  0.20 * min(100., gap / 12 * 100))
+    if quality < min_confidence:
+        return None, f"評価点不足 ({quality:.0f}点)", df
+    return {"score": round(quality), "gap": round(gap, 1), "coverage": round(coverage),
+            "dirt_coverage": round(dirt_coverage), "top_dirt": top_dirt,
+            "top_avg_runs": round(top_avg_runs, 1)}, None, df
 
 # --- タブ構成: 土曜日 / 日曜日 ---
 tab_sat, tab_sun = st.tabs(["📅 土曜日開催レース", "📅 日曜日開催レース"])
@@ -293,17 +368,36 @@ def render_race_list(target_day_label):
         st.warning(f"⚠️ {target_day_label} のレースデータがありません。サイドバーの『データ取得診断』で原因を確認するか、Excelファイルをアップロードしてください。")
         return
 
-    for r_idx, race in enumerate(filtered_races):
+    selected = []
+    excluded = []
+    for race in filtered_races:
+        metrics, reason, df = screen_race(race, min_coverage, min_gap, min_confidence, min_top_history, min_top_dirt)
+        if metrics is None:
+            excluded.append((race["race_name"], reason))
+        else:
+            selected.append((race, metrics, df))
+    selected.sort(key=lambda item: (item[1]["score"], item[1]["gap"]), reverse=True)
+    overflow = selected[max_recommendations:]
+    selected = selected[:max_recommendations]
+    for race, metrics, _ in overflow:
+        excluded.append((race["race_name"], f"推奨上限{max_recommendations}件による見送り（評価{metrics['score']}点）"))
+    st.info(f"推奨 {len(selected)} レース / 対象 {len(filtered_races)} レース（見送り {len(excluded)}）。基準未達なら3件未満もあります。")
+    if not selected:
+        st.warning("条件に合う推奨候補はありません。条件を緩めるか、データを確認してください。")
+    with st.expander(f"スクリーニング除外理由（{len(excluded)}レース）"):
+        for name, reason in excluded:
+            st.write(f"{name}：{reason}")
+    for race, metrics, scored_df in selected:
         if not race["identified"]:
             st.warning("⚠️ このレースの開催場・レース番号はCSV内で特定できませんでした。元シートの見出しをご確認ください。")
-        scored_df = calculate_ai_indices(race["horses"])
         top4_nos = scored_df.head(4)['horse_no'].tolist()
 
         st.markdown(f"""
         <div class="race-card">
             <span style="background-color: #2d3748; color: #63b3ed; padding: 2px 8px; border-radius: 4px; font-size: 0.75rem;">📅 {html.escape(race['day_label'])}</span>
-            <span class="confidence-badge">🔥 4頭BOX (4点)</span>
+            <span class="confidence-badge">候補評価 {metrics["score"]}点</span>
             <h3 style="margin-top: 8px;">📍 {html.escape(race['race_name'])}</h3>
+            <p style='margin: 4px 0; font-size: 0.8rem; color: #cbd5e0;'>過去走保有率 {metrics["coverage"]}% ／ ダート実績保有率 {metrics["dirt_coverage"]}% ／ 上位4頭ダート経験 {metrics["top_dirt"]}/4 ／ 4位-5位指数差 {metrics["gap"]}</p>
             <p style='margin: 4px 0; font-size: 0.85rem; color: #a0aec0;'>
                 <b>🎯 AI上位4頭 (BOX対象):</b> 馬番 <b>{', '.join(map(str, top4_nos))}番</b>
             </p>
@@ -313,20 +407,16 @@ def render_race_list(target_day_label):
         with st.expander(f"🎫 {race['race_name']} の3連複4頭BOX買い目 & 出走馬一覧を開く", expanded=False):
             box_bets = []
             for comb in itertools.combinations(top4_nos, 3):
-                comb_sorted = sorted(list(comb))
-                matched_odds = scored_df[scored_df['horse_no'].isin(comb_sorted)]['odds'].sum()
-                simulated_odds = round(matched_odds * 1.5, 1)
                 box_bets.append({
                     "券種": "3連複BOX",
-                    "組み合わせ": f"{comb_sorted[0]} - {comb_sorted[1]} - {comb_sorted[2]}",
+                    "組み合わせ": " - ".join(map(str, sorted(comb))),
                     "投資金額": f"{bet_unit:,} 円",
-                    "想定オッズ": f"{simulated_odds} 倍",
-                    "予想払戻金": f"約 {int(bet_unit * simulated_odds):,} 円"
                 })
             st.dataframe(pd.DataFrame(box_bets), use_container_width=True, hide_index=True)
+            st.caption(f"4点 × {bet_unit:,}円 = 合計 {bet_unit * 4:,}円。実際の3連複オッズは取得していないため、架空の払戻予測は表示しません。")
 
             st.markdown("##### 📋 出走馬 AIスコアリング一覧")
-            sorted_df = scored_df.sort_values('idx_rank').reset_index(drop=True)
+            sorted_df = scored_df.sort_values("ai_score", ascending=False, na_position="last").reset_index(drop=True)
             for _, row in sorted_df.iterrows():
                 gap_color = "#63b3ed" if row['divergence'] > 0 else ("#f6e05e" if row['divergence'] == 0 else "#ff4b4b")
                 st.markdown(f"""
@@ -338,7 +428,7 @@ def render_race_list(target_day_label):
                     <div style="display: flex; gap: 15px; font-size: 0.8rem; color: #cbd5e0; flex-wrap: wrap;">
                         <div>AI順位: <b style="color: #f6e05e;">第{int(row['idx_rank'])}位</b></div>
                         <div>人気: <b>{int(row['pop_rank'])}番人気</b></div>
-                        <div>AI指数: <b>{row['ai_score']:.1f}</b></div>
+                        <div>AI指数: <b>{row['ai_score']:.1f} / 過去{int(row['history_count'])}走</b></div>
                         <div>乖離: <b style="color: {gap_color};">{row['divergence']:+d}</b></div>
                         <div>単勝オッズ: <b style="color: #4ade80;">{row['odds']}倍</b></div>
                     </div>
@@ -346,6 +436,8 @@ def render_race_list(target_day_label):
                 """, unsafe_allow_html=True)
 
         st.markdown("---")
+
+st.caption("評価点は過去走・ダート実績・指数差に基づく独自の順位付けで、的中確率ではありません。過去の確定着順によるバックテストは未実施です。")
 
 with tab_sat:
     st.markdown("### 🟢 土曜日開催のレース一覧")
