@@ -103,18 +103,41 @@ def run_strict_backtest(df):
 @st.cache_data
 def fetch_safe_live_race_horses():
     """
-    実データファイル（CSV）から特定の1レース分の出走馬データを抽出する。
-    オッズはCSV内の「単勝」列のデータを直接取得する。
+    実データファイル（CSV）から特定の1レース分を抽出し、
+    各馬のタイムや上りから個別のAI指数を正しく計算して返す。
     """
     df, status = load_historical_jra_data()
     if not df.empty and 'レースID' in df.columns:
-        # 先頭のレースIDのデータを取得
         sample_race_id = df['レースID'].iloc[0]
         race_df = df[df['レースID'] == sample_race_id].copy()
         
+        # タイムや上りデータを数値化して個別の指数をつける
+        if 'タイム' in race_df.columns:
+            def parse_time(t_str):
+                try:
+                    if pd.isna(t_str): return 999.0
+                    parts = str(t_str).split(':')
+                    if len(parts) == 2:
+                        return float(parts[0]) * 60 + float(parts[1])
+                    return float(t_str)
+                except:
+                    return 999.0
+            race_df['time_sec'] = race_df['タイム'].apply(parse_time)
+            min_t = race_df['time_sec'].min()
+            # タイムが良いほど高得点になるよう個別に計算
+            race_df['calc_time_idx'] = (95 - (race_df['time_sec'] - min_t) * 8).clip(50, 99)
+        else:
+            race_df['calc_time_idx'] = 75.0
+
+        if '上り' in race_df.columns:
+            race_df['last3f_val'] = pd.to_numeric(race_df['上り'], errors='coerce').fillna(38.0)
+            min_l3 = race_df['last3f_val'].min()
+            race_df['calc_l3_idx'] = (95 - (race_df['last3f_val'] - min_l3) * 10).clip(50, 99)
+        else:
+            race_df['calc_l3_idx'] = 75.0
+
         horses = []
         for _, row in race_df.iterrows():
-            # 単勝オッズの取得（数値化できない場合はデフォルト10.0）
             odds_val = 10.0
             try:
                 odds_val = float(row.get('単勝', 10.0))
@@ -135,12 +158,11 @@ def fetch_safe_live_race_horses():
                 "horse_no": int(row.get('馬番', 1)),
                 "name": str(row.get('馬名', '抽出馬')),
                 "pop_rank": pop_val,
-                "time_index": float(78.0),
-                "last3f_index": float(75.0),
-                "track_aptitude": float(80.0),
-                "odds": odds_val,
-                "source": f"実データロード成功 (Race ID: {sample_race_id})"
+                "time_index": float(row.get('calc_time_idx', 75.0)),
+                "last3f_index": float(row.get('calc_l3_idx', 75.0)),
+                "track_aptitude": float(78.0),
+                "odds": odds_val
             })
-        return horses, f"実データ抽出成功 (レースID: {sample_race_id}, 出走頭数: {len(horses)}頭)"
+        return horses, f"実データ個別算出成功 (レースID: {sample_race_id}, 出走頭数: {len(horses)}頭)"
     
-    return [], "実データファイルが見つからないためサンプル表示にフォールバックします。"
+    return [], "データ読込エラー"
