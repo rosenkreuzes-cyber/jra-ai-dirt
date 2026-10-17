@@ -7,7 +7,7 @@ import re
 
 # 1. ページの設定
 st.set_page_config(
-    page_title="JRA 黄金パターン AI ダッシュボード (Excel完全対応版)",
+    page_title="JRA 黄金パターン AI ダッシュボード",
     page_icon="🏇",
     layout="centered"
 )
@@ -29,7 +29,7 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-st.title("🏇 JRA 黄金パターン AI ダッシュボード [Excel完全対応版]")
+st.title("🏇 JRA 黄金パターン AI ダッシュボード [土日別・完全版]")
 
 # --- サイドバー ---
 with st.sidebar:
@@ -49,8 +49,8 @@ def load_and_parse_excel_races():
     for f in excel_files:
         try:
             xls = pd.ExcelFile(f)
-            # 土日判定（ファイル名またはシート名から判定）
-            is_sunday = '18' in f or '10_18' in f
+            # 土日判定
+            is_sunday = ('10_18' in f) or ('18' in f)
             day_label = "日曜日開催" if is_sunday else "土曜日開催"
             
             for sheet_name in xls.sheet_names:
@@ -58,23 +58,22 @@ def load_and_parse_excel_races():
                 if df_raw.empty:
                     continue
                 
-                # 0行目からレース情報を取得
                 header_text = str(df_raw.iloc[0, 0])
                 
                 # 競馬場名の判定
                 course_name = "東京"
-                if "京都" in sheet_name or "京都" in header_text:
+                s_lower = sheet_name.lower()
+                if "kyouto" in s_lower or "京都" in header_text or "京都" in sheet_name:
                     course_name = "京都"
-                elif "新潟" in sheet_name or "新潟" in header_text:
+                elif "niigata" in s_lower or "新潟" in header_text or "新潟" in sheet_name:
                     course_name = "新潟"
-                elif "東京" in sheet_name or "東京" in header_text:
+                elif "tokyou" in s_lower or "東京" in header_text or "東京" in sheet_name:
                     course_name = "東京"
                 
                 # レース番号や条件の抽出
-                race_no_match = re.search(r'(\d+)レース', header_text)
+                race_no_match = re.search(r'(\d+)レース', header_text) or re.search(r'(\d+)Ｒ', header_text)
                 race_no_str = f"{race_no_match.group(1)}R" if race_no_match else "1R"
                 
-                # 条件抽出（例: 2歳未勝利、新馬など）
                 race_cond = "未勝利"
                 if "新馬" in header_text:
                     race_cond = "新馬戦"
@@ -83,11 +82,9 @@ def load_and_parse_excel_races():
                 elif "1勝" in header_text:
                     race_cond = "1勝クラス"
 
-                # 新馬戦除外フィルター用
                 is_shinjin_race = ("新馬" in race_cond)
 
-                # 2行目以降（出馬表データ）の切り出し
-                # 表のヘッダーが1行目（index 1）にあるため、データはindex 2以降
+                # 2行目（index 1）をヘッダーとしてデータを読込
                 df_data = pd.read_excel(f, sheet_name=sheet_name, header=1)
                 
                 horses = []
@@ -99,14 +96,12 @@ def load_and_parse_excel_races():
                     except:
                         continue
                         
-                    # 馬名カラムの特定
                     col_name_key = [c for c in df_data.columns if '馬名' in c]
                     if not col_name_key:
                         continue
                     col_val = str(row[col_name_key[0]])
                     name_line = col_val.split('\n')[0].strip()
                     
-                    # オッズ・人気の抽出
                     odds_val = 15.0
                     pop_val = 5
                     try:
@@ -214,7 +209,7 @@ def render_race_list(target_day_label):
                         <div>人気: <b>{int(row['pop_rank'])}番人気</b></div>
                         <div>AI指数: <b>{row['ai_score']:.1f}</b></div>
                         <div>乖離: <b style="color: {gap_color};">{row['divergence']:+d}</b></div>
-                        <div>単勝オッズ: <b style="color: #4ade80;">{row['odds']}倍</b></div>
+                        <div>単勝オッズ: <b style="color: #4ade80;>{row['odds']}倍</b></div>
                     </div>
                 </div>
                 """, unsafe_allow_html=True)
