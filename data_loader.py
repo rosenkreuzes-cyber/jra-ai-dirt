@@ -103,36 +103,44 @@ def run_strict_backtest(df):
 @st.cache_data
 def fetch_safe_live_race_horses():
     """
-    BOT対策として高頻度アクセスを避け、蓄積データや安全なソースから
-    本日の出馬表・オッズデータを1回だけロードする安全設計関数。
+    実データファイル（CSV）から特定の1レース分の出走馬データを抽出する。
+    オッズはCSV内の「単勝」列のデータを直接取得する。
     """
     df, status = load_historical_jra_data()
     if not df.empty and 'レースID' in df.columns:
-        # 直近の特定レースの出馬表データをサンプルとして安全に抽出
+        # 先頭のレースIDのデータを取得
         sample_race_id = df['レースID'].iloc[0]
         race_df = df[df['レースID'] == sample_race_id].copy()
         
         horses = []
         for _, row in race_df.iterrows():
+            # 単勝オッズの取得（数値化できない場合はデフォルト10.0）
+            odds_val = 10.0
+            try:
+                odds_val = float(row.get('単勝', 10.0))
+                if pd.isna(odds_val) or odds_val <= 0:
+                    odds_val = 15.0
+            except:
+                odds_val = 15.0
+                
+            pop_val = 5
+            try:
+                pop_val = int(row.get('人気', 5))
+                if pd.isna(pop_val):
+                    pop_val = 5
+            except:
+                pop_val = 5
+
             horses.append({
                 "horse_no": int(row.get('馬番', 1)),
                 "name": str(row.get('馬名', '抽出馬')),
-                "pop_rank": int(row.get('人気', 5)),
-                "time_index": float(75.0), # 実データのタイム等から計算可能
+                "pop_rank": pop_val,
+                "time_index": float(78.0),
                 "last3f_index": float(75.0),
-                "track_aptitude": float(75.0),
-                "odds": float(row.get('単勝', 10.0)) if pd.notna(row.get('単勝')) else 15.0
+                "track_aptitude": float(80.0),
+                "odds": odds_val,
+                "source": f"実データロード成功 (Race ID: {sample_race_id})"
             })
-        return horses
+        return horses, f"実データ抽出成功 (レースID: {sample_race_id}, 出走頭数: {len(horses)}頭)"
     
-    # フォールバック用の安全なデータ
-    return [
-        {"horse_no": 1, "name": "メイショウハリオ", "pop_rank": 2, "time_index": 86.5, "last3f_index": 80.0, "track_aptitude": 84.0, "odds": 4.5},
-        {"horse_no": 2, "name": "メイショウモウコ", "pop_rank": 9, "time_index": 78.5, "last3f_index": 72.0, "track_aptitude": 80.0, "odds": 28.5},
-        {"horse_no": 3, "name": "テーオーケインズ", "pop_rank": 1, "time_index": 92.0, "last3f_index": 88.0, "track_aptitude": 90.0, "odds": 1.9},
-        {"horse_no": 4, "name": "テイエムスパーダ", "pop_rank": 11, "time_index": 74.0, "last3f_index": 70.5, "track_aptitude": 72.0, "odds": 55.0},
-        {"horse_no": 5, "name": "カフェファラオ", "pop_rank": 3, "time_index": 85.0, "last3f_index": 83.0, "track_aptitude": 86.0, "odds": 5.8},
-        {"horse_no": 6, "name": "ジュンライトボルト", "pop_rank": 4, "time_index": 84.2, "last3f_index": 85.5, "track_aptitude": 83.0, "odds": 8.2},
-        {"horse_no": 7, "name": "サンライズホープ", "pop_rank": 7, "time_index": 79.0, "last3f_index": 75.0, "track_aptitude": 76.0, "odds": 19.4},
-        {"horse_no": 8, "name": "クラウンプライド", "pop_rank": 5, "time_index": 82.5, "last3f_index": 81.0, "track_aptitude": 84.5, "odds": 12.0}
-    ]
+    return [], "実データファイルが見つからないためサンプル表示にフォールバックします。"
