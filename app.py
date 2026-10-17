@@ -8,6 +8,8 @@ import re
 import csv
 import html
 import unicodedata
+import zipfile
+from urllib.error import HTTPError, URLError
 
 # 1. ページの設定
 st.set_page_config(
@@ -89,9 +91,11 @@ def parse_race_heading(value, sheet_name=""):
     course_match = COURSE_PATTERN.search(text)
     course = course_match.group(1) if course_match else None
     if course is None:
-        course = next((c for c in COURSES if c in sheet_name.lower() or
-                       {"東京": "tokyou", "京都": "kyouto", "新潟": "niigata"}.get(c) in sheet_name.lower()
-                       if {"東京": "tokyou", "京都": "kyouto", "新潟": "niigata"}.get(c)), None)
+        aliases = {"tokyou": "東京", "tokyo": "東京", "kyouto": "京都", "kyoto": "京都", "niigata": "新潟"}
+        lower = sheet_name.lower()
+        course = next((c for c in COURSES if c in sheet_name), None)
+        if course is None:
+            course = next((v for k, v in aliases.items() if k in lower), None)
     race_no = None
     race_line_index = None
     for i, line in enumerate(lines):
@@ -190,31 +194,83 @@ def parse_workbook_bytes(data, day_label):
         workbook.close()
 
 
+# Googleスプレッドシートと、Driveに置いた元ExcelではダウンロードURLが異なる。
+SOURCES = [
+    {"id": "14Zn-qUtrbhvNIXJXfNoB8hLfFXLzzeRf-jI3qBDZI_Q", "day_label": "土曜日開催"},
+    {"id": "1oI_Z6cqjDjQP9C81WsLJ5GgfTMqNw7mbiH2N9N9b780", "day_label": "日曜日開催"},
+]
+
+
+def download_workbook(file_id):
+    candidates = [
+        ("Googleスプレッドシート形式", f"https://docs.google.com/spreadsheets/d/{file_id}/export?format=xlsx"),
+        ("Google DriveのExcelファイル", f"https://drive.google.com/uc?export=download&id={file_id}"),
+    ]
+    failures = []
+    for label, url in candidates:
+        try:
+            request = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0", "Accept": "*/*"})
+            with urllib.request.urlopen(request, timeout=35) as response:
+                content = response.read()
+                final_url = response.geturl()
+            if not zipfile.is_zipfile(io.BytesIO(content)):
+                preview = content[:200].decode("utf-8", errors="replace").replace("\n", " ")
+                failures.append(f"{label}: Excelではない応答 ({len(content)} bytes, {preview[:90]!r})")
+                continue
+            with zipfile.ZipFile(io.BytesIO(content)) as z:
+                if "xl/workbook.xml" not in z.namelist():
+                    failures.append(f"{label}: ExcelブックではないZIP")
+                    continue
+            return content, label
+        except HTTPError as exc:
+            failures.append(f"{label}: HTTP {exc.code} {exc.reason}")
+        except (URLError, TimeoutError, OSError) as exc:
+            failures.append(f"{label}: 通信エラー {type(exc).__name__}: {exc}")
+        except Exception as exc:
+            failures.append(f"{label}: {type(exc).__name__}: {exc}")
+    raise RuntimeError(" / ".join(failures))
+
+
 @st.cache_data(ttl=300)
 def load_races_from_google_drive():
-    sources = [
-        {"id": "14Zn-qUtrbhvNIXJXfNoB8hLfFXLzzeRf-jI3qBDZI_Q", "day_label": "土曜日開催"},
-        {"id": "1oI_Z6cqjDjQP9C81WsLJ5GgfTMqNw7mbiH2N9N9b780", "day_label": "日曜日開催"},
-    ]
-    races, errors = [], []
-    for source in sources:
-        # CSVは最初のタブだけになるため、Excel形式で全タブを取得する。
-        url = f"https://docs.google.com/spreadsheets/d/{source['id']}/export?format=xlsx"
+    races, errors, diagnostics = [], [], []
+    for source in SOURCES:
+        day = source["day_label"]
         try:
-            request = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-            with urllib.request.urlopen(request, timeout=30) as response:
-                data = response.read()
-            parsed = parse_workbook_bytes(data, source["day_label"])
+            content, method = download_workbook(source["id"])
+            parsed = parse_workbook_bytes(content, day)
             races.extend(parsed)
+            diagnostics.append(f"{day}: {method}から {len(parsed)} レースを取得")
             if not parsed:
-                errors.append(f"{source['day_label']}: 出走馬を含むレースが見つかりません")
+                errors.append(f"{day}: Excelは取得できましたが、レースを解析できませんでした")
         except Exception as exc:
-            errors.append(f"{source['day_label']}: 取得・解析失敗 ({exc})")
-    return races, errors
+            errors.append(f"{day}: {exc}")
+    return races, errors, diagnostics
 
-all_loaded_races, load_errors = load_races_from_google_drive()
-for error in load_errors:
-    st.warning(error)
+
+all_loaded_races, load_errors, load_diagnostics = load_races_from_google_drive()
+with st.sidebar.expander("📡 データ取得診断", expanded=bool(load_errors)):
+    for msg in load_diagnostics:
+        st.success(msg)
+    for msg in load_errors:
+        st.error(msg)
+    st.caption("403なら公開設定・組織のダウンロード制限、404ならID違い、Excel以外の応答ならGoogleのログイン画面やプレビュー画面への転送が考えられます。")
+
+# Google Drive側の仕様に左右されず、手元のExcelで表示を確認できる代替手段
+with st.sidebar.expander("📂 Excelファイルから読み込む（代替）"):
+    uploaded_sat = st.file_uploader("土曜日のExcel", type=["xlsx"], key="sat_xlsx")
+    uploaded_sun = st.file_uploader("日曜日のExcel", type=["xlsx"], key="sun_xlsx")
+    for upload, day in ((uploaded_sat, "土曜日開催"), (uploaded_sun, "日曜日開催")):
+        if upload is not None:
+            try:
+                replacement = parse_workbook_bytes(upload.getvalue(), day)
+                if not replacement:
+                    st.error(f"{day}: レースが見つかりませんでした")
+                else:
+                    all_loaded_races = [r for r in all_loaded_races if r["day_label"] != day] + replacement
+                    st.success(f"{day}: {len(replacement)} レースを読み込みました")
+            except Exception as exc:
+                st.error(f"{day}: ファイル解析エラー: {exc}")
 
 def calculate_ai_indices(horses_data):
     df = pd.DataFrame(horses_data)
@@ -234,7 +290,7 @@ def render_race_list(target_day_label):
     filtered_races = [r for r in all_loaded_races if r['day_label'] == target_day_label]
     
     if not filtered_races:
-        st.warning(f"⚠️ Google Driveからの {target_day_label} のレースデータ取得に失敗しました。スプレッドシートのアクセス権限（リンクを知っている全員が閲覧可能）をご確認ください。")
+        st.warning(f"⚠️ {target_day_label} のレースデータがありません。サイドバーの『データ取得診断』で原因を確認するか、Excelファイルをアップロードしてください。")
         return
 
     for r_idx, race in enumerate(filtered_races):
