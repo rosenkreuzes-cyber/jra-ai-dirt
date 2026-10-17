@@ -9,6 +9,11 @@ import csv
 import html
 import unicodedata
 import zipfile
+import json
+import base64
+import datetime
+import urllib.parse
+from urllib.error import HTTPError
 from urllib.error import HTTPError, URLError
 
 # 1. ページの設定
@@ -358,91 +363,282 @@ def screen_race(race, min_coverage, min_gap, min_confidence, min_top_history, mi
             "dirt_coverage": round(dirt_coverage), "top_dirt": top_dirt,
             "top_avg_runs": round(top_avg_runs, 1)}, None, df
 
-# --- タブ構成: 土曜日 / 日曜日 ---
-tab_sat, tab_sun = st.tabs(["📅 土曜日開催レース", "📅 日曜日開催レース"])
 
-def render_race_list(target_day_label):
-    filtered_races = [r for r in all_loaded_races if r['day_label'] == target_day_label]
-    
-    if not filtered_races:
-        st.warning(f"⚠️ {target_day_label} のレースデータがありません。サイドバーの『データ取得診断』で原因を確認するか、Excelファイルをアップロードしてください。")
-        return
+# --- GitHub Private repository persistence ---
+APP_VERSION = "hit-priority-1.0-history-1.0"
 
-    selected = []
-    excluded = []
-    for race in filtered_races:
+def github_config():
+    token = st.secrets.get("GITHUB_TOKEN", "")
+    repo = st.secrets.get("GITHUB_REPO", "")
+    if not token or not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", repo):
+        raise RuntimeError("SecretsにGITHUB_TOKENとGITHUB_REPO（ユーザー名/jra-ai-history）を設定してください")
+    return token, repo
+
+
+def github_request(method, path, payload=None):
+    token, repo = github_config()
+    url = "https://api.github.com/repos/" + repo + "/contents/" + urllib.parse.quote(path, safe="/")
+    data = json.dumps(payload, ensure_ascii=False).encode("utf-8") if payload is not None else None
+    req = urllib.request.Request(url, data=data, method=method, headers={
+        "Authorization": "Bearer " + token,
+        "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+        "User-Agent": "JRA-Streamlit-History",
+        "Content-Type": "application/json",
+    })
+    try:
+        with urllib.request.urlopen(req, timeout=25) as response:
+            return json.loads(response.read().decode("utf-8"))
+    except HTTPError as e:
+        body = e.read().decode("utf-8", errors="replace")[:250]
+        if e.code == 404 and method == "GET":
+            return None
+        raise RuntimeError(f"GitHub HTTP {e.code}: {body}") from e
+
+
+def get_record(path):
+    item = github_request("GET", path)
+    if item is None:
+        return None, None
+    if item.get("type") != "file":
+        raise RuntimeError("保存先がファイルではありません: " + path)
+    # GitHub Contents API can return content="" for files >1MB; records here are per-race.
+    raw = base64.b64decode(item["content"].replace("\n", ""))
+    return json.loads(raw.decode("utf-8")), item["sha"]
+
+
+def put_record(path, record, overwrite=False):
+    # Refuse overwriting a frozen pre-race prediction.
+    for attempt in range(2):
+        old, sha = get_record(path)
+        if old is not None and not overwrite:
+            return False
+        data = json.dumps(record, ensure_ascii=False, indent=2, allow_nan=False).encode("utf-8")
+        payload = {"message": "JRA history: " + path, "content": base64.b64encode(data).decode("ascii")}
+        if sha:
+            payload["sha"] = sha
+        try:
+            github_request("PUT", path, payload)
+            return True
+        except RuntimeError as e:
+            if "HTTP 409" in str(e) and attempt == 0:
+                continue
+            raise
+    raise RuntimeError("同時更新が発生しました。再読み込みしてから再試行してください")
+
+
+def list_files(directory):
+    token, repo = github_config()
+    url = "https://api.github.com/repos/" + repo + "/contents/" + urllib.parse.quote(directory, safe="/") + "?per_page=1000"
+    req = urllib.request.Request(url, headers={"Authorization": "Bearer " + token,
+        "Accept": "application/vnd.github+json", "X-GitHub-Api-Version": "2022-11-28", "User-Agent": "JRA-Streamlit-History"})
+    try:
+        with urllib.request.urlopen(req, timeout=25) as response:
+            items = json.loads(response.read().decode("utf-8"))
+    except HTTPError as e:
+        if e.code == 404:
+            return []
+        raise RuntimeError(f"GitHub一覧取得エラー HTTP {e.code}") from e
+    return [x["path"] for x in items if x.get("type") == "file" and x["name"].endswith(".json")]
+
+
+def race_key(date, race):
+    return f"{date.isoformat()}_{race['course']}_{int(race['race_no']):02d}R"
+
+
+def snapshot(date, race, metrics, df, settings):
+    top = [int(x) for x in df.head(4)["horse_no"]]
+    horses = []
+    for row in df.to_dict("records"):
+        clean = {}
+        for k, v in row.items():
+            if isinstance(v, (np.integer,)):
+                v = int(v)
+            elif isinstance(v, (np.floating,)):
+                v = float(v) if np.isfinite(v) else None
+            elif pd.isna(v):
+                v = None
+            clean[k] = v
+        horses.append(clean)
+    return {
+        "race_id": race_key(date, race), "race_date": date.isoformat(),
+        "day_label": race["day_label"], "course": race["course"],
+        "race_no": int(race["race_no"]), "race_name": race["race_name"],
+        "saved_at_utc": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+        "model_version": APP_VERSION, "settings": settings, "metrics": metrics,
+        "top4": top, "bets": [list(c) for c in itertools.combinations(sorted(top), 3)],
+        "bet_unit": int(bet_unit), "horses": horses,
+    }
+
+
+def read_all_history():
+    predictions, results = {}, {}
+    for kind, target in (("predictions", predictions), ("results", results)):
+        for folder in github_list_directories(kind):
+            for path in list_files(folder):
+                rec, _ = get_record(path)
+                if rec and rec.get("race_id"):
+                    target[rec["race_id"]] = rec
+    return predictions, results
+
+
+def github_list_directories(root):
+    token, repo = github_config()
+    url = "https://api.github.com/repos/" + repo + "/contents/" + root
+    req = urllib.request.Request(url, headers={"Authorization": "Bearer " + token,
+        "Accept": "application/vnd.github+json", "User-Agent": "JRA-Streamlit-History"})
+    try:
+        with urllib.request.urlopen(req, timeout=25) as response:
+            return [x["path"] for x in json.loads(response.read().decode("utf-8")) if x["type"] == "dir"]
+    except HTTPError as e:
+        if e.code == 404:
+            return []
+        raise RuntimeError(f"履歴フォルダ取得失敗 HTTP {e.code}") from e
+
+
+def outcome(pred, result):
+    finish = [int(x) for x in result["top3"]]
+    hit = len(finish) == 3 and len(set(finish)) == 3 and set(finish).issubset(set(pred["top4"]))
+    stake = 4 * int(pred["bet_unit"])
+    # JRA 3連複払戻は100円あたり。4点のうち的中1点に対して計算。
+    payout = int(result["trio_payout_100yen"]) * int(pred["bet_unit"]) // 100 if hit else 0
+    return hit, stake, payout
+
+
+settings = {"min_coverage": min_coverage, "min_gap": min_gap,
+    "min_confidence": min_confidence, "max_recommendations": max_recommendations,
+    "min_top_history": min_top_history, "min_top_dirt": min_top_dirt}
+
+st.sidebar.divider()
+st.sidebar.header("📆 開催日（保存時に必須）")
+st.sidebar.caption("Excel内の実際の開催日を指定してください。誤った日付で保存すると別レースとして記録されます。")
+sat_date = st.sidebar.date_input("土曜日の開催日", value=datetime.date.today(), key="sat_date")
+sun_date = st.sidebar.date_input("日曜日の開催日", value=datetime.date.today() + datetime.timedelta(days=1), key="sun_date")
+
+
+def choose_races(day):
+    selected, excluded = [], []
+    for race in [r for r in all_loaded_races if r["day_label"] == day]:
         metrics, reason, df = screen_race(race, min_coverage, min_gap, min_confidence, min_top_history, min_top_dirt)
         if metrics is None:
             excluded.append((race["race_name"], reason))
         else:
             selected.append((race, metrics, df))
-    selected.sort(key=lambda item: (item[1]["score"], item[1]["gap"]), reverse=True)
-    overflow = selected[max_recommendations:]
-    selected = selected[:max_recommendations]
-    for race, metrics, _ in overflow:
-        excluded.append((race["race_name"], f"推奨上限{max_recommendations}件による見送り（評価{metrics['score']}点）"))
-    st.info(f"推奨 {len(selected)} レース / 対象 {len(filtered_races)} レース（見送り {len(excluded)}）。基準未達なら3件未満もあります。")
-    if not selected:
-        st.warning("条件に合う推奨候補はありません。条件を緩めるか、データを確認してください。")
-    with st.expander(f"スクリーニング除外理由（{len(excluded)}レース）"):
+    selected.sort(key=lambda x: (x[1]["score"], x[1]["gap"]), reverse=True)
+    for r, m, _ in selected[max_recommendations:]:
+        excluded.append((r["race_name"], "上限超過"))
+    return selected[:max_recommendations], excluded
+
+
+def render_races(day, date):
+    selected, excluded = choose_races(day)
+    st.info(f"推奨 {len(selected)} レース・除外 {len(excluded)} レース")
+    with st.expander("除外レースと理由"):
         for name, reason in excluded:
-            st.write(f"{name}：{reason}")
-    for race, metrics, scored_df in selected:
-        if not race["identified"]:
-            st.warning("⚠️ このレースの開催場・レース番号はCSV内で特定できませんでした。元シートの見出しをご確認ください。")
-        top4_nos = scored_df.head(4)['horse_no'].tolist()
+            st.write(name, "：", reason)
+    if not selected:
+        st.warning("推奨レースはありません。")
+        return
+    for race, metrics, df in selected:
+        top = [int(x) for x in df.head(4)["horse_no"]]
+        st.subheader(f"🏇 {race['race_name']}　評価 {metrics['score']}点")
+        st.write("推奨4頭:", "・".join(map(str, top)), "／ 4位-5位指数差:", metrics["gap"])
+        with st.expander("買い目・全馬指数"):
+            st.dataframe(pd.DataFrame([{"3連複": "-".join(map(str, x)), "金額": bet_unit} for x in itertools.combinations(sorted(top), 3)]), hide_index=True)
+            st.dataframe(df, hide_index=True)
+        if st.button("💾 このレースの予想を確定保存", key="save_" + race_key(date, race)):
+            rec = snapshot(date, race, metrics, df, settings)
+            path = f"predictions/{date.year}/{rec['race_id']}.json"
+            try:
+                if put_record(path, rec):
+                    st.success("保存しました。予想は固定され、再保存しても上書きされません。")
+                else:
+                    st.warning("このレースの予想は保存済みです。上書きしていません。")
+            except Exception as e:
+                st.error("保存失敗: " + str(e))
+                st.download_button("バックアップJSONを保存", json.dumps(rec, ensure_ascii=False, indent=2), file_name=rec["race_id"]+".json", key="backup_"+rec["race_id"])
+        st.divider()
 
-        st.markdown(f"""
-        <div class="race-card">
-            <span style="background-color: #2d3748; color: #63b3ed; padding: 2px 8px; border-radius: 4px; font-size: 0.75rem;">📅 {html.escape(race['day_label'])}</span>
-            <span class="confidence-badge">候補評価 {metrics["score"]}点</span>
-            <h3 style="margin-top: 8px;">📍 {html.escape(race['race_name'])}</h3>
-            <p style='margin: 4px 0; font-size: 0.8rem; color: #cbd5e0;'>過去走保有率 {metrics["coverage"]}% ／ ダート実績保有率 {metrics["dirt_coverage"]}% ／ 上位4頭ダート経験 {metrics["top_dirt"]}/4 ／ 4位-5位指数差 {metrics["gap"]}</p>
-            <p style='margin: 4px 0; font-size: 0.85rem; color: #a0aec0;'>
-                <b>🎯 AI上位4頭 (BOX対象):</b> 馬番 <b>{', '.join(map(str, top4_nos))}番</b>
-            </p>
-        </div>
-        """, unsafe_allow_html=True)
 
-        with st.expander(f"🎫 {race['race_name']} の3連複4頭BOX買い目 & 出走馬一覧を開く", expanded=False):
-            box_bets = []
-            for comb in itertools.combinations(top4_nos, 3):
-                box_bets.append({
-                    "券種": "3連複BOX",
-                    "組み合わせ": " - ".join(map(str, sorted(comb))),
-                    "投資金額": f"{bet_unit:,} 円",
-                })
-            st.dataframe(pd.DataFrame(box_bets), use_container_width=True, hide_index=True)
-            st.caption(f"4点 × {bet_unit:,}円 = 合計 {bet_unit * 4:,}円。実際の3連複オッズは取得していないため、架空の払戻予測は表示しません。")
+t1, t2, t3, t4 = st.tabs(["📅 土曜推奨", "📅 日曜推奨", "📝 結果登録", "📊 長期成績"])
+with t1:
+    st.caption(f"保存対象開催日: {sat_date}　※必ず実際の開催日を確認")
+    render_races("土曜日開催", sat_date)
+with t2:
+    st.caption(f"保存対象開催日: {sun_date}　※必ず実際の開催日を確認")
+    render_races("日曜日開催", sun_date)
 
-            st.markdown("##### 📋 出走馬 AIスコアリング一覧")
-            sorted_df = scored_df.sort_values("ai_score", ascending=False, na_position="last").reset_index(drop=True)
-            for _, row in sorted_df.iterrows():
-                gap_color = "#63b3ed" if row['divergence'] > 0 else ("#f6e05e" if row['divergence'] == 0 else "#ff4b4b")
-                st.markdown(f"""
-                <div style="background-color: #1a1c23; border: 1px solid #374151; padding: 10px 14px; border-radius: 6px; margin-bottom: 8px;">
-                    <div style="font-size: 1.0rem; font-weight: bold; color: #ffffff; margin-bottom: 4px;">
-                        <span style="background-color: #2b6cb0; color: white; padding: 2px 6px; border-radius: 4px; font-size: 0.75rem; margin-right: 6px;">馬番 {int(row['horse_no'])}</span>
-                        {html.escape(str(row['name']))}
-                    </div>
-                    <div style="display: flex; gap: 15px; font-size: 0.8rem; color: #cbd5e0; flex-wrap: wrap;">
-                        <div>AI順位: <b style="color: #f6e05e;">第{int(row['idx_rank'])}位</b></div>
-                        <div>人気: <b>{int(row['pop_rank'])}番人気</b></div>
-                        <div>AI指数: <b>{row['ai_score']:.1f} / 過去{int(row['history_count'])}走</b></div>
-                        <div>乖離: <b style="color: {gap_color};">{row['divergence']:+d}</b></div>
-                        <div>単勝オッズ: <b style="color: #4ade80;">{row['odds']}倍</b></div>
-                    </div>
-                </div>
-                """, unsafe_allow_html=True)
+with t3:
+    st.subheader("確定結果の登録")
+    if st.button("🔄 保存済み履歴を読み直す", key="refresh_history"):
+        st.rerun()
+    try:
+        predictions, results = read_all_history()
+        pending = {k: v for k, v in predictions.items() if k not in results}
+        if not pending:
+            st.info("結果未登録の予想はありません。まず推奨レースを確定保存してください。")
+        else:
+            ids = sorted(pending, reverse=True)
+            rid = st.selectbox("結果登録するレース", ids, format_func=lambda k: pending[k]["race_name"] + " / " + pending[k]["race_date"])
+            pred = pending[rid]
+            st.write("保存済み推奨馬番:", pred["top4"])
+            with st.form("result_form"):
+                a = st.number_input("1着馬番", 1, 18, 1)
+                b = st.number_input("2着馬番", 1, 18, 2)
+                c = st.number_input("3着馬番", 1, 18, 3)
+                payout = st.number_input("3連複確定払戻（100円あたり・円）", 0, 100000000, 0, step=100)
+                submitted = st.form_submit_button("確定結果を保存")
+            if submitted:
+                if len({a, b, c}) != 3:
+                    st.error("1〜3着に同じ馬番は指定できません。")
+                else:
+                    record = {"race_id": rid, "race_date": pred["race_date"], "top3": [int(a), int(b), int(c)],
+                              "trio_payout_100yen": int(payout), "saved_at_utc": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+                              "note": "同着・返還・取消がない通常レース用"}
+                    path = f"results/{pred['race_date'][:4]}/{rid}.json"
+                    try:
+                        if put_record(path, record):
+                            hit, stake, received = outcome(pred, record)
+                            st.success(f"結果保存完了：{'的中' if hit else '不的中'} ／ 投資 {stake:,}円 ／ 払戻 {received:,}円")
+                        else:
+                            st.warning("結果は登録済みです。上書きしていません。")
+                    except Exception as e:
+                        st.error("結果保存失敗: " + str(e))
+    except Exception as e:
+        st.error("履歴取得に失敗: " + str(e))
 
-        st.markdown("---")
+with t4:
+    st.subheader("長期成績")
+    try:
+        predictions, results = read_all_history()
+        records = []
+        for rid, pred in predictions.items():
+            result = results.get(rid)
+            hit, stake, received = outcome(pred, result) if result else (None, None, None)
+            records.append({"日付": pred["race_date"], "レース": pred["race_name"],
+                "推奨4頭": ",".join(map(str, pred["top4"])), "評価点": pred["metrics"]["score"],
+                "状態": "未登録" if result is None else ("的中" if hit else "不的中"),
+                "投資額": stake, "払戻額": received,
+                "損益": (received-stake) if result else None,
+                "指数差": pred["metrics"]["gap"], "モデル": pred["model_version"]})
+        df_hist = pd.DataFrame(records)
+        if df_hist.empty:
+            st.info("まだ履歴がありません。")
+        else:
+            completed = df_hist[df_hist["状態"] != "未登録"]
+            n = len(completed)
+            hits = int((completed["状態"] == "的中").sum())
+            invested = int(completed["投資額"].sum())
+            paid = int(completed["払戻額"].sum())
+            c1, c2, c3, c4 = st.columns(4)
+            c1.metric("結果登録", n)
+            c2.metric("的中率", f"{hits/n*100:.1f}%" if n else "—")
+            c3.metric("回収率", f"{paid/invested*100:.1f}%" if invested else "—")
+            c4.metric("累計損益", f"{paid-invested:+,}円")
+            st.dataframe(df_hist.sort_values("日付", ascending=False), hide_index=True, use_container_width=True)
+            st.download_button("📥 履歴CSVをダウンロード", df_hist.to_csv(index=False).encode("utf-8-sig"), "jra_history.csv", "text/csv")
+            st.caption("未登録レースは成績計算から除外。購入実績ではなく推奨4点を各設定金額で購入した場合のシミュレーションです。")
+    except Exception as e:
+        st.error("長期成績の取得に失敗: " + str(e))
 
-st.caption("評価点は過去走・ダート実績・指数差に基づく独自の順位付けで、的中確率ではありません。過去の確定着順によるバックテストは未実施です。")
-
-with tab_sat:
-    st.markdown("### 🟢 土曜日開催のレース一覧")
-    render_race_list("土曜日開催")
-
-with tab_sun:
-    st.markdown("### 🟠 日曜日開催のレース一覧")
-    render_race_list("日曜日開催")
+st.caption("⚠️ 同着・返還・取消・不成立の結果は現バージョンでは登録しないでください。JRA確定情報を確認し、通常レースのみ登録してください。")
