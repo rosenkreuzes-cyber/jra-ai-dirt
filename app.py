@@ -29,14 +29,17 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-st.title("🏇 JRA 黄金パターン AI ダッシュボード")
+st.title("🏇 JRA 黄金パターン AI ダッシュボード [強制表示版]")
 
 # --- サイドバー ---
 with st.sidebar:
     st.header("⚙️ 設定")
     bet_unit = st.number_input("1点あたりの金額 (円)", min_value=100, max_value=10000, value=100, step=100, key="box_unit")
+    if st.button("🔄 キャッシュをクリアして再読込"):
+        st.cache_data.clear()
+        st.rerun()
 
-# 馬柱データからタイムや上り3Fを解析する関数
+# タイム・上り3F解析
 def parse_horse_history(row_str):
     time_score = 70.0
     last3f_score = 70.0
@@ -56,8 +59,7 @@ def parse_horse_history(row_str):
         pass
     return time_score, last3f_score
 
-# Excelファイルを確実にロード・解析する関数
-@st.cache_data
+# データを確実にロードする関数（キャッシュなし）
 def load_and_parse_excel_races():
     target_files = ['2026 10_17 ダートレース.xlsx', '2026 10_18 ダートレース.xlsx']
     races = []
@@ -67,32 +69,14 @@ def load_and_parse_excel_races():
             continue
         try:
             xls = pd.ExcelFile(f)
-            # ファイル名で土日を判定
             is_sunday = ('10_18' in f)
             day_label = "日曜日開催" if is_sunday else "土曜日開催"
             
             for sheet_name in xls.sheet_names:
-                df_raw = pd.read_excel(f, sheet_name=sheet_name, header=None)
-                if df_raw.empty:
-                    continue
-                
-                header_text = str(df_raw.iloc[0, 0])
-                
-                # 競馬場名の判定
-                course_name = "東京"
-                s_lower = sheet_name.lower()
-                if "kyouto" in s_lower or "京都" in header_text:
-                    course_name = "京都"
-                elif "niigata" in s_lower or "新潟" in header_text:
-                    course_name = "新潟"
-                elif "tokyou" in s_lower or "東京" in header_text:
-                    course_name = "東京"
-
                 df_data = pd.read_excel(f, sheet_name=sheet_name, header=1)
                 if '馬番' not in df_data.columns:
                     continue
                 
-                # 馬番が「1」に戻る行を起点にレースごとに分割
                 df_data['馬番_num'] = pd.to_numeric(df_data['馬番'], errors='coerce')
                 reset_indices = df_data[df_data['馬番_num'] == 1].index.tolist()
                 reset_indices.append(len(df_data))
@@ -106,7 +90,7 @@ def load_and_parse_excel_races():
                         continue
                         
                     race_no = i + 1
-                    race_no_str = f"{race_no}R"
+                    course_name = "京都" if "kyouto" in sheet_name.lower() else ("新潟" if "niigata" in sheet_name.lower() else "東京")
                     
                     horses = []
                     for _, row in race_df.iterrows():
@@ -151,10 +135,11 @@ def load_and_parse_excel_races():
                         races.append({
                             "course": course_name,
                             "day_label": day_label,
-                            "race_name": f"{course_name} {race_no_str}",
+                            "race_name": f"{course_name} 第{race_no}レース",
                             "horses": horses
                         })
         except Exception as e:
+            print("Error parsing:", e)
             continue
             
     return races
@@ -179,7 +164,7 @@ def render_race_list(target_day_label):
     filtered_races = [r for r in all_loaded_races if r['day_label'] == target_day_label]
     
     if not filtered_races:
-        st.info(f"該当する {target_day_label} のレースはありません。")
+        st.warning(f"⚠️ {target_day_label} のレースデータが見つかりませんでした。サイドバーの「キャッシュをクリアして再読込」をお試しください。")
         return
 
     for r_idx, race in enumerate(filtered_races):
