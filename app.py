@@ -3,11 +3,11 @@ import pandas as pd
 import numpy as np
 import itertools
 import glob
-import os
+import re
 
 # 1. ページの設定
 st.set_page_config(
-    page_title="JRA 黄金パターン AI ダッシュボード (土日別判定完全版)",
+    page_title="JRA 黄金パターン AI ダッシュボード",
     page_icon="🏇",
     layout="centered"
 )
@@ -22,10 +22,6 @@ st.markdown("""
         background-color: #1a1c23; padding: 15px; border-radius: 10px;
         border-left: 5px solid #ff4b4b; margin-bottom: 15px;
     }
-    .result-box {
-        background-color: #111827; border: 1px solid #374151;
-        padding: 12px; border-radius: 8px; margin-top: 12px; font-size: 0.85rem;
-    }
     .success-box {
         background-color: #064e3b; border: 1px solid #10b981;
         padding: 10px; border-radius: 8px; color: #d1fae5; margin-bottom: 15px; font-size: 0.85rem;
@@ -37,15 +33,20 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-st.title("🏇 JRA 黄金パターン AI ダッシュボード [土日別・完全版]")
+st.title("🏇 JRA 黄金パターン AI ダッシュボード [自動パース版]")
 
 # --- サイドバー ---
 with st.sidebar:
     st.header("⚙️ 設定")
     bet_unit = st.number_input("1点あたりの金額 (円)", min_value=100, max_value=10000, value=100, step=100, key="box_unit")
+    
+    st.markdown("---")
+    st.markdown("### 📊 フィルター設定")
+    exclude_shinjin = st.checkbox("新馬戦を除外する", value=True, help="指数解析が不可能な新馬戦を自動除外します")
 
-# データのロード関数
-def load_uploaded_races():
+# データのロード & 自動パース関数
+@st.cache_data
+def load_and_parse_races():
     csv_files = glob.glob('*ダートレース*.csv')
     races = []
     
@@ -53,7 +54,7 @@ def load_uploaded_races():
         try:
             df = pd.read_csv(f)
             
-            # ファイル名の末尾（_17.csv / _18.csv）で土日を厳密に判定
+            # ファイル名から土日を厳密に判定（末尾が _17.csv なら土曜、_18.csv なら日曜）
             if f.endswith('_17.csv'):
                 day_label = "土曜日開催"
             elif f.endswith('_18.csv'):
@@ -61,17 +62,19 @@ def load_uploaded_races():
             else:
                 day_label = "土曜日開催"
                 
-            # 競馬場名の取得
-            course_part = "東京"
+            # 競馬場名の抽出 (東京 / 京都 / 新潟)
+            course_name = "東京"
             if "京都" in f:
-                course_part = "京都"
+                course_name = "京都"
             elif "新潟" in f:
-                course_part = "新潟"
+                course_name = "新潟"
             elif "東京" in f:
-                course_part = "東京"
+                course_name = "東京"
             
-            # 馬番・馬名・オッズ・人気の抽出
             horses = []
+            shinjin_matched_count = 0
+            total_horses = 0
+            
             for idx, row in df.iterrows():
                 if pd.isna(row.get('馬番')):
                     continue
@@ -80,21 +83,29 @@ def load_uploaded_races():
                 except:
                     continue
                     
+                total_horses += 1
+                
+                # 馬名の取得
                 col_name_key = [c for c in df.columns if '馬名' in c][0]
                 col_val = str(row[col_name_key])
                 name_line = col_val.split('\n')[0].strip()
                 
+                # オッズ・人気の抽出
                 odds_val = 15.0
                 pop_val = 5
                 try:
                     if '(' in col_val and '人気' in col_val:
-                        import re
                         m_odds = re.search(r'([\d\.]+)\s*\(\s*(\d+)番人気', col_val)
                         if m_odds:
                             odds_val = float(m_odds.group(1))
                             pop_val = int(m_odds.group(2))
                 except:
                     pass
+
+                # 新馬戦の判定（前走やデータに「新馬」が含まれる割合で判定）
+                row_str = str(row.values)
+                if '新馬' in row_str and '未勝利' not in row_str:
+                    shinjin_matched_count += 1
 
                 horses.append({
                     "horse_no": horse_no,
@@ -107,11 +118,15 @@ def load_uploaded_races():
                 })
             
             if horses:
+                # レース全体が新馬戦かどうかの判定（半数以上が新馬実績の場合）
+                is_shinjin_race = (shinjin_matched_count > total_horses / 2) if total_horses > 0 else False
+                
                 races.append({
                     "filename": f,
-                    "course": course_part,
+                    "course": course_name,
                     "day_label": day_label,
-                    "race_name": f"{course_part} ダート特選",
+                    "race_name": f"{course_name} ダート特選競走",
+                    "is_shinjin": is_shinjin_race,
                     "horses": horses
                 })
         except Exception as e:
@@ -119,7 +134,7 @@ def load_uploaded_races():
             
     return races
 
-all_loaded_races = load_uploaded_races()
+all_loaded_races = load_and_parse_races()
 
 def calculate_ai_indices(horses_data):
     df = pd.DataFrame(horses_data)
@@ -138,8 +153,11 @@ tab_sat, tab_sun = st.tabs(["📅 土曜日開催レース", "📅 日曜日開�
 def render_race_list(target_day_label):
     filtered_races = [r for r in all_loaded_races if r['day_label'] == target_day_label]
     
+    if exclude_shinjin:
+        filtered_races = [r for r in filtered_races if not r['is_shinjin']]
+        
     if not filtered_races:
-        st.info(f"該当する {target_day_label} の解析対象レースはありません。")
+        st.info(f"該当する {target_day_label} の解析対象レースはありません。（※新馬戦除外フィルター適用中）")
         return
 
     for r_idx, race in enumerate(filtered_races):
