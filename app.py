@@ -7,7 +7,7 @@ import os
 
 # 1. ページの設定
 st.set_page_config(
-    page_title="JRA 黄金パターン AI ダッシュボード (土日別・完全修正版)",
+    page_title="JRA 黄金パターン AI ダッシュボード (土日別判定完全版)",
     page_icon="🏇",
     layout="centered"
 )
@@ -37,7 +37,7 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-st.title("🏇 JRA 黄金パターン AI ダッシュボード [土日別・完全修正版]")
+st.title("🏇 JRA 黄金パターン AI ダッシュボード [土日別・完全版]")
 
 # --- サイドバー ---
 with st.sidebar:
@@ -53,10 +53,10 @@ def load_uploaded_races():
         try:
             df = pd.read_csv(f)
             
-            # 土日の判定（ファイル名に _17 があれば土曜、_18 があれば日曜）
-            if '_17' in f:
+            # ファイル名の末尾（_17.csv / _18.csv）で土日を厳密に判定
+            if f.endswith('_17.csv'):
                 day_label = "土曜日開催"
-            elif '_18' in f:
+            elif f.endswith('_18.csv'):
                 day_label = "日曜日開催"
             else:
                 day_label = "土曜日開催"
