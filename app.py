@@ -5,6 +5,9 @@ import itertools
 import urllib.request
 import io
 import re
+import csv
+import html
+import unicodedata
 
 # 1. ページの設定
 st.set_page_config(
@@ -60,113 +63,158 @@ def parse_horse_history(row_str):
         pass
     return time_score, last3f_score
 
-# Google Driveから直接データを読み込む関数
-@st.cache_data(ttl=300)
-def load_races_from_google_drive():
-    # Google Drive上のスプレッドシートID設定
-    drive_sources = [
-        {"id": "14Zn-qUtrbhvNIXJXfNoB8hLfFXLzzeRf-jI3qBDZI_Q", "day_label": "土曜日開催"},
-        {"id": "1oI_Z6cqjDjQP9C81WsLJ5GgfTMqNw7mbiH2N9N9b780", "day_label": "日曜日開催"}
-    ]
-    
-    races = []
-    
-    for src in drive_sources:
-        url = f"https://docs.google.com/spreadsheets/d/{src['id']}/export?format=csv"
-        try:
-            req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
-            with urllib.request.urlopen(req) as response:
-                csv_data = response.read().decode('utf-8', errors='ignore')
-                df_data = pd.read_csv(io.StringIO(csv_data), header=1)
-                
-                horse_col = None
-                for col in df_data.columns:
-                    if '馬番' in str(col):
-                        horse_col = col
-                        break
-                if not horse_col:
-                    continue
-                
-                df_data['馬番_num'] = pd.to_numeric(df_data[horse_col], errors='coerce')
-                reset_indices = df_data[df_data['馬番_num'] == 1].index.tolist()
-                reset_indices.append(len(df_data))
-                
-                for i in range(len(reset_indices) - 1):
-                    start_idx = reset_indices[i]
-                    end_idx = reset_indices[i+1]
-                    race_df = df_data.iloc[start_idx:end_idx].copy()
-                    
-                    if len(race_df) < 2:
-                        continue
-                        
-                    race_no = i + 1
-                    course_name = "東京"
-                    
-                    horses = []
-                    for _, row in race_df.iterrows():
-                        h_val = row.get(horse_col)
-                        if pd.isna(h_val):
-                            continue
-                        try:
-                            horse_no = int(float(h_val))
-                        except:
-                            continue
-                            
-                        name_col = None
-                        for c in race_df.columns:
-                            if '馬名' in str(c):
-                                name_col = c
-                                break
-                        if not name_col:
-                            continue
-                            
-                        col_val = str(row[name_col])
-                        name_line = col_val.split('\n')[0].strip()
-                        if not name_line or name_line == 'nan':
-                            continue
-                        
-                        odds_val = 15.0
-                        pop_val = 5
-                        try:
-                            if '(' in col_val and '人気' in col_val:
-                                m_odds = re.search(r'([\d\.]+)\s*\(\s*(\d+)番人気', col_val)
-                                if m_odds:
-                                    odds_val = float(m_odds.group(1))
-                                    pop_val = int(m_odds.group(2))
-                        except:
-                            pass
+# 実際のJRA表では「2026年... 4回東京6日」の次の行に「1レース」が入る。
+# 各シートを個別に読み、見出しセルを起点にレースを分割する。
+COURSES = ("札幌", "函館", "福島", "新潟", "東京", "中山", "中京", "京都", "阪神", "小倉")
+COURSE_PATTERN = re.compile(r"(?:[1-5]回\s*)?(" + "|".join(COURSES) + r")(?:\s*\d+日|競馬場)?")
+RACE_NUMBER_PATTERN = re.compile(r"(?<!\d)(1[0-2]|[1-9])\s*(?:レース|R|Ｒ)(?!\w)", re.I)
+ODDS_PATTERN = re.compile(r"([\d.]+)\s*\(\s*(\d+)\s*番人気\s*\)")
 
-                        prev_run = ""
-                        for c in race_df.columns:
-                            if '前走' in str(c):
-                                prev_run = str(row.get(c, ''))
-                                break
-                                
-                        t_score, l3f_score = parse_horse_history(prev_run)
-                        
-                        horses.append({
-                            "horse_no": horse_no,
-                            "name": name_line,
-                            "pop_rank": pop_val,
-                            "odds": odds_val,
-                            "time_index": t_score,
-                            "last3f_index": l3f_score,
-                            "track_aptitude": float(75.0)
-                        })
-                    
-                    if horses:
-                        races.append({
-                            "course": course_name,
-                            "day_label": src['day_label'],
-                            "race_name": f"{course_name} 第{race_no}レース",
-                            "horses": horses
-                        })
-        except Exception as e:
+
+def clean_text(value):
+    if value is None:
+        return ""
+    try:
+        if pd.isna(value):
+            return ""
+    except (TypeError, ValueError):
+        pass
+    return unicodedata.normalize("NFKC", str(value)).strip()
+
+
+def parse_race_heading(value, sheet_name=""):
+    text = clean_text(value)
+    # 「ウインファイヴ 2レース目」は誤検出しないよう、行頭の単独レース番号を優先。
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    course_match = COURSE_PATTERN.search(text)
+    course = course_match.group(1) if course_match else None
+    if course is None:
+        course = next((c for c in COURSES if c in sheet_name.lower() or
+                       {"東京": "tokyou", "京都": "kyouto", "新潟": "niigata"}.get(c) in sheet_name.lower()
+                       if {"東京": "tokyou", "京都": "kyouto", "新潟": "niigata"}.get(c)), None)
+    race_no = None
+    race_line_index = None
+    for i, line in enumerate(lines):
+        match = re.fullmatch(r"(?:第\s*)?(1[0-2]|[1-9])\s*(?:レース|R|Ｒ)", line, re.I)
+        if match:
+            race_no = int(match.group(1))
+            race_line_index = i
+            break
+    if race_no is None:
+        return None
+    # 競走名は「Nレース」の次の行。WIN5表記が間にある場合は読み飛ばす。
+    following = lines[race_line_index + 1:]
+    following = [x for x in following if not re.search(r"ウインファイヴ|レース目", x)]
+    race_title = following[0] if following else ""
+    return {"course": course, "race_no": race_no, "race_title": race_title}
+
+
+def parse_sheet_rows(rows, day_label, sheet_name=""):
+    races = []
+    current = None
+    columns = None
+
+    def finish():
+        nonlocal current
+        if current and current["horses"]:
+            course = current["course"]
+            number = current["race_no"]
+            name = f"{course} {number}R" if course else f"開催場不明 {number}R"
+            if current["race_title"]:
+                name += f" {current['race_title']}"
+            current["race_name"] = name
+            current["identified"] = bool(course and number)
+            current["day_label"] = day_label
+            races.append(current)
+        current = None
+
+    for raw in rows:
+        cells = [clean_text(x) for x in raw]
+        if not any(cells):
             continue
-            
+        first = cells[0]
+        # 見出しはA列にあり、複数行テキストでレース番号が単独行に入る。
+        if first and ("発走時刻" in first or "レース" in first):
+            heading = parse_race_heading(first, sheet_name)
+            if heading:
+                finish()
+                current = {**heading, "horses": []}
+                columns = None
+                continue
+        if any("馬番" in c for c in cells) and any("馬名" in c for c in cells):
+            columns = {
+                "horse": next(i for i, c in enumerate(cells) if "馬番" in c),
+                "name": next(i for i, c in enumerate(cells) if "馬名" in c),
+                "previous": next((i for i, c in enumerate(cells) if "前走" in c), None),
+            }
+            continue
+        if current is None or columns is None:
+            continue
+        hi, ni, pi = columns["horse"], columns["name"], columns["previous"]
+        if max(hi, ni) >= len(cells):
+            continue
+        try:
+            horse_no = int(float(cells[hi]))
+            if not 1 <= horse_no <= 18 or float(cells[hi]) != horse_no:
+                continue
+        except (ValueError, TypeError):
+            continue
+        field = cells[ni]
+        name = field.split("\n")[0].strip()
+        if not name:
+            continue
+        odds_match = ODDS_PATTERN.search(field)
+        odds = float(odds_match.group(1)) if odds_match else 15.0
+        popularity = int(odds_match.group(2)) if odds_match else 5
+        previous = cells[pi] if pi is not None and pi < len(cells) else ""
+        time_score, last3f_score = parse_horse_history(previous)
+        current["horses"].append({
+            "horse_no": horse_no, "name": name,
+            "pop_rank": popularity, "odds": odds,
+            "time_index": time_score, "last3f_index": last3f_score,
+            "track_aptitude": 75.0,
+        })
+    finish()
     return races
 
-all_loaded_races = load_races_from_google_drive()
+
+def parse_workbook_bytes(data, day_label):
+    from openpyxl import load_workbook
+    workbook = load_workbook(io.BytesIO(data), read_only=True, data_only=True)
+    try:
+        races = []
+        for sheet in workbook.worksheets:
+            races.extend(parse_sheet_rows(sheet.values, day_label, sheet.title))
+        return races
+    finally:
+        workbook.close()
+
+
+@st.cache_data(ttl=300)
+def load_races_from_google_drive():
+    sources = [
+        {"id": "14Zn-qUtrbhvNIXJXfNoB8hLfFXLzzeRf-jI3qBDZI_Q", "day_label": "土曜日開催"},
+        {"id": "1oI_Z6cqjDjQP9C81WsLJ5GgfTMqNw7mbiH2N9N9b780", "day_label": "日曜日開催"},
+    ]
+    races, errors = [], []
+    for source in sources:
+        # CSVは最初のタブだけになるため、Excel形式で全タブを取得する。
+        url = f"https://docs.google.com/spreadsheets/d/{source['id']}/export?format=xlsx"
+        try:
+            request = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+            with urllib.request.urlopen(request, timeout=30) as response:
+                data = response.read()
+            parsed = parse_workbook_bytes(data, source["day_label"])
+            races.extend(parsed)
+            if not parsed:
+                errors.append(f"{source['day_label']}: 出走馬を含むレースが見つかりません")
+        except Exception as exc:
+            errors.append(f"{source['day_label']}: 取得・解析失敗 ({exc})")
+    return races, errors
+
+all_loaded_races, load_errors = load_races_from_google_drive()
+for error in load_errors:
+    st.warning(error)
 
 def calculate_ai_indices(horses_data):
     df = pd.DataFrame(horses_data)
@@ -190,14 +238,16 @@ def render_race_list(target_day_label):
         return
 
     for r_idx, race in enumerate(filtered_races):
+        if not race["identified"]:
+            st.warning("⚠️ このレースの開催場・レース番号はCSV内で特定できませんでした。元シートの見出しをご確認ください。")
         scored_df = calculate_ai_indices(race["horses"])
         top4_nos = scored_df.head(4)['horse_no'].tolist()
 
         st.markdown(f"""
         <div class="race-card">
-            <span style="background-color: #2d3748; color: #63b3ed; padding: 2px 8px; border-radius: 4px; font-size: 0.75rem;">📅 {race['day_label']}</span>
+            <span style="background-color: #2d3748; color: #63b3ed; padding: 2px 8px; border-radius: 4px; font-size: 0.75rem;">📅 {html.escape(race['day_label'])}</span>
             <span class="confidence-badge">🔥 4頭BOX (4点)</span>
-            <h3 style="margin-top: 8px;">📍 {race['race_name']}</h3>
+            <h3 style="margin-top: 8px;">📍 {html.escape(race['race_name'])}</h3>
             <p style='margin: 4px 0; font-size: 0.85rem; color: #a0aec0;'>
                 <b>🎯 AI上位4頭 (BOX対象):</b> 馬番 <b>{', '.join(map(str, top4_nos))}番</b>
             </p>
@@ -227,7 +277,7 @@ def render_race_list(target_day_label):
                 <div style="background-color: #1a1c23; border: 1px solid #374151; padding: 10px 14px; border-radius: 6px; margin-bottom: 8px;">
                     <div style="font-size: 1.0rem; font-weight: bold; color: #ffffff; margin-bottom: 4px;">
                         <span style="background-color: #2b6cb0; color: white; padding: 2px 6px; border-radius: 4px; font-size: 0.75rem; margin-right: 6px;">馬番 {int(row['horse_no'])}</span>
-                        {row['name']}
+                        {html.escape(str(row['name']))}
                     </div>
                     <div style="display: flex; gap: 15px; font-size: 0.8rem; color: #cbd5e0; flex-wrap: wrap;">
                         <div>AI順位: <b style="color: #f6e05e;">第{int(row['idx_rank'])}位</b></div>
