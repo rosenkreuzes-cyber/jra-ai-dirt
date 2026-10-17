@@ -60,10 +60,9 @@ def parse_horse_history(row_str):
         pass
     return time_score, last3f_score
 
-# Google Driveから直接データを読み込む関数
+# Google Driveから各シートを読み込み、競馬場を正しく判定する関数
 @st.cache_data(ttl=300)
 def load_races_from_google_drive():
-    # Google Drive上のスプレッドシートID設定
     drive_sources = [
         {"id": "14Zn-qUtrbhvNIXJXfNoB8hLfFXLzzeRf-jI3qBDZI_Q", "day_label": "土曜日開催"},
         {"id": "1oI_Z6cqjDjQP9C81WsLJ5GgfTMqNw7mbiH2N9N9b780", "day_label": "日曜日開催"}
@@ -74,10 +73,38 @@ def load_races_from_google_drive():
     for src in drive_sources:
         url = f"https://docs.google.com/spreadsheets/d/{src['id']}/export?format=csv"
         try:
-            req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
+            # スプレッドシート内の全シート名を取得するためにExcelFileの代わりに複数CSVを想定するか、
+            # Googleスプレッドシートの各タブは別URLまたはgvizAPIで取得する必要があるため、
+            # もし1つのCSVに結合されている場合はテキストからタブ/セクションを判別します。
+            # ここではGoogleスプレッドシートのエクスポート仕様に合わせて各タブを考慮します。
+            
+            # Googleスプレッドシートのデフォルトエクスポートは最初のシートのみになるため、
+            # もし複数タブがある場合は gid を指定するか、xlsxとしてダウンロードします。
+            # 今回はxlsx形式（export?format=xlsx）でダウンロードして処理します。
+            xlsx_url = f"https://docs.google.com/spreadsheets/d/{src['id']}/export?format=xlsx"
+            req = urllib.request.Request(xlsx_url, headers={'User-Agent': 'Mozilla/5.0'})
             with urllib.request.urlopen(req) as response:
-                csv_data = response.read().decode('utf-8', errors='ignore')
-                df_data = pd.read_csv(io.StringIO(csv_data), header=1)
+                excel_bytes = response.read()
+                
+            xls = pd.ExcelFile(io.BytesIO(excel_bytes))
+            
+            for sheet_name in xls.sheet_names:
+                df_raw = pd.read_excel(io.BytesIO(excel_bytes), sheet_name=sheet_name, header=None)
+                if df_raw.empty:
+                    continue
+                
+                # 1行目などのテキストから会場名（東京・京都・新潟）を検出
+                header_text = str(df_raw.iloc[0, 0])
+                s_lower = sheet_name.lower()
+                
+                if "kyouto" in s_lower or "京都" in header_text or "京都" in sheet_name:
+                    course_name = "京都"
+                elif "niigata" in s_lower or "新潟" in header_text or "新潟" in sheet_name:
+                    course_name = "新潟"
+                else:
+                    course_name = "東京"
+                
+                df_data = pd.read_excel(io.BytesIO(excel_bytes), sheet_name=sheet_name, header=1)
                 
                 horse_col = None
                 for col in df_data.columns:
@@ -100,7 +127,6 @@ def load_races_from_google_drive():
                         continue
                         
                     race_no = i + 1
-                    course_name = "東京"
                     
                     horses = []
                     for _, row in race_df.iterrows():
@@ -186,7 +212,7 @@ def render_race_list(target_day_label):
     filtered_races = [r for r in all_loaded_races if r['day_label'] == target_day_label]
     
     if not filtered_races:
-        st.warning(f"⚠️ Google Driveからの {target_day_label} のレースデータ取得に失敗しました。スプレッドシートのアクセス権限（リンクを知っている全員が閲覧可能）をご確認ください。")
+        st.warning(f"⚠️ Google Driveからの {target_day_label} のレースデータ取得に失敗しました。")
         return
 
     for r_idx, race in enumerate(filtered_races):
@@ -219,7 +245,7 @@ def render_race_list(target_day_label):
                 })
             st.dataframe(pd.DataFrame(box_bets), use_container_width=True, hide_index=True)
 
-            st.markdown("##### 📋 出走馬 AIスコアリング一覧")
+### 📋 出走馬 AIスコアリング一覧
             sorted_df = scored_df.sort_values('idx_rank').reset_index(drop=True)
             for _, row in sorted_df.iterrows():
                 gap_color = "#63b3ed" if row['divergence'] > 0 else ("#f6e05e" if row['divergence'] == 0 else "#ff4b4b")
