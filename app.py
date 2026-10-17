@@ -13,24 +13,7 @@ st.set_page_config(
     layout="centered"
 )
 
-# 2. カスタムCSS
-st.markdown("""
-<style>
-    .main { background-color: #0e1117; }
-    h1 { font-size: 1.4rem !important; color: #ff4b4b; }
-    h3 { font-size: 1.1rem !important; color: #f6e05e; }
-    .race-card {
-        background-color: #1a1c23; padding: 15px; border-radius: 10px;
-        border-left: 5px solid #ff4b4b; margin-bottom: 15px;
-    }
-    .confidence-badge {
-        background-color: #b7791f; color: #ffffff; padding: 2px 8px;
-        border-radius: 4px; font-size: 0.75rem; font-weight: bold; float: right;
-    }
-</style>
-""", unsafe_allow_html=True)
-
-st.title("🏇 JRA 黄金パターン AI ダッシュボード [強制読込版]")
+st.title("🏇 JRA 黄金パターン AI ダッシュボード [直接読込版]")
 
 # --- サイドバー ---
 with st.sidebar:
@@ -38,6 +21,13 @@ with st.sidebar:
     bet_unit = st.number_input("1点あたりの金額 (円)", min_value=100, max_value=10000, value=100, step=100, key="box_unit")
     if st.button("🔄 アプリを再読込"):
         st.rerun()
+
+    st.markdown("---")
+    st.markdown("### 📂 読み込みファイル確認")
+    current_dir = os.getcwd()
+    all_excels = glob.glob('*.xlsx')
+    st.text(f"作業ディレクトリ:\n{current_dir}")
+    st.text(f"検出されたファイル:\n{all_excels}")
 
 # タイム・上り3F解析
 def parse_horse_history(row_str):
@@ -59,22 +49,27 @@ def parse_horse_history(row_str):
         pass
     return time_score, last3f_score
 
-# ワークスペース内のすべてのExcelファイルを強制的に解析する関数
+# 確実にファイルを探索して読み込む関数
 def load_and_parse_excel_races():
-    excel_files = glob.glob('*.xlsx')
     races = []
+    # ワークスペース内からダートレースのExcelファイルを自動探索
+    excel_files = [f for f in glob.glob('*.xlsx') if 'ダートレース' in f or '10_17' in f or '10_18' in f]
     
+    if not excel_files:
+        excel_files = glob.glob('*.xlsx') # フォールバック
+        
     for filename in excel_files:
         try:
-            xls = pd.ExcelFile(filename)
-            # ファイル名に18が含まれていれば日曜、それ以外は土曜
+            # 絶対パスの生成
+            abs_path = os.path.abspath(filename)
+            xls = pd.ExcelFile(abs_path)
+            
             is_sunday = ('18' in filename)
             day_label = "日曜日開催" if is_sunday else "土曜日開催"
             
             for sheet_name in xls.sheet_names:
-                df_data = pd.read_excel(filename, sheet_name=sheet_name, header=1)
+                df_data = pd.read_excel(abs_path, sheet_name=sheet_name, header=1)
                 
-                # 馬番カラムの検索
                 horse_col = None
                 for col in df_data.columns:
                     if '馬番' in str(col):
@@ -164,6 +159,7 @@ def load_and_parse_excel_races():
                             "horses": horses
                         })
         except Exception as e:
+            st.error(f"ファイル読込エラー ({filename}): {e}")
             continue
             
     return races
@@ -188,7 +184,7 @@ def render_race_list(target_day_label):
     filtered_races = [r for r in all_loaded_races if r['day_label'] == target_day_label]
     
     if not filtered_races:
-        st.warning(f"⚠️ {target_day_label} のレースデータが検出されませんでした。")
+        st.warning(f"⚠️ {target_day_label} のレースデータが検出されませんでした。（サイドバーの検出ファイル名をご確認ください）")
         return
 
     for r_idx, race in enumerate(filtered_races):
@@ -196,10 +192,10 @@ def render_race_list(target_day_label):
         top4_nos = scored_df.head(4)['horse_no'].tolist()
 
         st.markdown(f"""
-        <div class="race-card">
+        <div style="background-color: #1a1c23; padding: 15px; border-radius: 10px; border-left: 5px solid #ff4b4b; margin-bottom: 15px;">
             <span style="background-color: #2d3748; color: #63b3ed; padding: 2px 8px; border-radius: 4px; font-size: 0.75rem;">📅 {race['day_label']}</span>
-            <span class="confidence-badge">🔥 4頭BOX (4点)</span>
-            <h3 style="margin-top: 8px;">📍 {race['race_name']}</h3>
+            <span style="background-color: #b7791f; color: #ffffff; padding: 2px 8px; border-radius: 4px; font-size: 0.75rem; font-weight: bold; float: right;">🔥 4頭BOX (4点)</span>
+            <h3 style="margin-top: 8px; color: #f6e05e;">📍 {race['race_name']}</h3>
             <p style='margin: 4px 0; font-size: 0.85rem; color: #a0aec0;'>
                 <b>🎯 AI上位4頭 (BOX対象):</b> 馬番 <b>{', '.join(map(str, top4_nos))}番</b>
             </p>
