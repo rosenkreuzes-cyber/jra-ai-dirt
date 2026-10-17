@@ -2,12 +2,12 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import itertools
-import glob
+import os
 import re
 
 # 1. ページの設定
 st.set_page_config(
-    page_title="JRA 黄金パターン AI ダッシュボード (馬柱完全解析版)",
+    page_title="JRA 黄金パターン AI ダッシュボード",
     page_icon="🏇",
     layout="centered"
 )
@@ -29,7 +29,7 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-st.title("🏇 JRA 黄金パターン AI ダッシュボード [馬柱データ完全解析版]")
+st.title("🏇 JRA 黄金パターン AI ダッシュボード [完全版]")
 
 # --- サイドバー ---
 with st.sidebar:
@@ -40,42 +40,38 @@ with st.sidebar:
     st.markdown("### 📊 フィルター設定")
     exclude_shinjin = st.checkbox("新馬戦を除外する", value=True, help="指数解析が不可能な新馬戦を自動除外します")
 
-# 馬柱データから前走の情報をパースしてAI指数を算出する関数
+# 馬柱データ（前走等）からタイムや上り3Fを解析する関数
 def parse_horse_history(row_str):
     time_score = 70.0
     last3f_score = 70.0
-    
     try:
-        # 上り3Fの抽出 (例: "3F 38.4")
         m_3f = re.search(r'3F\s*([\d\.]+)', row_str)
         if m_3f:
             val_3f = float(m_3f.group(1))
-            # 3Fが速いほど高得点 (基準38.0秒)
             last3f_score = max(50.0, 100.0 - (val_3f - 35.0) * 10)
             
-        # 走破タイムの抽出 (例: "1:15.2")
         m_time = re.search(r'(\d+):([\d\.]+)', row_str)
         if m_time:
             minutes = int(m_time.group(1))
             seconds = float(m_time.group(2))
             total_sec = minutes * 60 + seconds
-            # タイムが短いほど高得点
             time_score = max(50.0, 110.0 - (total_sec - 75.0) * 2)
     except:
         pass
-        
     return time_score, last3f_score
 
-# Excelファイルのロード & 複数レース分割解析関数
+# 正式な2つのExcelファイルのみを対象にデータをロード・解析する関数
 @st.cache_data
 def load_and_parse_excel_races():
-    excel_files = glob.glob('*ダートレース.xlsx')
+    target_files = ['2026 10_17 ダートレース.xlsx', '2026 10_18 ダートレース.xlsx']
     races = []
     
-    for f in excel_files:
+    for f in target_files:
+        if not os.path.exists(f):
+            continue
         try:
             xls = pd.ExcelFile(f)
-            is_sunday = ('10_18' in f) or ('18' in f)
+            is_sunday = ('10_18' in f)
             day_label = "日曜日開催" if is_sunday else "土曜日開催"
             
             for sheet_name in xls.sheet_names:
@@ -88,20 +84,20 @@ def load_and_parse_excel_races():
                 # 競馬場名の判定
                 course_name = "東京"
                 s_lower = sheet_name.lower()
-                if "kyouto" in s_lower or "京都" in header_text or "京都" in sheet_name:
+                if "kyouto" in s_lower or "京都" in header_text:
                     course_name = "京都"
-                elif "niigata" in s_lower or "新潟" in header_text or "新潟" in sheet_name:
+                elif "niigata" in s_lower or "新潟" in header_text:
                     course_name = "新潟"
-                elif "tokyou" in s_lower or "東京" in header_text or "東京" in sheet_name:
+                elif "tokyou" in s_lower or "東京" in header_text:
                     course_name = "東京"
 
-                # 2行目をヘッダーとしてデータ読込
                 df_data = pd.read_excel(f, sheet_name=sheet_name, header=1)
                 if '馬番' not in df_data.columns:
                     continue
                 
-                # 馬番が「1」に戻る行インデックスを検出し、レースごとに分割
-                reset_indices = df_data[df_data['馬番'] == 1].index.tolist()
+                # 馬番が「1」に戻る行を起点にレースごとに分割
+                df_data['馬番_num'] = pd.to_numeric(df_data['馬番'], errors='coerce')
+                reset_indices = df_data[df_data['馬番_num'] == 1].index.tolist()
                 reset_indices.append(len(df_data))
                 
                 for i in range(len(reset_indices) - 1):
@@ -146,7 +142,6 @@ def load_and_parse_excel_races():
                         except:
                             pass
 
-                        # 馬柱（前走データ）からの解析
                         prev_run = str(row.get('前走', ''))
                         if '新馬' in prev_run and '未勝利' not in prev_run:
                             shinjin_count += 1
