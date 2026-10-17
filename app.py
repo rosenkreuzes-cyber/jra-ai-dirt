@@ -569,39 +569,64 @@ with t2:
     render_races("日曜日開催", sun_date)
 
 with t3:
-    st.subheader("確定結果の登録")
+    st.subheader("確定結果の登録・訂正")
     if st.button("🔄 保存済み履歴を読み直す", key="refresh_history"):
         st.rerun()
     try:
         predictions, results = read_all_history()
-        pending = {k: v for k, v in predictions.items() if k not in results}
-        if not pending:
-            st.info("結果未登録の予想はありません。まず推奨レースを確定保存してください。")
+        if not predictions:
+            st.info("保存済みの予想がありません。まず推奨レースを確定保存してください。")
         else:
-            ids = sorted(pending, reverse=True)
-            rid = st.selectbox("結果登録するレース", ids, format_func=lambda k: pending[k]["race_name"] + " / " + pending[k]["race_date"])
-            pred = pending[rid]
+            ids = sorted(predictions, reverse=True)
+            rid = st.selectbox("結果を登録・訂正するレース", ids,
+                format_func=lambda k: predictions[k]["race_name"] + " / " + predictions[k]["race_date"] + (" 【登録済み】" if k in results else " 【未登録】"))
+            pred = predictions[rid]
+            old = results.get(rid)
             st.write("保存済み推奨馬番:", pred["top4"])
-            with st.form("result_form"):
-                a = st.number_input("1着馬番", 1, 18, 1)
-                b = st.number_input("2着馬番", 1, 18, 2)
-                c = st.number_input("3着馬番", 1, 18, 3)
-                payout = st.number_input("3連複確定払戻（100円あたり・円）", 0, 100000000, 0, step=100)
-                submitted = st.form_submit_button("確定結果を保存")
+            if old:
+                st.info("登録済みの結果を表示しています。訂正して保存できます。予想履歴は変更しません。")
+            initial = [int(x) for x in old["top3"]] if old else [1, 2, 3]
+            with st.form("result_form_" + rid):
+                a = st.number_input("1着馬番", 1, 18, initial[0], key="first_" + rid)
+                b = st.number_input("2着馬番", 1, 18, initial[1], key="second_" + rid)
+                c = st.number_input("3着馬番", 1, 18, initial[2], key="third_" + rid)
+                payout = st.number_input("3連複確定払戻（100円あたり・円）", 0, 100000000,
+                    int(old.get("trio_payout_100yen", 0)) if old else 0, step=10, key="payout_" + rid)
+                reason = st.text_input("訂正理由（訂正時のみ）", placeholder="例：2着と3着を取り違えた", key="reason_" + rid) if old else ""
+                confirmed = st.checkbox("登録内容を確認しました", key="confirmed_" + rid)
+                submitted = st.form_submit_button("✏️ 訂正して保存" if old else "💾 確定結果を保存")
             if submitted:
-                if len({a, b, c}) != 3:
-                    st.error("1〜3着に同じ馬番は指定できません。")
+                if not confirmed:
+                    st.error("確認欄にチェックを入れてください。")
+                elif len({a, b, c}) != 3:
+                    st.error("1〜3着に同じ馬番は指定できません（同着レースは未対応）。")
+                elif old and not reason.strip():
+                    st.error("訂正時は理由を入力してください。")
                 else:
-                    record = {"race_id": rid, "race_date": pred["race_date"], "top3": [int(a), int(b), int(c)],
-                              "trio_payout_100yen": int(payout), "saved_at_utc": datetime.datetime.now(datetime.timezone.utc).isoformat(),
-                              "note": "同着・返還・取消がない通常レース用"}
+                    now = datetime.datetime.now(datetime.timezone.utc).isoformat()
+                    record = {
+                        "race_id": rid, "race_date": pred["race_date"],
+                        "top3": [int(a), int(b), int(c)],
+                        "trio_payout_100yen": int(payout),
+                        "saved_at_utc": old.get("saved_at_utc", now) if old else now,
+                        "updated_at_utc": now,
+                        "note": "同着・返還・取消がない通常レース用",
+                        "revision_history": list(old.get("revision_history", [])) if old else [],
+                    }
+                    if old:
+                        record["revision_history"].append({
+                            "corrected_at_utc": now, "reason": reason.strip(),
+                            "previous_top3": old["top3"],
+                            "previous_trio_payout_100yen": old["trio_payout_100yen"],
+                        })
                     path = f"results/{pred['race_date'][:4]}/{rid}.json"
                     try:
-                        if put_record(path, record):
+                        if put_record(path, record, overwrite=bool(old)):
                             hit, stake, received = outcome(pred, record)
-                            st.success(f"結果保存完了：{'的中' if hit else '不的中'} ／ 投資 {stake:,}円 ／ 払戻 {received:,}円")
+                            st.success(f"{'訂正' if old else '登録'}完了：{'的中' if hit else '不的中'} ／ 投資 {stake:,}円 ／ 払戻 {received:,}円")
+                            st.rerun()
                         else:
-                            st.warning("結果は登録済みです。上書きしていません。")
+                            st.warning("すでに結果が登録されています。履歴を再読み込みしてください。")
                     except Exception as e:
                         st.error("結果保存失敗: " + str(e))
     except Exception as e:
