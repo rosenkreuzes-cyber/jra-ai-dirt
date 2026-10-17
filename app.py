@@ -29,18 +29,14 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-st.title("🏇 JRA 黄金パターン AI ダッシュボード [完全版]")
+st.title("🏇 JRA 黄金パターン AI ダッシュボード")
 
 # --- サイドバー ---
 with st.sidebar:
     st.header("⚙️ 設定")
     bet_unit = st.number_input("1点あたりの金額 (円)", min_value=100, max_value=10000, value=100, step=100, key="box_unit")
-    
-    st.markdown("---")
-    st.markdown("### 📊 フィルター設定")
-    exclude_shinjin = st.checkbox("新馬戦を除外する", value=True, help="指数解析が不可能な新馬戦を自動除外します")
 
-# 馬柱データ（前走等）からタイムや上り3Fを解析する関数
+# 馬柱データからタイムや上り3Fを解析する関数
 def parse_horse_history(row_str):
     time_score = 70.0
     last3f_score = 70.0
@@ -60,7 +56,7 @@ def parse_horse_history(row_str):
         pass
     return time_score, last3f_score
 
-# 正式な2つのExcelファイルのみを対象にデータをロード・解析する関数
+# Excelファイルを確実にロード・解析する関数
 @st.cache_data
 def load_and_parse_excel_races():
     target_files = ['2026 10_17 ダートレース.xlsx', '2026 10_18 ダートレース.xlsx']
@@ -71,6 +67,7 @@ def load_and_parse_excel_races():
             continue
         try:
             xls = pd.ExcelFile(f)
+            # ファイル名で土日を判定
             is_sunday = ('10_18' in f)
             day_label = "日曜日開催" if is_sunday else "土曜日開催"
             
@@ -112,9 +109,6 @@ def load_and_parse_excel_races():
                     race_no_str = f"{race_no}R"
                     
                     horses = []
-                    shinjin_count = 0
-                    total_h = 0
-                    
                     for _, row in race_df.iterrows():
                         if pd.isna(row.get('馬番')):
                             continue
@@ -123,8 +117,6 @@ def load_and_parse_excel_races():
                         except:
                             continue
                             
-                        total_h += 1
-                        
                         col_name_key = [c for c in race_df.columns if '馬名' in c]
                         if not col_name_key:
                             continue
@@ -143,9 +135,6 @@ def load_and_parse_excel_races():
                             pass
 
                         prev_run = str(row.get('前走', ''))
-                        if '新馬' in prev_run and '未勝利' not in prev_run:
-                            shinjin_count += 1
-                            
                         t_score, l3f_score = parse_horse_history(prev_run)
                         
                         horses.append({
@@ -159,14 +148,10 @@ def load_and_parse_excel_races():
                         })
                     
                     if horses:
-                        is_shinjin_race = (shinjin_count > total_h / 2) if total_h > 0 else False
-                        race_cond = "新馬戦" if is_shinjin_race else "2歳未勝利/条件戦"
-                        
                         races.append({
                             "course": course_name,
                             "day_label": day_label,
-                            "race_name": f"{course_name} {race_no_str} - {race_cond}",
-                            "is_shinjin": is_shinjin_race,
+                            "race_name": f"{course_name} {race_no_str}",
                             "horses": horses
                         })
         except Exception as e:
@@ -193,11 +178,8 @@ tab_sat, tab_sun = st.tabs(["📅 土曜日開催レース", "📅 日曜日開�
 def render_race_list(target_day_label):
     filtered_races = [r for r in all_loaded_races if r['day_label'] == target_day_label]
     
-    if exclude_shinjin:
-        filtered_races = [r for r in filtered_races if not r['is_shinjin']]
-        
     if not filtered_races:
-        st.info(f"該当する {target_day_label} の解析対象レースはありません。（※新馬戦除外フィルター適用中）")
+        st.info(f"該当する {target_day_label} のレースはありません。")
         return
 
     for r_idx, race in enumerate(filtered_races):
@@ -253,9 +235,9 @@ def render_race_list(target_day_label):
         st.markdown("---")
 
 with tab_sat:
-    st.markdown("### 🟢 土曜日開催の対象レース一覧")
+    st.markdown("### 🟢 土曜日開催のレース一覧")
     render_race_list("土曜日開催")
 
 with tab_sun:
-    st.markdown("### 🟠 日曜日開催の対象レース一覧")
+    st.markdown("### 🟠 日曜日開催のレース一覧")
     render_race_list("日曜日開催")
