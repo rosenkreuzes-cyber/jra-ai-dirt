@@ -13,21 +13,13 @@ st.set_page_config(
     layout="centered"
 )
 
-st.title("🏇 JRA 黄金パターン AI ダッシュボード [直接読込版]")
+st.title("🏇 JRA 黄金パターン AI ダッシュボード [デバッグ版]")
 
-# --- サイドバー ---
+# --- サイドバー (診断情報) ---
 with st.sidebar:
-    st.header("⚙️ 設定")
-    bet_unit = st.number_input("1点あたりの金額 (円)", min_value=100, max_value=10000, value=100, step=100, key="box_unit")
-    if st.button("🔄 アプリを再読込"):
+    st.header("🔍 デバッグ診断パネル")
+    if st.button("🔄 再読込"):
         st.rerun()
-
-    st.markdown("---")
-    st.markdown("### 📂 読み込みファイル確認")
-    current_dir = os.getcwd()
-    all_excels = glob.glob('*.xlsx')
-    st.text(f"作業ディレクトリ:\n{current_dir}")
-    st.text(f"検出されたファイル:\n{all_excels}")
 
 # タイム・上り3F解析
 def parse_horse_history(row_str):
@@ -49,26 +41,26 @@ def parse_horse_history(row_str):
         pass
     return time_score, last3f_score
 
-# 確実にファイルを探索して読み込む関数
+# データを読み込み、詳細なログを収集する関数
 def load_and_parse_excel_races():
     races = []
-    # ワークスペース内からダートレースのExcelファイルを自動探索
-    excel_files = [f for f in glob.glob('*.xlsx') if 'ダートレース' in f or '10_17' in f or '10_18' in f]
+    log_messages = []
     
-    if not excel_files:
-        excel_files = glob.glob('*.xlsx') # フォールバック
-        
+    excel_files = glob.glob('*.xlsx')
+    log_messages.append(f"検出ファイル一覧: {excel_files}")
+    
     for filename in excel_files:
-        try:
-            # 絶対パスの生成
-            abs_path = os.path.abspath(filename)
-            xls = pd.ExcelFile(abs_path)
+        if 'ダートレース' not in filename and '10_17' not in filename and '10_18' not in filename:
+            continue
             
+        try:
+            xls = pd.ExcelFile(filename)
             is_sunday = ('18' in filename)
             day_label = "日曜日開催" if is_sunday else "土曜日開催"
             
             for sheet_name in xls.sheet_names:
-                df_data = pd.read_excel(abs_path, sheet_name=sheet_name, header=1)
+                df_data = pd.read_excel(filename, sheet_name=sheet_name, header=1)
+                log_messages.append(f"📁 [{filename}] シート '{sheet_name}' 読込成功 (行数: {len(df_data)})")
                 
                 horse_col = None
                 for col in df_data.columns:
@@ -76,11 +68,13 @@ def load_and_parse_excel_races():
                         horse_col = col
                         break
                 if not horse_col:
+                    log_messages.append(f"  ❌ '馬番'カラムが見つかりません。Columns: {list(df_data.columns)}")
                     continue
                 
                 df_data['馬番_num'] = pd.to_numeric(df_data[horse_col], errors='coerce')
                 reset_indices = df_data[df_data['馬番_num'] == 1].index.tolist()
                 reset_indices.append(len(df_data))
+                log_messages.append(f"  📌 馬番リセット位置: {reset_indices}")
                 
                 for i in range(len(reset_indices) - 1):
                     start_idx = reset_indices[i]
@@ -159,12 +153,19 @@ def load_and_parse_excel_races():
                             "horses": horses
                         })
         except Exception as e:
-            st.error(f"ファイル読込エラー ({filename}): {e}")
+            log_messages.append(f"🔥 エラー発生 ({filename}): {str(e)}")
             continue
             
-    return races
+    return races, log_messages
 
-all_loaded_races = load_and_parse_excel_races()
+all_loaded_races, debug_logs = load_and_parse_excel_races()
+
+with st.sidebar:
+    st.markdown("---")
+    st.markdown(f"**総抽出レース数:** {len(all_loaded_races)}件")
+    with st.expander("🛠️ 読み込み詳細ログ"):
+        for log in debug_logs:
+            st.write(log)
 
 def calculate_ai_indices(horses_data):
     df = pd.DataFrame(horses_data)
@@ -184,7 +185,7 @@ def render_race_list(target_day_label):
     filtered_races = [r for r in all_loaded_races if r['day_label'] == target_day_label]
     
     if not filtered_races:
-        st.warning(f"⚠️ {target_day_label} のレースデータが検出されませんでした。（サイドバーの検出ファイル名をご確認ください）")
+        st.warning(f"⚠️ {target_day_label} のレースデータが 0 件です。（サイドバーの「読み込み詳細ログ」をご確認ください）")
         return
 
     for r_idx, race in enumerate(filtered_races):
