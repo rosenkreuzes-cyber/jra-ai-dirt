@@ -7,7 +7,7 @@ import os
 
 # 1. ページの設定
 st.set_page_config(
-    page_title="JRA 黄金パターン AI ダッシュボード (土日別・対象レース限定版)",
+    page_title="JRA 黄金パターン AI ダッシュボード (土日別・対象レース表示版)",
     page_icon="🏇",
     layout="centered"
 )
@@ -46,7 +46,7 @@ with st.sidebar:
     
     st.markdown("---")
     st.markdown("### 📊 表示フィルター")
-    exclude_shinjin = st.checkbox("新馬戦を除外する（指数解析不可のため）", value=True)
+    exclude_shinjin = st.checkbox("新馬戦を除外する", value=False) # デフォルトで全表示にして確認しやすくします
 
 # データのロード関数
 def load_uploaded_races():
@@ -56,21 +56,30 @@ def load_uploaded_races():
     for f in csv_files:
         try:
             df = pd.read_csv(f)
-            # ファイル名から情報解析 (例: 2026_10_17_10_18_ダートレース_東京10_17.csv)
-            parts = f.split('_')
-            course_part = parts[4].replace('ダートレース', '')
-            day_part = parts[6].replace('.csv', '') # 17 (土) or 18 (日)
-            
-            # 土日の判定 (17日=土曜、18日=日曜 と仮定)
-            day_label = "土曜日開催" if day_part == "17" else ("日曜日開催" if day_part == "18" else "その他")
+            # ファイル名から競馬場名と日付を正確に判定
+            # 例: 2026_10_17_10_18_ダートレース_東京10_17.csv -> 末尾が _17.csv なら土曜、_18.csv なら日曜
+            filename_lower = f.lower()
+            if '_17.csv' in filename_lower:
+                day_label = "土曜日開催"
+            elif '_18.csv' in filename_lower:
+                day_label = "日曜日開催"
+            else:
+                day_label = "土曜日開催"
+                
+            # 競馬場名の取得
+            course_part = "東京"
+            if "京都" in f:
+                course_part = "京都"
+            elif "新潟" in f:
+                course_part = "新潟"
+            elif "東京" in f:
+                course_part = "東京"
             
             # 馬番・馬名・オッズ・人気の抽出
             horses = []
             for idx, row in df.iterrows():
-                # NaN行（区切り行など）をスキップ
                 if pd.isna(row.get('馬番')):
                     continue
-                
                 try:
                     horse_no = int(row['馬番'])
                 except:
@@ -80,12 +89,10 @@ def load_uploaded_races():
                 col_val = str(row[col_name_key])
                 name_line = col_val.split('\n')[0].strip()
                 
-                # オッズ・人気の抽出（文字列からパース）
                 odds_val = 15.0
                 pop_val = 5
                 try:
                     if '(' in col_val and '人気' in col_val:
-                        # 例: 61.3(8番人気)
                         import re
                         m_odds = re.search(r'([\d\.]+)\s*\(\s*(\d+)番人気', col_val)
                         if m_odds:
@@ -94,33 +101,22 @@ def load_uploaded_races():
                 except:
                     pass
 
-                # 新馬戦判定（前走データや血統欄に新馬が含まれるか）
-                row_str = str(row.values)
-                is_shinjin = '新馬' in row_str and '未勝利' not in row_str
-                
                 horses.append({
                     "horse_no": horse_no,
                     "name": name_line,
                     "pop_rank": pop_val,
                     "odds": odds_val,
-                    "is_shinjin": is_shinjin,
-                    # 指数計算用ダミー（後で実走タイムから算出可能）
                     "time_index": float(80.0 - (idx * 0.4)),
                     "last3f_index": float(78.0 - (idx * 0.3)),
                     "track_aptitude": float(75.0)
                 })
             
             if horses:
-                # レースが新馬戦か判定
-                shinjin_count = sum(1 for h in horses if h["is_shinjin"])
-                is_race_shinjin = (shinjin_count > len(horses) / 2)
-                
                 races.append({
                     "filename": f,
                     "course": course_part,
                     "day_label": day_label,
                     "race_name": f"{course_part} ダート特選",
-                    "is_shinjin": is_race_shinjin,
                     "horses": horses
                 })
         except Exception as e:
@@ -147,9 +143,6 @@ tab_sat, tab_sun = st.tabs(["📅 土曜日開催レース", "📅 日曜日開�
 def render_race_list(target_day_label):
     filtered_races = [r for r in all_loaded_races if r['day_label'] == target_day_label]
     
-    if exclude_shinjin:
-        filtered_races = [r for r in filtered_races if not r['is_shinjin']]
-        
     if not filtered_races:
         st.info(f"該当する {target_day_label} の解析対象レースはありません。")
         return
