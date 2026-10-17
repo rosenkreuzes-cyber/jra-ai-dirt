@@ -101,17 +101,26 @@ def run_strict_backtest(df):
         return None
 
 @st.cache_data
-def fetch_safe_live_race_horses():
-    """
-    実データファイル（CSV）から特定の1レース分を抽出し、
-    各馬のタイムや上りから個別のAI指数を正しく計算して返す。
-    """
+def fetch_safe_live_race_horses_with_info():
     df, status = load_historical_jra_data()
     if not df.empty and 'レースID' in df.columns:
         sample_race_id = df['レースID'].iloc[0]
         race_df = df[df['レースID'] == sample_race_id].copy()
         
-        # タイムや上りデータを数値化して個別の指数をつける
+        # レース情報の抽出
+        row_sample = race_df.iloc[0]
+        race_date = str(row_sample.get('レース日付', row_sample.get('datetime', '2021年')))
+        course_name = str(row_sample.get('競馬場名', '東京'))
+        race_no = str(row_sample.get('レース番号', '10')) + "R"
+        race_name = str(row_sample.get('レース名', 'ダート特選競走'))
+        
+        race_info = {
+            "date": race_date.split(' ')[0],
+            "course": course_name,
+            "race_no": race_no,
+            "race_name": race_name
+        }
+        
         if 'タイム' in race_df.columns:
             def parse_time(t_str):
                 try:
@@ -124,7 +133,6 @@ def fetch_safe_live_race_horses():
                     return 999.0
             race_df['time_sec'] = race_df['タイム'].apply(parse_time)
             min_t = race_df['time_sec'].min()
-            # タイムが良いほど高得点になるよう個別に計算
             race_df['calc_time_idx'] = (95 - (race_df['time_sec'] - min_t) * 8).clip(50, 99)
         else:
             race_df['calc_time_idx'] = 75.0
@@ -163,6 +171,6 @@ def fetch_safe_live_race_horses():
                 "track_aptitude": float(78.0),
                 "odds": odds_val
             })
-        return horses, f"実データ個別算出成功 (レースID: {sample_race_id}, 出走頭数: {len(horses)}頭)"
+        return horses, f"実データ抽出成功 (レースID: {sample_race_id})", race_info
     
-    return [], "データ読込エラー"
+    return [], "データ読込エラー", {"date": "-", "course": "-", "race_no": "-", "race_name": "-"}
