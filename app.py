@@ -73,18 +73,28 @@ with tab_live:
     st.caption("【実戦検証】AI指数5位未満への断層を考慮した「上位4頭BOX（4点）」の買い目構築")
 
     sample_race_horses = [
-        {"horse_no": 2, "name": "メイショウモウコ", "pop_rank": 3, "time_index": 78.5, "last3f_index": 72.0, "track_aptitude": 80.0, "odds": 6.8},
-        {"horse_no": 4, "name": "テイエムスパーダ", "pop_rank": 6, "time_index": 84.0, "last3f_index": 82.5, "track_aptitude": 85.0, "odds": 18.2},
-        {"horse_no": 7, "name": "サンライズホープ", "pop_rank": 1, "time_index": 88.0, "last3f_index": 75.0, "track_aptitude": 82.0, "odds": 2.4},
-        {"horse_no": 9, "name": "ロードエクレール", "pop_rank": 4, "time_index": 79.0, "last3f_index": 78.0, "track_aptitude": 76.0, "odds": 9.5},
-        {"horse_no": 12, "name": "グレートサンド", "pop_rank": 8, "time_index": 75.0, "last3f_index": 74.0, "track_aptitude": 78.0, "odds": 35.4}
+        {"horse_no": 1, "name": "メイショウハリオ", "pop_rank": 2, "time_index": 86.5, "last3f_index": 80.0, "track_aptitude": 84.0, "odds": 4.5},
+        {"horse_no": 2, "name": "メイショウモウコ", "pop_rank": 9, "time_index": 78.5, "last3f_index": 72.0, "track_aptitude": 80.0, "odds": 28.5},
+        {"horse_no": 3, "name": "テーオーケインズ", "pop_rank": 1, "time_index": 92.0, "last3f_index": 88.0, "track_aptitude": 90.0, "odds": 1.9},
+        {"horse_no": 4, "name": "テイエムスパーダ", "pop_rank": 11, "time_index": 74.0, "last3f_index": 70.5, "track_aptitude": 72.0, "odds": 55.0},
+        {"horse_no": 5, "name": "カフェファラオ", "pop_rank": 3, "time_index": 85.0, "last3f_index": 83.0, "track_aptitude": 86.0, "odds": 5.8},
+        {"horse_no": 6, "name": "ジュンライトボルト", "pop_rank": 4, "time_index": 84.2, "last3f_index": 85.5, "track_aptitude": 83.0, "odds": 8.2},
+        {"horse_no": 7, "name": "サンライズホープ", "pop_rank": 7, "time_index": 79.0, "last3f_index": 75.0, "track_aptitude": 76.0, "odds": 19.4},
+        {"horse_no": 8, "name": "クラウンプライド", "pop_rank": 5, "time_index": 82.5, "last3f_index": 81.0, "track_aptitude": 84.5, "odds": 12.0},
+        {"horse_no": 9, "name": "ロードエクレール", "pop_rank": 10, "time_index": 76.0, "last3f_index": 73.0, "track_aptitude": 75.0, "odds": 42.1},
+        {"horse_no": 10, "name": "ハピ", "pop_rank": 6, "time_index": 81.0, "last3f_index": 84.0, "track_aptitude": 81.5, "odds": 15.6},
+        {"horse_no": 11, "name": "ノットフォアセール", "pop_rank": 13, "time_index": 70.0, "last3f_index": 68.0, "track_aptitude": 70.0, "odds": 110.4},
+        {"horse_no": 12, "name": "グレートサンド", "pop_rank": 12, "time_index": 72.5, "last3f_index": 71.0, "track_aptitude": 73.0, "odds": 85.2},
+        {"horse_no": 13, "name": "レッドルゼル", "pop_rank": 8, "time_index": 79.8, "last3f_index": 86.0, "track_aptitude": 79.0, "odds": 22.0},
+        {"horse_no": 14, "name": "オメガパフューム", "pop_rank": 14, "time_index": 68.5, "last3f_index": 67.0, "track_aptitude": 69.0, "odds": 145.0},
+        {"horse_no": 15, "name": "ウェスタールルド", "pop_rank": 15, "time_index": 65.0, "last3f_index": 66.0, "track_aptitude": 66.0, "odds": 210.0},
+        {"horse_no": 16, "name": "グロリアムンディ", "pop_rank": 16, "time_index": 62.0, "last3f_index": 64.0, "track_aptitude": 63.0, "odds": 320.0}
     ]
 
     scored_df = calculate_ai_indices(sample_race_horses)
 
     st.markdown("### 📍 東京 10R - ダート 1600m（上位4頭BOXシミュレーション）")
     
-    # 上位4頭を抽出
     top4_horses = scored_df.head(4)
     top4_nos = top4_horses['horse_no'].tolist()
 
@@ -94,12 +104,11 @@ with tab_live:
         <span class="confidence-badge">🔥 推奨買い方: 4頭BOX (4点)</span>
         <h3 style="margin-top: 8px;">AI指数上位4頭による堅実・高効率フォーメーション</h3>
         <p style='margin: 4px 0; font-size: 0.85rem; color: #a0aec0;'>
-            <b>🛡️ 狙い目:</b> 指数5位以降への断層を逆手に取り、上位4頭（馬番: <b>{', '.join(map(str, top4_nos))}番</b>）で決着する確率を高確率で網羅します。
+            <b>🛡️ 狙い目:</b> 指数5位以降への断層を考慮し、上位4頭（馬番: <b>{', '.join(map(str, top4_nos))}番</b>）で決着する確率を高確率で網羅します。
         </p>
     </div>
     """, unsafe_allow_html=True)
 
-    # 3連複4頭BOXの買い目（4点）生成
     st.markdown("#### 🎫 3連複 4頭BOX 買い目一覧（計 4点）")
     box_bets = []
     for comb in itertools.combinations(top4_nos, 3):
@@ -118,11 +127,29 @@ with tab_live:
 
     st.markdown(f"**💰 総投資金額:** {bet_unit * 4:,} 円")
 
-    st.markdown("#### 📋 出走馬 AIスコアリング一覧（上位4頭がBOX対象）")
-    display_df = scored_df[['horse_no', 'name', 'pop_rank', 'odds', 'ai_score', 'idx_rank', 'divergence']].rename(columns={
-        'horse_no': '馬番', 'name': '馬名', 'pop_rank': '人気順', 'odds': '想定オッズ', 'ai_score': 'AI総合指数', 'idx_rank': 'AI順位', 'divergence': '乖離ギャップ'
-    })
-    st.markdown(display_df.to_html(index=False, classes="dataframe"), unsafe_allow_html=True)
+    st.markdown("#### 📋 全出走馬 AIスコアリング一覧（2段カード表示）")
+    
+    # AI順位順にソートして2段カードで描画
+    sorted_df = scored_df.sort_values('idx_rank').reset_index(drop=True)
+    
+    for idx, row in sorted_df.iterrows():
+        gap_color = "#63b3ed" if row['divergence'] > 0 else ("#f6e05e" if row['divergence'] == 0 else "#ff4b4b")
+        
+        st.markdown(f"""
+        <div style="background-color: #1a1c23; border: 1px solid #374151; padding: 12px 16px; border-radius: 8px; margin-bottom: 10px;">
+            <div style="font-size: 1.1rem; font-weight: bold; color: #ffffff; margin-bottom: 6px;">
+                <span style="background-color: #2b6cb0; color: white; padding: 2px 8px; border-radius: 4px; font-size: 0.8rem; margin-right: 8px;">馬番 {int(row['horse_no'])}</span>
+                {row['name']}
+            </div>
+            <div style="display: flex; gap: 20px; font-size: 0.85rem; color: #cbd5e0; flex-wrap: wrap;">
+                <div>AI順位: <b style="color: #f6e05e;">第{int(row['idx_rank'])}位</b></div>
+                <div>人気順: <b>{int(row['pop_rank'])}番人気</b></div>
+                <div>AI総合指数: <b>{row['ai_score']:.1f}</b></div>
+                <div>乖離ギャップ: <b style="color: {gap_color};">{row['divergence']:+d}</b></div>
+                <div>想定オッズ: <b>{row['odds']}倍</b></div>
+            </div>
+        </div>
+        """, unsafe_allow_html=True)
 
 with tab_backtest:
     if "BOX戦略" in analysis_mode:
@@ -145,9 +172,7 @@ with tab_backtest:
             st.markdown("""<div class="error-box"><b>⚠️ 集計エラー</b></div>""", unsafe_allow_html=True)
             st.stop()
             
-        # 上位1〜4頭がすべて3着以内に入った確率のシミュレーション計算
         pcts = stats['percentages']
-        # 簡易的に上位4頭のカバー率合算を表示
         top4_coverage_1st = sum([pcts[1][i] for i in range(1, 5)])
         top4_coverage_2nd = sum([pcts[2][i] for i in range(1, 5)])
         top4_coverage_3rd = sum([pcts[3][i] for i in range(1, 5)])
@@ -163,14 +188,11 @@ with tab_backtest:
         <div class="result-box">
             <b>📐 上位4頭BOX戦略の優位性 (検証レース数: <code>{stats['total_races']:,} レース</code>)</b><br>
             * <b>考察:</b> データが示す通り、1〜3着の大部分がAI指数上位4頭の範囲内で決着しており、5位以降との間に明確な「断層」があることが実証されています。<br>
-            * <b>結論:</b> 無理に軸を1頭に固定するよりも、この上位4頭を4点BOXで手堅く押さえる方が、軸抜けのリスクを排除しつつ高い的中効率を維持できる合理的な買い方です。<br>
-            <hr style="border-color: #374151; margin: 8px 0;">
-            <b>📌 運用方針:</b> 誇大な回収率の誇示を避け、純粋な実データの出現確率に基づいて資金効率を最大化します。
+            * <b>結論:</b> 無理に軸を1頭に固定するよりも、この上位4頭を4点BOXで手堅く押さえる方が、軸抜けのリスクを排除しつつ高い効率を維持できる合理的な買い方です。<br>
         </div>
         """, unsafe_allow_html=True)
         
     else:
-        # 従来の1〜7位マトリクス表示
         st.markdown("### 📈 着別・AI指数順位ファクト分析（1〜3着の構成比：1〜7位）")
         if not is_dataloader_available:
             st.stop()
