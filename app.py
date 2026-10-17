@@ -7,7 +7,7 @@ import re
 
 # 1. ページの設定
 st.set_page_config(
-    page_title="JRA 黄金パターン AI ダッシュボード",
+    page_title="JRA 黄金パターン AI ダッシュボード (馬柱完全解析版)",
     page_icon="🏇",
     layout="centered"
 )
@@ -29,7 +29,7 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-st.title("🏇 JRA 黄金パターン AI ダッシュボード [土日別・完全版]")
+st.title("🏇 JRA 黄金パターン AI ダッシュボード [馬柱データ完全解析版]")
 
 # --- サイドバー ---
 with st.sidebar:
@@ -40,7 +40,33 @@ with st.sidebar:
     st.markdown("### 📊 フィルター設定")
     exclude_shinjin = st.checkbox("新馬戦を除外する", value=True, help="指数解析が不可能な新馬戦を自動除外します")
 
-# Excelファイルのロード & 解析関数
+# 馬柱データから前走の情報をパースしてAI指数を算出する関数
+def parse_horse_history(row_str):
+    time_score = 70.0
+    last3f_score = 70.0
+    
+    try:
+        # 上り3Fの抽出 (例: "3F 38.4")
+        m_3f = re.search(r'3F\s*([\d\.]+)', row_str)
+        if m_3f:
+            val_3f = float(m_3f.group(1))
+            # 3Fが速いほど高得点 (基準38.0秒)
+            last3f_score = max(50.0, 100.0 - (val_3f - 35.0) * 10)
+            
+        # 走破タイムの抽出 (例: "1:15.2")
+        m_time = re.search(r'(\d+):([\d\.]+)', row_str)
+        if m_time:
+            minutes = int(m_time.group(1))
+            seconds = float(m_time.group(2))
+            total_sec = minutes * 60 + seconds
+            # タイムが短いほど高得点
+            time_score = max(50.0, 110.0 - (total_sec - 75.0) * 2)
+    except:
+        pass
+        
+    return time_score, last3f_score
+
+# Excelファイルのロード & 複数レース分割解析関数
 @st.cache_data
 def load_and_parse_excel_races():
     excel_files = glob.glob('*ダートレース.xlsx')
@@ -49,7 +75,6 @@ def load_and_parse_excel_races():
     for f in excel_files:
         try:
             xls = pd.ExcelFile(f)
-            # 土日判定
             is_sunday = ('10_18' in f) or ('18' in f)
             day_label = "日曜日開催" if is_sunday else "土曜日開催"
             
@@ -69,70 +94,86 @@ def load_and_parse_excel_races():
                     course_name = "新潟"
                 elif "tokyou" in s_lower or "東京" in header_text or "東京" in sheet_name:
                     course_name = "東京"
-                
-                # レース番号や条件の抽出
-                race_no_match = re.search(r'(\d+)レース', header_text) or re.search(r'(\d+)Ｒ', header_text)
-                race_no_str = f"{race_no_match.group(1)}R" if race_no_match else "1R"
-                
-                race_cond = "未勝利"
-                if "新馬" in header_text:
-                    race_cond = "新馬戦"
-                elif "未勝利" in header_text:
-                    race_cond = "2歳未勝利"
-                elif "1勝" in header_text:
-                    race_cond = "1勝クラス"
 
-                is_shinjin_race = ("新馬" in race_cond)
-
-                # 2行目（index 1）をヘッダーとしてデータを読込
+                # 2行目をヘッダーとしてデータ読込
                 df_data = pd.read_excel(f, sheet_name=sheet_name, header=1)
+                if '馬番' not in df_data.columns:
+                    continue
                 
-                horses = []
-                for idx, row in df_data.iterrows():
-                    if pd.isna(row.get('馬番')):
-                        continue
-                    try:
-                        horse_no = int(row['馬番'])
-                    except:
+                # 馬番が「1」に戻る行インデックスを検出し、レースごとに分割
+                reset_indices = df_data[df_data['馬番'] == 1].index.tolist()
+                reset_indices.append(len(df_data))
+                
+                for i in range(len(reset_indices) - 1):
+                    start_idx = reset_indices[i]
+                    end_idx = reset_indices[i+1]
+                    race_df = df_data.iloc[start_idx:end_idx].copy()
+                    
+                    if len(race_df) < 3:
                         continue
                         
-                    col_name_key = [c for c in df_data.columns if '馬名' in c]
-                    if not col_name_key:
-                        continue
-                    col_val = str(row[col_name_key[0]])
-                    name_line = col_val.split('\n')[0].strip()
+                    race_no = i + 1
+                    race_no_str = f"{race_no}R"
                     
-                    odds_val = 15.0
-                    pop_val = 5
-                    try:
-                        if '(' in col_val and '人気' in col_val:
-                            m_odds = re.search(r'([\d\.]+)\s*\(\s*(\d+)番人気', col_val)
-                            if m_odds:
-                                odds_val = float(m_odds.group(1))
-                                pop_val = int(m_odds.group(2))
-                    except:
-                        pass
+                    horses = []
+                    shinjin_count = 0
+                    total_h = 0
+                    
+                    for _, row in race_df.iterrows():
+                        if pd.isna(row.get('馬番')):
+                            continue
+                        try:
+                            horse_no = int(row['馬番'])
+                        except:
+                            continue
+                            
+                        total_h += 1
+                        
+                        col_name_key = [c for c in race_df.columns if '馬名' in c]
+                        if not col_name_key:
+                            continue
+                        col_val = str(row[col_name_key[0]])
+                        name_line = col_val.split('\n')[0].strip()
+                        
+                        odds_val = 15.0
+                        pop_val = 5
+                        try:
+                            if '(' in col_val and '人気' in col_val:
+                                m_odds = re.search(r'([\d\.]+)\s*\(\s*(\d+)番人気', col_val)
+                                if m_odds:
+                                    odds_val = float(m_odds.group(1))
+                                    pop_val = int(m_odds.group(2))
+                        except:
+                            pass
 
-                    horses.append({
-                        "horse_no": horse_no,
-                        "name": name_line,
-                        "pop_rank": pop_val,
-                        "odds": odds_val,
-                        "time_index": float(80.0 - (idx * 0.4)),
-                        "last3f_index": float(78.0 - (idx * 0.3)),
-                        "track_aptitude": float(75.0)
-                    })
-                
-                if horses:
-                    races.append({
-                        "filename": f,
-                        "sheet": sheet_name,
-                        "course": course_name,
-                        "day_label": day_label,
-                        "race_name": f"{course_name} {race_no_str} - {race_cond}",
-                        "is_shinjin": is_shinjin_race,
-                        "horses": horses
-                    })
+                        # 馬柱（前走データ）からの解析
+                        prev_run = str(row.get('前走', ''))
+                        if '新馬' in prev_run and '未勝利' not in prev_run:
+                            shinjin_count += 1
+                            
+                        t_score, l3f_score = parse_horse_history(prev_run)
+                        
+                        horses.append({
+                            "horse_no": horse_no,
+                            "name": name_line,
+                            "pop_rank": pop_val,
+                            "odds": odds_val,
+                            "time_index": t_score,
+                            "last3f_index": l3f_score,
+                            "track_aptitude": float(75.0)
+                        })
+                    
+                    if horses:
+                        is_shinjin_race = (shinjin_count > total_h / 2) if total_h > 0 else False
+                        race_cond = "新馬戦" if is_shinjin_race else "2歳未勝利/条件戦"
+                        
+                        races.append({
+                            "course": course_name,
+                            "day_label": day_label,
+                            "race_name": f"{course_name} {race_no_str} - {race_cond}",
+                            "is_shinjin": is_shinjin_race,
+                            "horses": horses
+                        })
         except Exception as e:
             continue
             
@@ -143,9 +184,9 @@ all_loaded_races = load_and_parse_excel_races()
 def calculate_ai_indices(horses_data):
     df = pd.DataFrame(horses_data)
     df['ai_score'] = (
-        df['time_index'] * 0.4 + 
+        df['time_index'] * 0.5 + 
         df['last3f_index'] * 0.3 + 
-        df['track_aptitude'] * 0.3
+        df['track_aptitude'] * 0.2
     )
     df['idx_rank'] = df['ai_score'].rank(ascending=False, method='min').astype(int)
     df['divergence'] = df['pop_rank'] - df['idx_rank']
@@ -209,7 +250,7 @@ def render_race_list(target_day_label):
                         <div>人気: <b>{int(row['pop_rank'])}番人気</b></div>
                         <div>AI指数: <b>{row['ai_score']:.1f}</b></div>
                         <div>乖離: <b style="color: {gap_color};">{row['divergence']:+d}</b></div>
-                        <div>単勝オッズ: <b style="color: #4ade80;>{row['odds']}倍</b></div>
+                        <div>単勝オッズ: <b style="color: #4ade80;">{row['odds']}倍</b></div>
                     </div>
                 </div>
                 """, unsafe_allow_html=True)
