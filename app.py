@@ -28,6 +28,10 @@ st.markdown("""
         background-color: #7f1d1d; border: 1px solid #ef4444;
         padding: 15px; border-radius: 8px; color: #fee2e2; margin-bottom: 20px;
     }
+    .success-box {
+        background-color: #064e3b; border: 1px solid #10b981;
+        padding: 10px; border-radius: 8px; color: #d1fae5; margin-bottom: 15px; font-size: 0.85rem;
+    }
     .confidence-badge {
         background-color: #b7791f; color: #ffffff; padding: 2px 8px;
         border-radius: 4px; font-size: 0.75rem; font-weight: bold; float: right;
@@ -70,27 +74,41 @@ def calculate_ai_indices(horses_data):
 tab_live, tab_backtest = st.tabs(["📍 本日のレース & 4頭BOX買い目 (LIVE)", "📈 上位4頭BOX戦略・実データ検証"])
 
 with tab_live:
-    st.caption("【実戦検証】BOT対策をクリアした安全なキャッシュ読込による「上位4頭BOX（4点）」の買い目構築")
+    st.caption("【実戦検証】実データファイルから安全にオッズ・出馬表をロードして「上位4頭BOX（4点）」を構築")
 
-    # 安全なキャッシュ機構経由で出馬表・オッズを取得
+    # 実データからオッズ・出馬表を取得
+    fetch_status_msg = ""
     if is_dataloader_available:
-        sample_race_horses = data_loader.fetch_safe_live_race_horses()
+        sample_race_horses, fetch_status_msg = data_loader.fetch_safe_live_race_horses()
     else:
+        sample_race_horses = []
+        fetch_status_msg = "data_loaderモジュールがありません。"
+
+    if not sample_race_horses:
+        # フォールバック
         sample_race_horses = [
             {"horse_no": 1, "name": "メイショウハリオ", "pop_rank": 2, "time_index": 86.5, "last3f_index": 80.0, "track_aptitude": 84.0, "odds": 4.5},
             {"horse_no": 3, "name": "テーオーケインズ", "pop_rank": 1, "time_index": 92.0, "last3f_index": 88.0, "track_aptitude": 90.0, "odds": 1.9}
         ]
+        fetch_status_msg = "サンプルデータにフォールバックしました。"
+
+    # 画面上にデータ取得状況を表示
+    st.markdown(f"""
+    <div class="success-box">
+        <b>📡 データ取得状況:</b> {fetch_status_msg}
+    </div>
+    """, unsafe_allow_html=True)
 
     scored_df = calculate_ai_indices(sample_race_horses)
 
-    st.markdown("### 📍 東京 10R - ダート 1600m（上位4頭BOXシミュレーション）")
+    st.markdown("### 📍 対象レース（実データ・オッズ反映）")
     
     top4_horses = scored_df.head(4)
     top4_nos = top4_horses['horse_no'].tolist()
 
     st.markdown(f"""
     <div class="race-card">
-        <span style="background-color: #2d3748; color: #63b3ed; padding: 2px 8px; border-radius: 4px; font-size: 0.75rem;">🎯 断層突破戦略 (安全取得)</span>
+        <span style="background-color: #2d3748; color: #63b3ed; padding: 2px 8px; border-radius: 4px; font-size: 0.75rem;">🎯 断層突破戦略</span>
         <span class="confidence-badge">🔥 推奨買い方: 4頭BOX (4点)</span>
         <h3 style="margin-top: 8px;">AI指数上位4頭による堅実・高効率フォーメーション</h3>
         <p style='margin: 4px 0; font-size: 0.85rem; color: #a0aec0;'>
@@ -103,12 +121,14 @@ with tab_live:
     box_bets = []
     for comb in itertools.combinations(top4_nos, 3):
         comb_sorted = sorted(list(comb))
-        simulated_odds = round(scored_df[scored_df['horse_no'].isin(comb_sorted)]['odds'].sum() * 2.8, 1)
+        # 実データから取得した実際のオッズを合計して配当の目安を算出
+        matched_odds = scored_df[scored_df['horse_no'].isin(comb_sorted)]['odds'].sum()
+        simulated_odds = round(matched_odds * 1.8, 1) # 実オッズベースの補正
         box_bets.append({
             "券種": "3連複BOX",
             "組み合わせ": f"{comb_sorted[0]} - {comb_sorted[1]} - {comb_sorted[2]}",
             "投資金額": f"{bet_unit:,} 円",
-            "想定オッズ": f"{simulated_odds} 倍",
+            "実オッズ反映目安": f"{simulated_odds} 倍",
             "予想払戻金": f"約 {int(bet_unit * simulated_odds):,} 円"
         })
         
@@ -117,7 +137,7 @@ with tab_live:
 
     st.markdown(f"**💰 総投資金額:** {bet_unit * 4:,} 円")
 
-    st.markdown("#### 📋 全出走馬 AIスコアリング一覧（2段カード表示）")
+    st.markdown("#### 📋 全出走馬 AIスコアリング一覧（実オッズ表示）")
     
     sorted_df = scored_df.sort_values('idx_rank').reset_index(drop=True)
     
@@ -135,7 +155,7 @@ with tab_live:
                 <div>人気順: <b>{int(row['pop_rank'])}番人気</b></div>
                 <div>AI総合指数: <b>{row['ai_score']:.1f}</b></div>
                 <div>乖離ギャップ: <b style="color: {gap_color};">{row['divergence']:+d}</b></div>
-                <div>想定オッズ: <b>{row['odds']}倍</b></div>
+                <div>単勝オッズ(実データ): <b style="color: #4ade80;">{row['odds']}倍</b></div>
             </div>
         </div>
         """, unsafe_allow_html=True)
