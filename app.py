@@ -7,7 +7,7 @@ import os
 
 # 1. ページの設定
 st.set_page_config(
-    page_title="JRA 黄金パターン AI ダッシュボード (土日別・対象レース表示版)",
+    page_title="JRA 黄金パターン AI ダッシュボード (土日別・完全修正版)",
     page_icon="🏇",
     layout="centered"
 )
@@ -37,16 +37,12 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-st.title("🏇 JRA 黄金パターン AI ダッシュボード [土日別・対象レース解析版]")
+st.title("🏇 JRA 黄金パターン AI ダッシュボード [土日別・完全修正版]")
 
 # --- サイドバー ---
 with st.sidebar:
     st.header("⚙️ 設定")
     bet_unit = st.number_input("1点あたりの金額 (円)", min_value=100, max_value=10000, value=100, step=100, key="box_unit")
-    
-    st.markdown("---")
-    st.markdown("### 📊 表示フィルター")
-    exclude_shinjin = st.checkbox("新馬戦を除外する", value=False) # デフォルトで全表示にして確認しやすくします
 
 # データのロード関数
 def load_uploaded_races():
@@ -56,12 +52,11 @@ def load_uploaded_races():
     for f in csv_files:
         try:
             df = pd.read_csv(f)
-            # ファイル名から競馬場名と日付を正確に判定
-            # 例: 2026_10_17_10_18_ダートレース_東京10_17.csv -> 末尾が _17.csv なら土曜、_18.csv なら日曜
-            filename_lower = f.lower()
-            if '_17.csv' in filename_lower:
+            
+            # 土日の判定（ファイル名に _17 があれば土曜、_18 があれば日曜）
+            if '_17' in f:
                 day_label = "土曜日開催"
-            elif '_18.csv' in filename_lower:
+            elif '_18' in f:
                 day_label = "日曜日開催"
             else:
                 day_label = "土曜日開催"
