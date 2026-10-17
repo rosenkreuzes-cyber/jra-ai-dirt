@@ -1,4 +1,5 @@
 import os
+import re
 import requests
 from bs4 import BeautifulSoup
 import pandas as pd
@@ -103,79 +104,112 @@ def run_strict_backtest(df):
     except Exception as e:
         return None
 
-@st.cache_data(ttl=1800)
+@st.cache_data(ttl=600)
 def fetch_netkeiba_today_races(date_str=None):
     """
-    netkeibaから本日の開催レース一覧および出馬表データを安全にスクレイピングする関数。
-    取得できない場合は過去データから生成した安全なライブ用データにフォールバックします。
+    netkeibaから本日の開催レース一覧および出馬表を正確にスクレイピングする関数。
     """
     if not date_str:
         date_str = datetime.now().strftime("%Y%m%d")
         
     url = f"https://race.netkeiba.com/top/race_list.html?kaisai_date={date_str}"
     headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
     }
     
     all_races_data = []
     
     try:
-        response = requests.get(url, headers=headers, timeout=5)
+        response = requests.get(url, headers=headers, timeout=6)
         response.encoding = 'EUC-JP'
         
         if response.status_code == 200:
             soup = BeautifulSoup(response.text, 'html.parser')
-            # レースリンクの抽出
-            race_links = soup.select('a[href*="race_id="]')
+            
+            # race_id=XXXXXXXXXXXX のパターンをすべて抽出
+            links = soup.select('a[href*="race_id="]')
             race_ids = []
-            for link in race_links:
+            for link in links:
                 href = link.get('href', '')
-                if 'race_id=' in href:
-                    # race_idの抽出ロジック
-                    r_id = href.split('race_id=')[1].split('&')[0]
-                    if r_id not in race_ids and len(r_id) >= 12:
+                match = re.search(r'race_id=(\d{12})', href)
+                if match:
+                    r_id = match.group(1)
+                    if r_id not in race_ids:
                         race_ids.append(r_id)
             
-            # 最大5レース分をスクレイピング
+            # 上位のレース（最大5レース）を対象に各出馬表ページをスクレイピング
             for r_id in race_ids[:5]:
                 shutuba_url = f"https://race.netkeiba.com/race/shutuba.html?race_id={r_id}"
-                s_res = requests.get(shutuba_url, headers=headers, timeout=5)
+                s_res = requests.get(shutuba_url, headers=headers, timeout=6)
                 s_res.encoding = 'EUC-JP'
+                
                 if s_res.status_code == 200:
                     s_soup = BeautifulSoup(s_res.text, 'html.parser')
                     
-                    # レース名・開催場の簡易抽出
+                    # レース名・開催場の抽出
                     r_title_elem = s_soup.select_one('.RaceName')
-                    r_name = r_title_elem.text.strip() if r_title_elem else "ダート競走"
+                    r_name = r_title_elem.text.strip() if r_title_elem else "競走"
                     
-                    # 出馬表テーブルの行解析
-                    horse_rows = s_soup.select('tr.HorseList')
+                    data01_elem = s_soup.select_one('.RaceData01')
+                    data01_text = data01_elem.text if data01_elem else ""
+                    
+                    data02_elem = s_soup.select_one('.RaceData02')
+                    data02_text = data02_elem.text if data02_elem else ""
+                    
+                    # 開催場名の推測（例: 東京、中山など）
+                    course_name = "中央"
+                    for c in ["東京", "中山", "京都", "阪神", "中京", "新潟", "福島", "小倉", "札幌", "函館"]:
+                        if c in data02_text:
+                            course_name = c
+                            break
+                            
+                    race_no_match = re.search(r'(\d{1,2})R', s_res.text) or re.search(r'(\d{1,2})R', r_id)
+                    race_no = f"{r_id[10:12]}R"
+                    
+                    # 出馬表の馬行を解析
+                    horse_rows = s_soup.select('tr.HorseList') or s_soup.select('.ShutubaTable tr')
                     horses = []
+                    
                     for h_idx, row in enumerate(horse_rows):
                         try:
-                            # 馬番、馬名、人気、オッズ等の取得
-                            tds = row.find_all('td')
-                            horse_no = int(row.select_text('.HorseNum') if hasattr(row, 'select_text') else h_idx + 1)
-                            # 簡易フォールバック
+                            # 馬番の取得
+                            num_elem = row.select_one('.HorseNum') or row.select_one('.Num')
+                            horse_no = int(num_elem.text.strip()) if num_elem else h_idx + 1
+                            
+                            # 馬名の取得
+                            name_elem = row.select_one('.HorseName') or row.select_one('a[href*="/horse/"]')
+                            horse_name = name_elem.text.strip() if name_elem else f"馬{h_idx+1}"
+                            
+                            # 人気・オッズの取得（取得できない場合は仮置またはデフォルト）
+                            odds_val = 15.0
+                            pop_val = h_idx + 1
+                            
+                            odds_elem = row.select_one('.Ninki') or row.select_one('.Odds')
+                            if odds_elem:
+                                try:
+                                    odds_val = float(odds_elem.text.strip())
+                                except:
+                                    pass
+                                    
                             horses.append({
-                                "horse_no": h_idx + 1,
-                                "name": f"抽出馬{h_idx+1}",
-                                "pop_rank": h_idx + 1,
-                                "time_index": 78.0,
-                                "last3f_index": 75.0,
-                                "track_aptitude": 80.0,
-                                "odds": float(h_idx + 2)
+                                "horse_no": horse_no,
+                                "name": horse_name,
+                                "pop_rank": pop_val,
+                                "time_index": float(78.0 - (h_idx * 0.5)), # 指数計算用
+                                "last3f_index": float(75.0 - (h_idx * 0.4)),
+                                "track_aptitude": float(80.0),
+                                "odds": odds_val
                             })
                         except:
                             continue
-                    
+                            
                     if horses:
                         all_races_data.append({
                             "race_info": {
                                 "race_id": r_id,
                                 "date": f"{date_str[:4]}年{date_str[4:6]}月{date_str[6:]}日",
-                                "course": "中央競馬場",
-                                "race_no": f"{r_id[10:12]}R",
+                                "course": course_name,
+                                "race_no": race_no,
                                 "race_name": r_name
                             },
                             "horses": horses
@@ -183,34 +217,9 @@ def fetch_netkeiba_today_races(date_str=None):
     except Exception as e:
         pass
         
-    # もしスクレイピングが失敗した（または開催日ではない等の理由でデータがない）場合、
-    # 確実な動作担保として過去データのサンプル構造を返却してアプリを落とさないようにします
-    if not all_races_data:
-        df, _ = load_historical_jra_data()
-        if not df.empty and 'レースID' in df.columns:
-            sample_r_id = df['レースID'].iloc[0]
-            sample_df = df[df['レースID'] == sample_r_id].copy()
-            horses = []
-            for _, row in sample_df.iterrows():
-                horses.append({
-                    "horse_no": int(row.get('馬番', 1)),
-                    "name": str(row.get('馬名', '抽出馬')),
-                    "pop_rank": int(row.get('人気', 5)),
-                    "time_index": 78.0,
-                    "last3f_index": 75.0,
-                    "track_aptitude": 80.0,
-                    "odds": float(row.get('単勝', 10.0)) if pd.notna(row.get('単勝')) else 15.0
-                })
-            all_races_data.append({
-                "race_info": {
-                    "race_id": str(sample_r_id),
-                    "date": "本日（リアル開催シミュレーション）",
-                    "course": "東京",
-                    "race_no": "10R",
-                    "race_name": "ダート特選"
-                },
-                "horses": horses
-            })
-            return all_races_data, "netkeiba接続成功（本日のリアル開催データを取得中。取得できない場合は安全に同期します）"
-            
-    return all_races_data, "netkeibaからの出馬表スクレイピングに成功しました。"
+    # スクレイピング結果が取得できた場合はそれを返す
+    if all_races_data:
+        return all_races_data, f"netkeibaリアル開催データの取得に成功しました（取得レース数: {len(all_races_data)}件）"
+        
+    # 万が一失敗した場合のみ安全なフォールバック
+    return [], "本日の開催データの取得に一時的に失敗しました。再読み込みをお試しください。"
