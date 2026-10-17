@@ -3,7 +3,6 @@ import pandas as pd
 import numpy as np
 import itertools
 import os
-import glob
 import re
 
 # 1. ページの設定
@@ -30,7 +29,7 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-st.title("🏇 JRA 黄金パターン AI ダッシュボード [完全版]")
+st.title("🏇 JRA 黄金パターン AI ダッシュボード [完全確実版]")
 
 # --- サイドバー ---
 with st.sidebar:
@@ -40,18 +39,16 @@ with st.sidebar:
         st.cache_data.clear()
         st.rerun()
 
-# 馬柱データ（前走等）から走破タイム・上り3Fを解析する関数
+# タイム・上り3F解析
 def parse_horse_history(row_str):
     time_score = 70.0
     last3f_score = 70.0
     try:
-        # 上り3Fの抽出
         m_3f = re.search(r'3F\s*([\d\.]+)', row_str)
         if m_3f:
             val_3f = float(m_3f.group(1))
             last3f_score = max(50.0, 100.0 - (val_3f - 35.0) * 10)
             
-        # 走破タイムの抽出 (例: 1:15.2)
         m_time = re.search(r'(\d+):([\d\.]+)', row_str)
         if m_time:
             minutes = int(m_time.group(1))
@@ -62,36 +59,32 @@ def parse_horse_history(row_str):
         pass
     return time_score, last3f_score
 
-# Excelファイルを確実に読み込み・パースする関数
-@st.cache_data
+# 明示的な2つのファイルのみを確実に読み込む関数
 def load_and_parse_excel_races():
-    excel_files = glob.glob('*.xlsx')
+    target_files = [
+        ('2026 10_17 ダートレース.xlsx', '土曜日開催'),
+        ('2026 10_18 ダートレース.xlsx', '日曜日開催')
+    ]
     races = []
     
-    for f in excel_files:
-        if 'ダートレース' not in f:
+    for filename, day_label in target_files:
+        if not os.path.exists(filename):
             continue
-            
         try:
-            xls = pd.ExcelFile(f)
-            # ファイル名に18が含まれていれば日曜、それ以外は土曜
-            is_sunday = ('18' in f)
-            day_label = "日曜日開催" if is_sunday else "土曜日開催"
-            
+            xls = pd.ExcelFile(filename)
             for sheet_name in xls.sheet_names:
-                df_data = pd.read_excel(f, sheet_name=sheet_name, header=1)
+                df_data = pd.read_excel(filename, sheet_name=sheet_name, header=1)
                 
-                # 「馬番」カラムを探す
+                # 馬番カラムの特定
                 if '馬番' not in df_data.columns:
-                    # カラム名にスペースや改行が含まれている場合のフォールバック
-                    matched_cols = [c for c in df_data.columns if '馬番' in str(c)]
-                    if not matched_cols:
+                    matched = [c for c in df_data.columns if '馬番' in str(c)]
+                    if not matched:
                         continue
-                    horse_no_col = matched_cols[0]
+                    horse_col = matched[0]
                 else:
-                    horse_no_col = '馬番'
+                    horse_col = '馬番'
                 
-                df_data['馬番_num'] = pd.to_numeric(df_data[horse_no_col], errors='coerce')
+                df_data['馬番_num'] = pd.to_numeric(df_data[horse_col], errors='coerce')
                 reset_indices = df_data[df_data['馬番_num'] == 1].index.tolist()
                 reset_indices.append(len(df_data))
                 
@@ -114,7 +107,7 @@ def load_and_parse_excel_races():
                     
                     horses = []
                     for _, row in race_df.iterrows():
-                        h_val = row.get(horse_no_col)
+                        h_val = row.get(horse_col)
                         if pd.isna(h_val):
                             continue
                         try:
@@ -122,7 +115,6 @@ def load_and_parse_excel_races():
                         except:
                             continue
                             
-                        # 馬名カラムの取得
                         col_name_key = [c for c in race_df.columns if '馬名' in c]
                         if not col_name_key:
                             continue
@@ -142,7 +134,6 @@ def load_and_parse_excel_races():
                         except:
                             pass
 
-                        # 前走（馬柱）データの解析
                         prev_run = str(row.get('前走', ''))
                         t_score, l3f_score = parse_horse_history(prev_run)
                         
@@ -164,6 +155,7 @@ def load_and_parse_excel_races():
                             "horses": horses
                         })
         except Exception as e:
+            print("Error:", e)
             continue
             
     return races
