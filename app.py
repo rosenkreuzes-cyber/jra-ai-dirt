@@ -30,7 +30,7 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-st.title("🏇 JRA 黄金パターン AI ダッシュボード [ダイレクト読込版]")
+st.title("🏇 JRA 黄金パターン AI ダッシュボード [強制読込版]")
 
 # --- サイドバー ---
 with st.sidebar:
@@ -59,23 +59,22 @@ def parse_horse_history(row_str):
         pass
     return time_score, last3f_score
 
-# キャッシュを一切使わず毎回ダイレクトにファイルを読み込む関数
+# ワークスペース内のすべてのExcelファイルを強制的に解析する関数
 def load_and_parse_excel_races():
     excel_files = glob.glob('*.xlsx')
     races = []
     
     for filename in excel_files:
-        if 'ダートレース' not in filename:
-            continue
-            
         try:
             xls = pd.ExcelFile(filename)
+            # ファイル名に18が含まれていれば日曜、それ以外は土曜
             is_sunday = ('18' in filename)
             day_label = "日曜日開催" if is_sunday else "土曜日開催"
             
             for sheet_name in xls.sheet_names:
                 df_data = pd.read_excel(filename, sheet_name=sheet_name, header=1)
                 
+                # 馬番カラムの検索
                 horse_col = None
                 for col in df_data.columns:
                     if '馬番' in str(col):
