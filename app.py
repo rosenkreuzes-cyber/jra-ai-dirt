@@ -3,6 +3,7 @@ import pandas as pd
 import numpy as np
 import itertools
 import os
+import glob
 import re
 
 # 1. ページの設定
@@ -29,13 +30,13 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-st.title("🏇 JRA 黄金パターン AI ダッシュボード [強制表示版]")
+st.title("🏇 JRA 黄金パターン AI ダッシュボード [完全自動検出版]")
 
 # --- サイドバー ---
 with st.sidebar:
     st.header("⚙️ 設定")
     bet_unit = st.number_input("1点あたりの金額 (円)", min_value=100, max_value=10000, value=100, step=100, key="box_unit")
-    if st.button("🔄 キャッシュをクリアして再読込"):
+    if st.button("🔄 キャッシュクリア & 再読込"):
         st.cache_data.clear()
         st.rerun()
 
@@ -59,17 +60,20 @@ def parse_horse_history(row_str):
         pass
     return time_score, last3f_score
 
-# データを確実にロードする関数（キャッシュなし）
+# ワークスペース内のすべてのExcelファイルを自動検出してロード
 def load_and_parse_excel_races():
-    target_files = ['2026 10_17 ダートレース.xlsx', '2026 10_18 ダートレース.xlsx']
+    excel_files = glob.glob('*.xlsx')
     races = []
     
-    for f in target_files:
-        if not os.path.exists(f):
+    for f in excel_files:
+        # 古いテスト用ファイルなどを除外する場合の保険（ダートレースを含むもの対象）
+        if 'ダートレース' not in f:
             continue
+            
         try:
             xls = pd.ExcelFile(f)
-            is_sunday = ('10_18' in f)
+            # 18日が含まれていれば日曜、それ以外は土曜とする
+            is_sunday = ('18' in f)
             day_label = "日曜日開催" if is_sunday else "土曜日開催"
             
             for sheet_name in xls.sheet_names:
@@ -90,7 +94,13 @@ def load_and_parse_excel_races():
                         continue
                         
                     race_no = i + 1
-                    course_name = "京都" if "kyouto" in sheet_name.lower() else ("新潟" if "niigata" in sheet_name.lower() else "東京")
+                    s_lower = sheet_name.lower()
+                    if "kyouto" in s_lower or "京都" in sheet_name:
+                        course_name = "京都"
+                    elif "niigata" in s_lower or "新潟" in sheet_name:
+                        course_name = "新潟"
+                    else:
+                        course_name = "東京"
                     
                     horses = []
                     for _, row in race_df.iterrows():
@@ -139,7 +149,6 @@ def load_and_parse_excel_races():
                             "horses": horses
                         })
         except Exception as e:
-            print("Error parsing:", e)
             continue
             
     return races
@@ -164,7 +173,7 @@ def render_race_list(target_day_label):
     filtered_races = [r for r in all_loaded_races if r['day_label'] == target_day_label]
     
     if not filtered_races:
-        st.warning(f"⚠️ {target_day_label} のレースデータが見つかりませんでした。サイドバーの「キャッシュをクリアして再読込」をお試しください。")
+        st.warning(f"⚠️ {target_day_label} のレースデータが検出されませんでした。アップロードされたExcelファイル名をご確認ください。")
         return
 
     for r_idx, race in enumerate(filtered_races):
