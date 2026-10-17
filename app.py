@@ -70,26 +70,16 @@ def calculate_ai_indices(horses_data):
 tab_live, tab_backtest = st.tabs(["📍 本日のレース & 4頭BOX買い目 (LIVE)", "📈 上位4頭BOX戦略・実データ検証"])
 
 with tab_live:
-    st.caption("【実戦検証】AI指数5位未満への断層を考慮した「上位4頭BOX（4点）」の買い目構築")
+    st.caption("【実戦検証】BOT対策をクリアした安全なキャッシュ読込による「上位4頭BOX（4点）」の買い目構築")
 
-    sample_race_horses = [
-        {"horse_no": 1, "name": "メイショウハリオ", "pop_rank": 2, "time_index": 86.5, "last3f_index": 80.0, "track_aptitude": 84.0, "odds": 4.5},
-        {"horse_no": 2, "name": "メイショウモウコ", "pop_rank": 9, "time_index": 78.5, "last3f_index": 72.0, "track_aptitude": 80.0, "odds": 28.5},
-        {"horse_no": 3, "name": "テーオーケインズ", "pop_rank": 1, "time_index": 92.0, "last3f_index": 88.0, "track_aptitude": 90.0, "odds": 1.9},
-        {"horse_no": 4, "name": "テイエムスパーダ", "pop_rank": 11, "time_index": 74.0, "last3f_index": 70.5, "track_aptitude": 72.0, "odds": 55.0},
-        {"horse_no": 5, "name": "カフェファラオ", "pop_rank": 3, "time_index": 85.0, "last3f_index": 83.0, "track_aptitude": 86.0, "odds": 5.8},
-        {"horse_no": 6, "name": "ジュンライトボルト", "pop_rank": 4, "time_index": 84.2, "last3f_index": 85.5, "track_aptitude": 83.0, "odds": 8.2},
-        {"horse_no": 7, "name": "サンライズホープ", "pop_rank": 7, "time_index": 79.0, "last3f_index": 75.0, "track_aptitude": 76.0, "odds": 19.4},
-        {"horse_no": 8, "name": "クラウンプライド", "pop_rank": 5, "time_index": 82.5, "last3f_index": 81.0, "track_aptitude": 84.5, "odds": 12.0},
-        {"horse_no": 9, "name": "ロードエクレール", "pop_rank": 10, "time_index": 76.0, "last3f_index": 73.0, "track_aptitude": 75.0, "odds": 42.1},
-        {"horse_no": 10, "name": "ハピ", "pop_rank": 6, "time_index": 81.0, "last3f_index": 84.0, "track_aptitude": 81.5, "odds": 15.6},
-        {"horse_no": 11, "name": "ノットフォアセール", "pop_rank": 13, "time_index": 70.0, "last3f_index": 68.0, "track_aptitude": 70.0, "odds": 110.4},
-        {"horse_no": 12, "name": "グレートサンド", "pop_rank": 12, "time_index": 72.5, "last3f_index": 71.0, "track_aptitude": 73.0, "odds": 85.2},
-        {"horse_no": 13, "name": "レッドルゼル", "pop_rank": 8, "time_index": 79.8, "last3f_index": 86.0, "track_aptitude": 79.0, "odds": 22.0},
-        {"horse_no": 14, "name": "オメガパフューム", "pop_rank": 14, "time_index": 68.5, "last3f_index": 67.0, "track_aptitude": 69.0, "odds": 145.0},
-        {"horse_no": 15, "name": "ウェスタールルド", "pop_rank": 15, "time_index": 65.0, "last3f_index": 66.0, "track_aptitude": 66.0, "odds": 210.0},
-        {"horse_no": 16, "name": "グロリアムンディ", "pop_rank": 16, "time_index": 62.0, "last3f_index": 64.0, "track_aptitude": 63.0, "odds": 320.0}
-    ]
+    # 安全なキャッシュ機構経由で出馬表・オッズを取得
+    if is_dataloader_available:
+        sample_race_horses = data_loader.fetch_safe_live_race_horses()
+    else:
+        sample_race_horses = [
+            {"horse_no": 1, "name": "メイショウハリオ", "pop_rank": 2, "time_index": 86.5, "last3f_index": 80.0, "track_aptitude": 84.0, "odds": 4.5},
+            {"horse_no": 3, "name": "テーオーケインズ", "pop_rank": 1, "time_index": 92.0, "last3f_index": 88.0, "track_aptitude": 90.0, "odds": 1.9}
+        ]
 
     scored_df = calculate_ai_indices(sample_race_horses)
 
@@ -100,7 +90,7 @@ with tab_live:
 
     st.markdown(f"""
     <div class="race-card">
-        <span style="background-color: #2d3748; color: #63b3ed; padding: 2px 8px; border-radius: 4px; font-size: 0.75rem;">🎯 断層突破戦略</span>
+        <span style="background-color: #2d3748; color: #63b3ed; padding: 2px 8px; border-radius: 4px; font-size: 0.75rem;">🎯 断層突破戦略 (安全取得)</span>
         <span class="confidence-badge">🔥 推奨買い方: 4頭BOX (4点)</span>
         <h3 style="margin-top: 8px;">AI指数上位4頭による堅実・高効率フォーメーション</h3>
         <p style='margin: 4px 0; font-size: 0.85rem; color: #a0aec0;'>
@@ -129,7 +119,6 @@ with tab_live:
 
     st.markdown("#### 📋 全出走馬 AIスコアリング一覧（2段カード表示）")
     
-    # AI順位順にソートして2段カードで描画
     sorted_df = scored_df.sort_values('idx_rank').reset_index(drop=True)
     
     for idx, row in sorted_df.iterrows():
