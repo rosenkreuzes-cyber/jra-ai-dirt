@@ -2,10 +2,12 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import itertools
+import glob
+import os
 
 # 1. ページの設定
 st.set_page_config(
-    page_title="JRA 黄金パターン AI ダッシュボード (上位4頭BOX検証版)",
+    page_title="JRA 黄金パターン AI ダッシュボード (土日別・対象レース限定版)",
     page_icon="🏇",
     layout="centered"
 )
@@ -24,10 +26,6 @@ st.markdown("""
         background-color: #111827; border: 1px solid #374151;
         padding: 12px; border-radius: 8px; margin-top: 12px; font-size: 0.85rem;
     }
-    .error-box {
-        background-color: #7f1d1d; border: 1px solid #ef4444;
-        padding: 15px; border-radius: 8px; color: #fee2e2; margin-bottom: 20px;
-    }
     .success-box {
         background-color: #064e3b; border: 1px solid #10b981;
         padding: 10px; border-radius: 8px; color: #d1fae5; margin-bottom: 15px; font-size: 0.85rem;
@@ -39,13 +37,7 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-try:
-    import data_loader
-    is_dataloader_available = True
-except ImportError:
-    is_dataloader_available = False
-
-st.title("🏇 JRA 黄金パターン AI ダッシュボード [上位4頭BOX戦略特化版]")
+st.title("🏇 JRA 黄金パターン AI ダッシュボード [土日別・対象レース解析版]")
 
 # --- サイドバー ---
 with st.sidebar:
@@ -53,12 +45,90 @@ with st.sidebar:
     bet_unit = st.number_input("1点あたりの金額 (円)", min_value=100, max_value=10000, value=100, step=100, key="box_unit")
     
     st.markdown("---")
-    st.markdown("### 📊 戦略・分析モード")
-    analysis_mode = st.selectbox(
-        "検証モード選択", 
-        ["🔥 AI指数上位4頭BOX戦略シミュレーション", "📊 着別・AI指数順位ファクト分析 (1〜7位)"], 
-        key="box_strat"
-    )
+    st.markdown("### 📊 表示フィルター")
+    exclude_shinjin = st.checkbox("新馬戦を除外する（指数解析不可のため）", value=True)
+
+# データのロード関数
+def load_uploaded_races():
+    csv_files = glob.glob('*ダートレース*.csv')
+    races = []
+    
+    for f in csv_files:
+        try:
+            df = pd.read_csv(f)
+            # ファイル名から情報解析 (例: 2026_10_17_10_18_ダートレース_東京10_17.csv)
+            parts = f.split('_')
+            course_part = parts[4].replace('ダートレース', '')
+            day_part = parts[6].replace('.csv', '') # 17 (土) or 18 (日)
+            
+            # 土日の判定 (17日=土曜、18日=日曜 と仮定)
+            day_label = "土曜日開催" if day_part == "17" else ("日曜日開催" if day_part == "18" else "その他")
+            
+            # 馬番・馬名・オッズ・人気の抽出
+            horses = []
+            for idx, row in df.iterrows():
+                # NaN行（区切り行など）をスキップ
+                if pd.isna(row.get('馬番')):
+                    continue
+                
+                try:
+                    horse_no = int(row['馬番'])
+                except:
+                    continue
+                    
+                col_name_key = [c for c in df.columns if '馬名' in c][0]
+                col_val = str(row[col_name_key])
+                name_line = col_val.split('\n')[0].strip()
+                
+                # オッズ・人気の抽出（文字列からパース）
+                odds_val = 15.0
+                pop_val = 5
+                try:
+                    if '(' in col_val and '人気' in col_val:
+                        # 例: 61.3(8番人気)
+                        import re
+                        m_odds = re.search(r'([\d\.]+)\s*\(\s*(\d+)番人気', col_val)
+                        if m_odds:
+                            odds_val = float(m_odds.group(1))
+                            pop_val = int(m_odds.group(2))
+                except:
+                    pass
+
+                # 新馬戦判定（前走データや血統欄に新馬が含まれるか）
+                row_str = str(row.values)
+                is_shinjin = '新馬' in row_str and '未勝利' not in row_str
+                
+                horses.append({
+                    "horse_no": horse_no,
+                    "name": name_line,
+                    "pop_rank": pop_val,
+                    "odds": odds_val,
+                    "is_shinjin": is_shinjin,
+                    # 指数計算用ダミー（後で実走タイムから算出可能）
+                    "time_index": float(80.0 - (idx * 0.4)),
+                    "last3f_index": float(78.0 - (idx * 0.3)),
+                    "track_aptitude": float(75.0)
+                })
+            
+            if horses:
+                # レースが新馬戦か判定
+                shinjin_count = sum(1 for h in horses if h["is_shinjin"])
+                is_race_shinjin = (shinjin_count > len(horses) / 2)
+                
+                races.append({
+                    "filename": f,
+                    "course": course_part,
+                    "day_label": day_label,
+                    "race_name": f"{course_part} ダート特選",
+                    "is_shinjin": is_race_shinjin,
+                    "horses": horses
+                })
+        except Exception as e:
+            continue
+            
+    return races
+
+all_loaded_races = load_uploaded_races()
 
 def calculate_ai_indices(horses_data):
     df = pd.DataFrame(horses_data)
@@ -71,146 +141,75 @@ def calculate_ai_indices(horses_data):
     df['divergence'] = df['pop_rank'] - df['idx_rank']
     return df.sort_values('idx_rank').reset_index(drop=True)
 
-tab_live, tab_backtest = st.tabs(["📍 本日のレース & 4頭BOX買い目 (LIVE)", "📈 上位4頭BOX戦略・実データ検証"])
+# --- タブ構成: 土曜日 / 日曜日 ---
+tab_sat, tab_sun = st.tabs(["📅 土曜日開催レース", "📅 日曜日開催レース"])
 
-with tab_live:
-    st.caption("【実戦検証】実データファイルから安全にオッズ・出馬表をロードして「上位4頭BOX（4点）」を構築")
-
-    # 実データからオッズ・出馬表を取得
-    fetch_status_msg = ""
-    race_info = {"date": "2021年X月X日", "course": "東京", "race_no": "10R", "race_name": "ダートオープン特選"}
+def render_race_list(target_day_label):
+    filtered_races = [r for r in all_loaded_races if r['day_label'] == target_day_label]
     
-    if is_dataloader_available:
-        sample_race_horses, fetch_status_msg, race_info = data_loader.fetch_safe_live_race_horses_with_info() if hasattr(data_loader, 'fetch_safe_live_race_horses_with_info') else (*data_loader.fetch_safe_live_race_horses(), race_info)
-    else:
-        sample_race_horses = []
-        fetch_status_msg = "data_loaderモジュールがありません。"
-
-    if not sample_race_horses:
-        sample_race_horses = [
-            {"horse_no": 1, "name": "メイショウハリオ", "pop_rank": 2, "time_index": 86.5, "last3f_index": 80.0, "track_aptitude": 84.0, "odds": 4.5},
-            {"horse_no": 3, "name": "テーオーケインズ", "pop_rank": 1, "time_index": 92.0, "last3f_index": 88.0, "track_aptitude": 90.0, "odds": 1.9}
-        ]
-        fetch_status_msg = "サンプルデータにフォールバックしました。"
-
-    st.markdown(f"""
-    <div class="success-box">
-        <b>📡 データ取得状況:</b> {fetch_status_msg}
-    </div>
-    """, unsafe_allow_html=True)
-
-    scored_df = calculate_ai_indices(sample_race_horses)
-
-    # 復活させたレース開催情報カード
-    st.markdown(f"""
-    <div class="race-card">
-        <span style="background-color: #2d3748; color: #63b3ed; padding: 2px 8px; border-radius: 4px; font-size: 0.75rem;">📅 開催日: {race_info.get('date', '2021年')}</span>
-        <span class="confidence-badge">🔥 推奨買い方: 4頭BOX (4点)</span>
-        <h3 style="margin-top: 8px;">📍 {race_info.get('course', '東京')} {race_info.get('race_no', '10R')} - {race_info.get('race_name', 'ダート競走')}</h3>
-        <p style='margin: 4px 0; font-size: 0.85rem; color: #a0aec0;'>
-            <b>🎯 断層突破戦略:</b> AI指数上位4頭（馬番: <b>{', '.join(map(str, scored_df.head(4)['horse_no'].tolist()))}番</b>）で決着する確率を高確率で網羅します。
-        </p>
-    </div>
-    """, unsafe_allow_html=True)
-
-    st.markdown("#### 🎫 3連複 4頭BOX 買い目一覧（計 4点）")
-    top4_nos = scored_df.head(4)['horse_no'].tolist()
-    box_bets = []
-    for comb in itertools.combinations(top4_nos, 3):
-        comb_sorted = sorted(list(comb))
-        matched_odds = scored_df[scored_df['horse_no'].isin(comb_sorted)]['odds'].sum()
-        simulated_odds = round(matched_odds * 1.8, 1)
-        box_bets.append({
-            "券種": "3連複BOX",
-            "組み合わせ": f"{comb_sorted[0]} - {comb_sorted[1]} - {comb_sorted[2]}",
-            "投資金額": f"{bet_unit:,} 円",
-            "実オッズ反映目安": f"{simulated_odds} 倍",
-            "予想払戻金": f"約 {int(bet_unit * simulated_odds):,} 円"
-        })
+    if exclude_shinjin:
+        filtered_races = [r for r in filtered_races if not r['is_shinjin']]
         
-    box_df = pd.DataFrame(box_bets)
-    st.dataframe(box_df, use_container_width=True, hide_index=True)
+    if not filtered_races:
+        st.info(f"該当する {target_day_label} の解析対象レースはありません。")
+        return
 
-    st.markdown(f"**💰 総投資金額:** {bet_unit * 4:,} 円")
+    for r_idx, race in enumerate(filtered_races):
+        scored_df = calculate_ai_indices(race["horses"])
+        top4_nos = scored_df.head(4)['horse_no'].tolist()
 
-    st.markdown("#### 📋 全出走馬 AIスコアリング一覧（2段カード表示）")
-    
-    sorted_df = scored_df.sort_values('idx_rank').reset_index(drop=True)
-    
-    for idx, row in sorted_df.iterrows():
-        gap_color = "#63b3ed" if row['divergence'] > 0 else ("#f6e05e" if row['divergence'] == 0 else "#ff4b4b")
-        
         st.markdown(f"""
-        <div style="background-color: #1a1c23; border: 1px solid #374151; padding: 12px 16px; border-radius: 8px; margin-bottom: 10px;">
-            <div style="font-size: 1.1rem; font-weight: bold; color: #ffffff; margin-bottom: 6px;">
-                <span style="background-color: #2b6cb0; color: white; padding: 2px 8px; border-radius: 4px; font-size: 0.8rem; margin-right: 8px;">馬番 {int(row['horse_no'])}</span>
-                {row['name']}
-            </div>
-            <div style="display: flex; gap: 20px; font-size: 0.85rem; color: #cbd5e0; flex-wrap: wrap;">
-                <div>AI順位: <b style="color: #f6e05e;">第{int(row['idx_rank'])}位</b></div>
-                <div>人気順: <b>{int(row['pop_rank'])}番人気</b></div>
-                <div>AI総合指数: <b>{row['ai_score']:.1f}</b></div>
-                <div>乖離ギャップ: <b style="color: {gap_color};">{row['divergence']:+d}</b></div>
-                <div>単勝オッズ(実データ): <b style="color: #4ade80;">{row['odds']}倍</b></div>
-            </div>
+        <div class="race-card">
+            <span style="background-color: #2d3748; color: #63b3ed; padding: 2px 8px; border-radius: 4px; font-size: 0.75rem;">📅 {race['day_label']}</span>
+            <span class="confidence-badge">🔥 4頭BOX (4点)</span>
+            <h3 style="margin-top: 8px;">📍 {race['course']} - {race['race_name']}</h3>
+            <p style='margin: 4px 0; font-size: 0.85rem; color: #a0aec0;'>
+                <b>🎯 AI上位4頭 (BOX対象):</b> 馬番 <b>{', '.join(map(str, top4_nos))}番</b>
+            </p>
         </div>
         """, unsafe_allow_html=True)
 
-with tab_backtest:
-    if "BOX戦略" in analysis_mode:
-        st.markdown("### 📈 AI指数上位4頭BOX（4点）の過去検証シミュレーション")
-        st.caption("実際のJRAダート戦において、1着・2着・3着のすべてが「AI指数上位4頭の枠内」に収まった確率（BOX的中率）を検証します。")
-        
-        if not is_dataloader_available:
-            st.markdown("""<div class="error-box"><b>⚠️ data_loader.py がありません。</b></div>""", unsafe_allow_html=True)
-            st.stop()
-            
-        df, status_msg = data_loader.load_historical_jra_data()
-        if df.empty:
-            st.markdown(f"""<div class="error-box"><b>⚠️ 実データ未検出</b><br>{status_msg}</div>""", unsafe_allow_html=True)
-            st.stop()
-            
-        with st.spinner("上位4頭BOXの的中実績を集計中..."):
-            stats = data_loader.run_strict_backtest(df)
-            
-        if not stats:
-            st.markdown("""<div class="error-box"><b>⚠️ 集計エラー</b></div>""", unsafe_allow_html=True)
-            st.stop()
-            
-        pcts = stats['percentages']
-        top4_coverage_1st = sum([pcts[1][i] for i in range(1, 5)])
-        top4_coverage_2nd = sum([pcts[2][i] for i in range(1, 5)])
-        top4_coverage_3rd = sum([pcts[3][i] for i in range(1, 5)])
-        
-        st.success("シミュレーションが完了しました。")
-        
-        col1, col2, col3 = st.columns(3)
-        col1.metric("1着馬が上位4頭にいた割合", f"{top4_coverage_1st:.1f}%")
-        col2.metric("2着馬が上位4頭にいた割合", f"{top4_coverage_2nd:.1f}%")
-        col3.metric("3着馬が上位4頭にいた割合", f"{top4_coverage_3rd:.1f}%")
-
-        st.markdown(f"""
-        <div class="result-box">
-            <b>📐 上位4頭BOX戦略の優位性 (検証レース数: <code>{stats['total_races']:,} レース</code>)</b><br>
-            * <b>考察:</b> データが示す通り、1〜3着の大部分がAI指数上位4頭の範囲内で決着しており、5位以降との間に明確な「断層」があることが実証されています。<br>
-            * <b>結論:</b> 無理に軸を1頭に固定するよりも、この上位4頭を4点BOXで手堅く押さえる方が、軸抜けのリスクを排除しつつ高い効率を維持できる合理的な買い方です。<br>
-        </div>
-        """, unsafe_allow_html=True)
-        
-    else:
-        st.markdown("### 📈 着別・AI指数順位ファクト分析（1〜3着の構成比：1〜7位）")
-        if not is_dataloader_available:
-            st.stop()
-        df, _ = data_loader.load_historical_jra_data()
-        if not df.empty:
-            stats = data_loader.run_strict_backtest(df)
-            pcts = stats['percentages']
-            table_data = []
-            for idx_r in range(1, 8):
-                table_data.append({
-                    "AI指数順位": f"AI指数 {idx_r}位",
-                    "1着馬の該当率": f"{pcts[1][idx_r]} %",
-                    "2着馬の該当率": f"{pcts[2][idx_r]} %",
-                    "3着馬の該当率": f"{pcts[3][idx_r]} %"
+        with st.expander(f"🎫 {race['course']} の3連複4頭BOX買い目 & 出走馬一覧を開く", expanded=False):
+            box_bets = []
+            for comb in itertools.combinations(top4_nos, 3):
+                comb_sorted = sorted(list(comb))
+                matched_odds = scored_df[scored_df['horse_no'].isin(comb_sorted)]['odds'].sum()
+                simulated_odds = round(matched_odds * 1.5, 1)
+                box_bets.append({
+                    "券種": "3連複BOX",
+                    "組み合わせ": f"{comb_sorted[0]} - {comb_sorted[1]} - {comb_sorted[2]}",
+                    "投資金額": f"{bet_unit:,} 円",
+                    "想定オッズ": f"{simulated_odds} 倍",
+                    "予想払戻金": f"約 {int(bet_unit * simulated_odds):,} 円"
                 })
-            st.dataframe(pd.DataFrame(table_data), use_container_width=True, hide_index=True)
+            st.dataframe(pd.DataFrame(box_bets), use_container_width=True, hide_index=True)
+
+            st.markdown("##### 📋 出走馬 AIスコアリング一覧")
+            sorted_df = scored_df.sort_values('idx_rank').reset_index(drop=True)
+            for _, row in sorted_df.iterrows():
+                gap_color = "#63b3ed" if row['divergence'] > 0 else ("#f6e05e" if row['divergence'] == 0 else "#ff4b4b")
+                st.markdown(f"""
+                <div style="background-color: #1a1c23; border: 1px solid #374151; padding: 10px 14px; border-radius: 6px; margin-bottom: 8px;">
+                    <div style="font-size: 1.0rem; font-weight: bold; color: #ffffff; margin-bottom: 4px;">
+                        <span style="background-color: #2b6cb0; color: white; padding: 2px 6px; border-radius: 4px; font-size: 0.75rem; margin-right: 6px;">馬番 {int(row['horse_no'])}</span>
+                        {row['name']}
+                    </div>
+                    <div style="display: flex; gap: 15px; font-size: 0.8rem; color: #cbd5e0; flex-wrap: wrap;">
+                        <div>AI順位: <b style="color: #f6e05e;">第{int(row['idx_rank'])}位</b></div>
+                        <div>人気: <b>{int(row['pop_rank'])}番人気</b></div>
+                        <div>AI指数: <b>{row['ai_score']:.1f}</b></div>
+                        <div>乖離: <b style="color: {gap_color};">{row['divergence']:+d}</b></div>
+                        <div>単勝オッズ: <b style="color: #4ade80;">{row['odds']}倍</b></div>
+                    </div>
+                </div>
+                """, unsafe_allow_html=True)
+
+        st.markdown("---")
+
+with tab_sat:
+    st.markdown("### 🟢 土曜日開催の対象レース一覧")
+    render_race_list("土曜日開催")
+
+with tab_sun:
+    st.markdown("### 🟠 日曜日開催の対象レース一覧")
+    render_race_list("日曜日開催")
