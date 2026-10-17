@@ -30,7 +30,7 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-st.title("🏇 JRA 黄金パターン AI ダッシュボード [完全自動検出版]")
+st.title("🏇 JRA 黄金パターン AI ダッシュボード [完全版]")
 
 # --- サイドバー ---
 with st.sidebar:
@@ -40,16 +40,18 @@ with st.sidebar:
         st.cache_data.clear()
         st.rerun()
 
-# タイム・上り3F解析
+# 馬柱データ（前走等）から走破タイム・上り3Fを解析する関数
 def parse_horse_history(row_str):
     time_score = 70.0
     last3f_score = 70.0
     try:
+        # 上り3Fの抽出
         m_3f = re.search(r'3F\s*([\d\.]+)', row_str)
         if m_3f:
             val_3f = float(m_3f.group(1))
             last3f_score = max(50.0, 100.0 - (val_3f - 35.0) * 10)
             
+        # 走破タイムの抽出 (例: 1:15.2)
         m_time = re.search(r'(\d+):([\d\.]+)', row_str)
         if m_time:
             minutes = int(m_time.group(1))
@@ -60,28 +62,36 @@ def parse_horse_history(row_str):
         pass
     return time_score, last3f_score
 
-# ワークスペース内のすべてのExcelファイルを自動検出してロード
+# Excelファイルを確実に読み込み・パースする関数
+@st.cache_data
 def load_and_parse_excel_races():
     excel_files = glob.glob('*.xlsx')
     races = []
     
     for f in excel_files:
-        # 古いテスト用ファイルなどを除外する場合の保険（ダートレースを含むもの対象）
         if 'ダートレース' not in f:
             continue
             
         try:
             xls = pd.ExcelFile(f)
-            # 18日が含まれていれば日曜、それ以外は土曜とする
+            # ファイル名に18が含まれていれば日曜、それ以外は土曜
             is_sunday = ('18' in f)
             day_label = "日曜日開催" if is_sunday else "土曜日開催"
             
             for sheet_name in xls.sheet_names:
                 df_data = pd.read_excel(f, sheet_name=sheet_name, header=1)
-                if '馬番' not in df_data.columns:
-                    continue
                 
-                df_data['馬番_num'] = pd.to_numeric(df_data['馬番'], errors='coerce')
+                # 「馬番」カラムを探す
+                if '馬番' not in df_data.columns:
+                    # カラム名にスペースや改行が含まれている場合のフォールバック
+                    matched_cols = [c for c in df_data.columns if '馬番' in str(c)]
+                    if not matched_cols:
+                        continue
+                    horse_no_col = matched_cols[0]
+                else:
+                    horse_no_col = '馬番'
+                
+                df_data['馬番_num'] = pd.to_numeric(df_data[horse_no_col], errors='coerce')
                 reset_indices = df_data[df_data['馬番_num'] == 1].index.tolist()
                 reset_indices.append(len(df_data))
                 
@@ -90,7 +100,7 @@ def load_and_parse_excel_races():
                     end_idx = reset_indices[i+1]
                     race_df = df_data.iloc[start_idx:end_idx].copy()
                     
-                    if len(race_df) < 3:
+                    if len(race_df) < 2:
                         continue
                         
                     race_no = i + 1
@@ -104,18 +114,22 @@ def load_and_parse_excel_races():
                     
                     horses = []
                     for _, row in race_df.iterrows():
-                        if pd.isna(row.get('馬番')):
+                        h_val = row.get(horse_no_col)
+                        if pd.isna(h_val):
                             continue
                         try:
-                            horse_no = int(row['馬番'])
+                            horse_no = int(float(h_val))
                         except:
                             continue
                             
+                        # 馬名カラムの取得
                         col_name_key = [c for c in race_df.columns if '馬名' in c]
                         if not col_name_key:
                             continue
                         col_val = str(row[col_name_key[0]])
                         name_line = col_val.split('\n')[0].strip()
+                        if not name_line or name_line == 'nan':
+                            continue
                         
                         odds_val = 15.0
                         pop_val = 5
@@ -128,6 +142,7 @@ def load_and_parse_excel_races():
                         except:
                             pass
 
+                        # 前走（馬柱）データの解析
                         prev_run = str(row.get('前走', ''))
                         t_score, l3f_score = parse_horse_history(prev_run)
                         
@@ -173,7 +188,7 @@ def render_race_list(target_day_label):
     filtered_races = [r for r in all_loaded_races if r['day_label'] == target_day_label]
     
     if not filtered_races:
-        st.warning(f"⚠️ {target_day_label} のレースデータが検出されませんでした。アップロードされたExcelファイル名をご確認ください。")
+        st.warning(f"⚠️ {target_day_label} のレースデータが検出されませんでした。")
         return
 
     for r_idx, race in enumerate(filtered_races):
