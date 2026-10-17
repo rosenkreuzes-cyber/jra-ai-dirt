@@ -2,8 +2,8 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import itertools
-import os
-import glob
+import urllib.request
+import io
 import re
 
 # 1. ページの設定
@@ -13,12 +13,31 @@ st.set_page_config(
     layout="centered"
 )
 
-st.title("🏇 JRA 黄金パターン AI ダッシュボード [デバッグ版]")
+# 2. カスタムCSS
+st.markdown("""
+<style>
+    .main { background-color: #0e1117; }
+    h1 { font-size: 1.4rem !important; color: #ff4b4b; }
+    h3 { font-size: 1.1rem !important; color: #f6e05e; }
+    .race-card {
+        background-color: #1a1c23; padding: 15px; border-radius: 10px;
+        border-left: 5px solid #ff4b4b; margin-bottom: 15px;
+    }
+    .confidence-badge {
+        background-color: #b7791f; color: #ffffff; padding: 2px 8px;
+        border-radius: 4px; font-size: 0.75rem; font-weight: bold; float: right;
+    }
+</style>
+""", unsafe_allow_html=True)
 
-# --- サイドバー (診断情報) ---
+st.title("🏇 JRA 黄金パターン AI ダッシュボード")
+
+# --- サイドバー ---
 with st.sidebar:
-    st.header("🔍 デバッグ診断パネル")
-    if st.button("🔄 再読込"):
+    st.header("⚙️ 設定")
+    bet_unit = st.number_input("1点あたりの金額 (円)", min_value=100, max_value=10000, value=100, step=100, key="box_unit")
+    if st.button("🔄 Google Driveから最新データを再取得"):
+        st.cache_data.clear()
         st.rerun()
 
 # タイム・上り3F解析
@@ -41,26 +60,24 @@ def parse_horse_history(row_str):
         pass
     return time_score, last3f_score
 
-# データを読み込み、詳細なログを収集する関数
-def load_and_parse_excel_races():
+# Google Driveから直接データを読み込む関数
+@st.cache_data(ttl=300)
+def load_races_from_google_drive():
+    # Google Drive上のスプレッドシートID設定
+    drive_sources = [
+        {"id": "14Zn-qUtrbhvNIXJXfNoB8hLfFXLzzeRf-jI3qBDZI_Q", "day_label": "土曜日開催"},
+        {"id": "1oI_Z6cqjDjQP9C81WsLJ5GgfTMqNw7mbiH2N9N9b780", "day_label": "日曜日開催"}
+    ]
+    
     races = []
-    log_messages = []
     
-    excel_files = glob.glob('*.xlsx')
-    log_messages.append(f"検出ファイル一覧: {excel_files}")
-    
-    for filename in excel_files:
-        if 'ダートレース' not in filename and '10_17' not in filename and '10_18' not in filename:
-            continue
-            
+    for src in drive_sources:
+        url = f"https://docs.google.com/spreadsheets/d/{src['id']}/export?format=csv"
         try:
-            xls = pd.ExcelFile(filename)
-            is_sunday = ('18' in filename)
-            day_label = "日曜日開催" if is_sunday else "土曜日開催"
-            
-            for sheet_name in xls.sheet_names:
-                df_data = pd.read_excel(filename, sheet_name=sheet_name, header=1)
-                log_messages.append(f"📁 [{filename}] シート '{sheet_name}' 読込成功 (行数: {len(df_data)})")
+            req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
+            with urllib.request.urlopen(req) as response:
+                csv_data = response.read().decode('utf-8', errors='ignore')
+                df_data = pd.read_csv(io.StringIO(csv_data), header=1)
                 
                 horse_col = None
                 for col in df_data.columns:
@@ -68,13 +85,11 @@ def load_and_parse_excel_races():
                         horse_col = col
                         break
                 if not horse_col:
-                    log_messages.append(f"  ❌ '馬番'カラムが見つかりません。Columns: {list(df_data.columns)}")
                     continue
                 
                 df_data['馬番_num'] = pd.to_numeric(df_data[horse_col], errors='coerce')
                 reset_indices = df_data[df_data['馬番_num'] == 1].index.tolist()
                 reset_indices.append(len(df_data))
-                log_messages.append(f"  📌 馬番リセット位置: {reset_indices}")
                 
                 for i in range(len(reset_indices) - 1):
                     start_idx = reset_indices[i]
@@ -85,13 +100,7 @@ def load_and_parse_excel_races():
                         continue
                         
                     race_no = i + 1
-                    s_lower = sheet_name.lower()
-                    if "kyouto" in s_lower or "京都" in sheet_name:
-                        course_name = "京都"
-                    elif "niigata" in s_lower or "新潟" in sheet_name:
-                        course_name = "新潟"
-                    else:
-                        course_name = "東京"
+                    course_name = "東京"
                     
                     horses = []
                     for _, row in race_df.iterrows():
@@ -148,24 +157,16 @@ def load_and_parse_excel_races():
                     if horses:
                         races.append({
                             "course": course_name,
-                            "day_label": day_label,
+                            "day_label": src['day_label'],
                             "race_name": f"{course_name} 第{race_no}レース",
                             "horses": horses
                         })
         except Exception as e:
-            log_messages.append(f"🔥 エラー発生 ({filename}): {str(e)}")
             continue
             
-    return races, log_messages
+    return races
 
-all_loaded_races, debug_logs = load_and_parse_excel_races()
-
-with st.sidebar:
-    st.markdown("---")
-    st.markdown(f"**総抽出レース数:** {len(all_loaded_races)}件")
-    with st.expander("🛠️ 読み込み詳細ログ"):
-        for log in debug_logs:
-            st.write(log)
+all_loaded_races = load_races_from_google_drive()
 
 def calculate_ai_indices(horses_data):
     df = pd.DataFrame(horses_data)
@@ -185,7 +186,7 @@ def render_race_list(target_day_label):
     filtered_races = [r for r in all_loaded_races if r['day_label'] == target_day_label]
     
     if not filtered_races:
-        st.warning(f"⚠️ {target_day_label} のレースデータが 0 件です。（サイドバーの「読み込み詳細ログ」をご確認ください）")
+        st.warning(f"⚠️ Google Driveからの {target_day_label} のレースデータ取得に失敗しました。スプレッドシートのアクセス権限（リンクを知っている全員が閲覧可能）をご確認ください。")
         return
 
     for r_idx, race in enumerate(filtered_races):
@@ -193,10 +194,10 @@ def render_race_list(target_day_label):
         top4_nos = scored_df.head(4)['horse_no'].tolist()
 
         st.markdown(f"""
-        <div style="background-color: #1a1c23; padding: 15px; border-radius: 10px; border-left: 5px solid #ff4b4b; margin-bottom: 15px;">
+        <div class="race-card">
             <span style="background-color: #2d3748; color: #63b3ed; padding: 2px 8px; border-radius: 4px; font-size: 0.75rem;">📅 {race['day_label']}</span>
-            <span style="background-color: #b7791f; color: #ffffff; padding: 2px 8px; border-radius: 4px; font-size: 0.75rem; font-weight: bold; float: right;">🔥 4頭BOX (4点)</span>
-            <h3 style="margin-top: 8px; color: #f6e05e;">📍 {race['race_name']}</h3>
+            <span class="confidence-badge">🔥 4頭BOX (4点)</span>
+            <h3 style="margin-top: 8px;">📍 {race['race_name']}</h3>
             <p style='margin: 4px 0; font-size: 0.85rem; color: #a0aec0;'>
                 <b>🎯 AI上位4頭 (BOX対象):</b> 馬番 <b>{', '.join(map(str, top4_nos))}番</b>
             </p>
