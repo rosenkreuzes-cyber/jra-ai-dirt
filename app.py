@@ -78,21 +78,21 @@ with tab_live:
 
     # 実データからオッズ・出馬表を取得
     fetch_status_msg = ""
+    race_info = {"date": "2021年X月X日", "course": "東京", "race_no": "10R", "race_name": "ダートオープン特選"}
+    
     if is_dataloader_available:
-        sample_race_horses, fetch_status_msg = data_loader.fetch_safe_live_race_horses()
+        sample_race_horses, fetch_status_msg, race_info = data_loader.fetch_safe_live_race_horses_with_info() if hasattr(data_loader, 'fetch_safe_live_race_horses_with_info') else (*data_loader.fetch_safe_live_race_horses(), race_info)
     else:
         sample_race_horses = []
         fetch_status_msg = "data_loaderモジュールがありません。"
 
     if not sample_race_horses:
-        # フォールバック
         sample_race_horses = [
             {"horse_no": 1, "name": "メイショウハリオ", "pop_rank": 2, "time_index": 86.5, "last3f_index": 80.0, "track_aptitude": 84.0, "odds": 4.5},
             {"horse_no": 3, "name": "テーオーケインズ", "pop_rank": 1, "time_index": 92.0, "last3f_index": 88.0, "track_aptitude": 90.0, "odds": 1.9}
         ]
         fetch_status_msg = "サンプルデータにフォールバックしました。"
 
-    # 画面上にデータ取得状況を表示
     st.markdown(f"""
     <div class="success-box">
         <b>📡 データ取得状況:</b> {fetch_status_msg}
@@ -101,29 +101,25 @@ with tab_live:
 
     scored_df = calculate_ai_indices(sample_race_horses)
 
-    st.markdown("### 📍 対象レース（実データ・オッズ反映）")
-    
-    top4_horses = scored_df.head(4)
-    top4_nos = top4_horses['horse_no'].tolist()
-
+    # 復活させたレース開催情報カード
     st.markdown(f"""
     <div class="race-card">
-        <span style="background-color: #2d3748; color: #63b3ed; padding: 2px 8px; border-radius: 4px; font-size: 0.75rem;">🎯 断層突破戦略</span>
+        <span style="background-color: #2d3748; color: #63b3ed; padding: 2px 8px; border-radius: 4px; font-size: 0.75rem;">📅 開催日: {race_info.get('date', '2021年')}</span>
         <span class="confidence-badge">🔥 推奨買い方: 4頭BOX (4点)</span>
-        <h3 style="margin-top: 8px;">AI指数上位4頭による堅実・高効率フォーメーション</h3>
+        <h3 style="margin-top: 8px;">📍 {race_info.get('course', '東京')} {race_info.get('race_no', '10R')} - {race_info.get('race_name', 'ダート競走')}</h3>
         <p style='margin: 4px 0; font-size: 0.85rem; color: #a0aec0;'>
-            <b>🛡️ 狙い目:</b> 指数5位以降への断層を考慮し、上位4頭（馬番: <b>{', '.join(map(str, top4_nos))}番</b>）で決着する確率を高確率で網羅します。
+            <b>🎯 断層突破戦略:</b> AI指数上位4頭（馬番: <b>{', '.join(map(str, scored_df.head(4)['horse_no'].tolist()))}番</b>）で決着する確率を高確率で網羅します。
         </p>
     </div>
     """, unsafe_allow_html=True)
 
     st.markdown("#### 🎫 3連複 4頭BOX 買い目一覧（計 4点）")
+    top4_nos = scored_df.head(4)['horse_no'].tolist()
     box_bets = []
     for comb in itertools.combinations(top4_nos, 3):
         comb_sorted = sorted(list(comb))
-        # 実データから取得した実際のオッズを合計して配当の目安を算出
         matched_odds = scored_df[scored_df['horse_no'].isin(comb_sorted)]['odds'].sum()
-        simulated_odds = round(matched_odds * 1.8, 1) # 実オッズベースの補正
+        simulated_odds = round(matched_odds * 1.8, 1)
         box_bets.append({
             "券種": "3連複BOX",
             "組み合わせ": f"{comb_sorted[0]} - {comb_sorted[1]} - {comb_sorted[2]}",
@@ -137,7 +133,7 @@ with tab_live:
 
     st.markdown(f"**💰 総投資金額:** {bet_unit * 4:,} 円")
 
-    st.markdown("#### 📋 全出走馬 AIスコアリング一覧（実オッズ表示）")
+    st.markdown("#### 📋 全出走馬 AIスコアリング一覧（2段カード表示）")
     
     sorted_df = scored_df.sort_values('idx_rank').reset_index(drop=True)
     
