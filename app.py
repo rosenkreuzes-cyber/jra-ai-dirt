@@ -686,6 +686,32 @@ def put_record(path, record, overwrite=False):
     raise RuntimeError("同時更新が発生しました。再読み込みしてから再試行してください")
 
 
+def delete_record_safely(path, expected_race_id, expected_date):
+    """Delete one verified prediction file, using the current GitHub SHA."""
+    if not re.fullmatch(r"predictions/\d{4}/[A-Za-z0-9_.-]+\.json", path):
+        raise RuntimeError("予想履歴以外のパスは削除できません")
+    record, sha = get_record(path)
+    if not record or not sha:
+        raise RuntimeError("対象ファイルが見つかりません。履歴を再読み込みしてください")
+    if record.get("race_id") != expected_race_id or record.get("race_date") != expected_date:
+        raise RuntimeError("削除対象の内容が変わりました。削除を中止しました")
+    github_request("DELETE", path, {
+        "message": "JRA history: manually delete incorrect prediction " + path,
+        "sha": sha,
+    })
+
+
+def list_prediction_files_for_date(target_date):
+    """List actual GitHub files; do not deduplicate by race_id."""
+    matches = []
+    for folder in github_list_directories("predictions"):
+        for path in list_files(folder):
+            rec, _ = get_record(path)
+            if rec and rec.get("race_date") == target_date:
+                matches.append({"path": path, "record": rec})
+    return matches
+
+
 def list_files(directory):
     token, repo = github_config()
     url = "https://api.github.com/repos/" + repo + "/contents/" + urllib.parse.quote(directory, safe="/") + "?per_page=1000"
@@ -971,6 +997,39 @@ with t3:
 
 with t4:
     st.subheader("長期成績")
+    with st.expander("🗑️ 予想履歴を手動削除（誤保存分の整理）", expanded=False):
+        st.warning("削除はGitHubの予想履歴ファイルに対して実行され、元に戻すにはGitHubで復元が必要です。確定結果ファイルは削除しません。")
+        delete_date = st.date_input("削除対象の日付", value=datetime.date(2026, 10, 19), key="history_delete_date")
+        if st.button("この日付の削除候補を取得", key="history_delete_load"):
+            st.session_state["history_delete_loaded_date"] = delete_date.isoformat()
+        if st.session_state.get("history_delete_loaded_date") == delete_date.isoformat():
+            try:
+                candidates = list_prediction_files_for_date(delete_date.isoformat())
+                if not candidates:
+                    st.info("指定日付の予想履歴はありません。")
+                else:
+                    selected_paths = []
+                    st.caption(f"{len(candidates)}件の予想ファイル。削除するものだけ選択してください。")
+                    for idx, item in enumerate(candidates):
+                        rec = item["record"]
+                        models = "・".join((rec.get("models") or {"旧AI（過去保存）": {}}).keys())
+                        desc = f"{rec.get('race_date')} {rec.get('course')} {rec.get('race_no')}R {rec.get('race_name')} / {models} / {item['path']}"
+                        if st.checkbox(desc, key=f"history_del_select_{delete_date}_{idx}_{item['path']}"):
+                            selected_paths.append(item)
+                    st.caption(f"選択中：{len(selected_paths)}件（選択した予想ファイルのみ削除）")
+                    confirm = st.text_input("削除する場合は『削除』と入力", key="history_delete_confirm")
+                    if st.button("選択した予想履歴を完全削除", type="primary", disabled=not selected_paths or confirm != "削除", key="history_delete_execute"):
+                        count = 0
+                        for item in selected_paths:
+                            rec = item["record"]
+                            delete_record_safely(item["path"], rec["race_id"], delete_date.isoformat())
+                            count += 1
+                        st.session_state.pop("history_delete_loaded_date", None)
+                        st.success(f"予想履歴 {count}件を削除しました。画面を再読み込みしてください。")
+                        st.rerun()
+            except Exception as delete_error:
+                st.error("削除候補の取得または削除に失敗しました: " + str(delete_error))
+
     try:
         predictions, results = read_all_history()
         records = []
