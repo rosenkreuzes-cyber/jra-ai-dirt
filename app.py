@@ -688,7 +688,7 @@ def put_record(path, record, overwrite=False):
 
 def delete_record_safely(path, expected_race_id, expected_date):
     """Delete one verified prediction file, using the current GitHub SHA."""
-    if not re.fullmatch(r"predictions/\d{4}/[A-Za-z0-9_.-]+\.json", path):
+    if (not re.fullmatch(r"predictions/\d{4}/[^/\\]+\.json", path) or ".." in path):
         raise RuntimeError("予想履歴以外のパスは削除できません")
     record, sha = get_record(path)
     if not record or not sha:
