@@ -13,6 +13,7 @@ import json
 import base64
 import datetime
 import urllib.parse
+from urllib.error import HTTPError
 from urllib.error import HTTPError, URLError
 
 # 1. ページの設定
@@ -91,7 +92,10 @@ def clean_text(value):
             return ""
     except (TypeError, ValueError):
         pass
-    return unicodedata.normalize("NFKC", str(value)).strip()
+    value = html.unescape(str(value))
+    value = re.sub(r"(?i)<br\s*/?>", "\n", value)
+    value = re.sub(r"<[^>]+>", " ", value)
+    return unicodedata.normalize("NFKC", value).replace("\u3000", " ").strip()
 
 
 def parse_race_heading(value, sheet_name=""):
@@ -255,14 +259,20 @@ def parse_sheet_rows(rows, day_label, sheet_name=""):
             current["race_name"] = name
             current["identified"] = bool(course and number)
             current["day_label"] = day_label
-            # 見出しを参照する前に取得する（未定義変数による解析停止を防ぐ）。
             heading = current.get("heading_raw", "")
             current["race_date"] = heading_date(heading) or heading_date(sheet_name)
-            # 当該レースの距離・馬場は見出しから取れる場合のみ利用する。
-            dist_match = re.search(r"(\d{3,4})\s*ダ", heading)
+            # スプレッドシートのセル分割や表記揺れに対応する。
+            # 過去走の「1800ダ」は当該レースの判定には絶対に使用しない。
+            surface_text = heading + "\n" + "\n".join(current.get("race_info", []))
+            surface_text = unicodedata.normalize("NFKC", surface_text)
+            dirt_match = re.search(r"(?:ダート|ダ)\s*(\d{3,4})\s*(?:m|メートル)?", surface_text, re.I)
+            dirt_match_rev = re.search(r"(\d{3,4})\s*(?:m|メートル)?\s*(?:ダート|ダ)(?![ァ-ン])", surface_text, re.I)
+            turf_match = re.search(r"(?:芝|ターフ)\s*(\d{3,4})|(\d{3,4})\s*(?:m)?\s*芝", surface_text, re.I)
+            dist_match = dirt_match or dirt_match_rev
             target_distance = int(dist_match.group(1)) if dist_match else None
             current["target_distance"] = target_distance
-            current["is_dirt_race"] = bool(dist_match)
+            current["is_dirt_race"] = bool(dist_match) and not bool(turf_match and not dist_match)
+            current["surface_diagnostic"] = surface_text[:240]
             current["target_going"] = None
             dirt_model(current["horses"], target_distance, None)
             # 入力されている単勝だけから人気を推定しない。全頭揃う場合のみ順位算出。
@@ -283,7 +293,7 @@ def parse_sheet_rows(rows, day_label, sheet_name=""):
             heading = parse_race_heading(first, sheet_name)
             if heading:
                 finish()
-                current = {**heading, "horses": [], "heading_raw": first, "sheet_name": sheet_name}
+                current = {**heading, "horses": [], "heading_raw": " ".join(cells), "race_info": [], "sheet_name": sheet_name}
                 columns = None
                 continue
         if any("馬番" in c for c in cells) and any("馬名" in c for c in cells):
@@ -294,6 +304,8 @@ def parse_sheet_rows(rows, day_label, sheet_name=""):
                 "odds": next((i for i,c in enumerate(cells) if c == "単勝" or c.startswith("単勝オッズ")), None),
             }
             continue
+        if current is not None and columns is None:
+            current.setdefault("race_info", []).append(" ".join(cells))
         if current is None or columns is None:
             continue
         hi, ni, previous_indices = columns["horse"], columns["name"], columns["previous"]
@@ -409,9 +421,7 @@ def load_races_from_google_drive():
             content, method = download_workbook(source["id"])
             parsed = parse_workbook_bytes(content, day)
             races.extend(parsed)
-            dirt_count = sum(bool(r.get("is_dirt_race")) for r in parsed)
-            identified_count = sum(bool(r.get("identified")) for r in parsed)
-            diagnostics.append(f"{day}: {method}から {len(parsed)} レースを取得（ダート判定 {dirt_count}、レース特定 {identified_count}）")
+            diagnostics.append(f"{day}: {method}から {len(parsed)} レースを取得")
             if not parsed:
                 errors.append(f"{day}: Excelは取得できましたが、レースを解析できませんでした")
         except Exception as exc:
@@ -420,10 +430,6 @@ def load_races_from_google_drive():
 
 
 all_loaded_races, load_errors, load_diagnostics = load_races_from_google_drive()
-if not all_loaded_races:
-    st.error("Googleスプレッドシートからレースを1件も取得できていません。『比較対象0・除外0』はAIの選考結果ではなく、データ取得または解析の問題です。サイドバーの『📡 データ取得診断』を確認してください。")
-elif load_errors:
-    st.warning("土曜・日曜の一部データに読み込みエラーがあります。サイドバーの『📡 データ取得診断』を確認してください。")
 with st.sidebar.expander("📡 データ取得診断", expanded=bool(load_errors)):
     for msg in load_diagnostics:
         st.success(msg)
@@ -538,7 +544,7 @@ def choose_dual(day):
         if all(x["metrics"] is not None for x in evaluations.values()):
             selected.append((race, evaluations))
         else:
-            excluded.append((race["race_name"], "旧AI: " + str(evaluations["旧AI"]["reason"]) + " / 新AI: " + str(evaluations["新AI"]["reason"])))
+            excluded.append((race["race_name"], "旧AI: " + str(evaluations["旧AI"]["reason"]) + " / 新AI: " + str(evaluations["新AI"]["reason"]) + (" / 見出し: " + race.get("surface_diagnostic", "")[:100] if not race.get("is_dirt_race") else "")))
     # 両モデルを同じ対象レースで比較できるよう、新AI優先・旧AI代替で並べる
     def priority(item):
         ev = item[1]
@@ -764,16 +770,12 @@ sun_date = st.sidebar.date_input("日曜日の開催日", value=sat_date + datet
 
 def render_races(day, date):
     selected, excluded = choose_dual(day)
-    loaded_count = sum(r["day_label"] == day for r in all_loaded_races)
-    st.info(f"読込 {loaded_count} レース → 比較対象 {len(selected)} レース・除外 {len(excluded)} レース")
+    st.info(f"比較対象 {len(selected)} レース・除外 {len(excluded)} レース")
     with st.expander("除外レースと理由"):
         for name, reason in excluded:
             st.write(name, "：", reason)
     if not selected:
-        if loaded_count == 0:
-            st.error("この開催日のレースを読み込めていません。データ取得診断を確認してください。")
-        else:
-            st.warning("読み込みは成功しましたが、推奨条件を満たすレースがありません。除外理由を確認してください。")
+        st.warning("推奨対象レースはありません。")
         return
     for race, evaluations in selected:
         st.subheader("🏇 " + race["race_name"])
