@@ -13,7 +13,6 @@ import json
 import base64
 import datetime
 import urllib.parse
-from urllib.error import HTTPError
 from urllib.error import HTTPError, URLError
 
 # 1. ページの設定
@@ -137,6 +136,11 @@ def parse_sheet_rows(rows, day_label, sheet_name=""):
             name = f"{course} {number}R" if course else f"開催場不明 {number}R"
             if current["race_title"]:
                 name += f" {current['race_title']}"
+            # 単勝列に入力されたオッズから人気順位を算出（同倍率は同順位）。
+            available = [h["odds"] for h in current["horses"] if pd.notna(h["odds"])]
+            for horse in current["horses"]:
+                if pd.notna(horse["odds"]):
+                    horse["pop_rank"] = 1 + sum(v < horse["odds"] for v in available)
             current["race_name"] = name
             current["identified"] = bool(course and number)
             current["day_label"] = day_label
@@ -160,6 +164,7 @@ def parse_sheet_rows(rows, day_label, sheet_name=""):
             columns = {
                 "horse": next(i for i, c in enumerate(cells) if "馬番" in c),
                 "name": next(i for i, c in enumerate(cells) if "馬名" in c),
+                "odds": next((i for i, c in enumerate(cells) if c == "単勝" or c.startswith("単勝オッズ")), None),
                 "previous": [i for i, c in enumerate(cells) if re.search(r"前走|前々走|[34]走前", c)],
             }
             continue
@@ -179,8 +184,18 @@ def parse_sheet_rows(rows, day_label, sheet_name=""):
         if not name:
             continue
         odds_match = ODDS_PATTERN.search(field)
-        odds = float(odds_match.group(1)) if odds_match else 15.0
-        popularity = int(odds_match.group(2)) if odds_match else 5
+        odds = np.nan
+        odds_col = columns.get("odds")
+        if odds_col is not None and odds_col < len(cells):
+            raw_odds = cells[odds_col].replace(",", "").replace("倍", "").strip()
+            match = re.search(r"(?<!\d)(\d+(?:\.\d+)?)(?!\d)", raw_odds)
+            if match:
+                parsed_odds = float(match.group(1))
+                if parsed_odds > 0:
+                    odds = parsed_odds
+        if pd.isna(odds) and odds_match:
+            odds = float(odds_match.group(1))
+        popularity = np.nan  # 単勝オッズからレース単位で算出
         histories = [cells[i] for i in previous_indices if i < len(cells) and cells[i]]
         valid_histories = [h for h in histories if re.search(r"20\d{2}年\d{1,2}月\d{1,2}日", h)]
         previous = valid_histories[0] if valid_histories else ""
@@ -206,7 +221,7 @@ def parse_sheet_rows(rows, day_label, sheet_name=""):
         dirt_score = sum(dirt_results) / len(dirt_results) if dirt_results else None
         current["horses"].append({
             "horse_no": horse_no, "name": name,
-            "pop_rank": popularity, "odds": odds,
+            "pop_rank": popularity, "odds": odds, "odds_source": "Google Driveシート" if pd.notna(odds) else "未入力",
             "time_index": time_score, "last3f_index": last3f_score,
             "track_aptitude": 75.0,
             "history_count": len(valid_histories),
@@ -308,6 +323,89 @@ with st.sidebar.expander("📂 Excelファイルから読み込む（代替）")
             except Exception as exc:
                 st.error(f"{day}: ファイル解析エラー: {exc}")
 
+# 最新単勝オッズ: CSVアップロード、または任意の公開HTTPS CSVから取得する。
+# CSV列: day,course,race_no,horse_no,odds（pop_rankは任意）
+# dayは「土曜日開催」「日曜日開催」または sat/sun。
+ODDS_COLUMNS = {"day", "course", "race_no", "horse_no", "odds"}
+
+
+def parse_odds_csv(content):
+    frame = None
+    for encoding in ("utf-8-sig", "cp932"):
+        try:
+            frame = pd.read_csv(io.BytesIO(content), encoding=encoding, dtype={"day": str, "course": str})
+            break
+        except UnicodeDecodeError:
+            continue
+    if frame is None:
+        raise ValueError("CSVの文字コードが認識できません（UTF-8/Shift-JIS対応）")
+    frame.columns = [str(c).strip().lower() for c in frame.columns]
+    missing = ODDS_COLUMNS - set(frame.columns)
+    if missing:
+        raise ValueError("CSVに必要な列がありません: " + ", ".join(sorted(missing)))
+    if frame.empty:
+        raise ValueError("CSVにオッズデータがありません")
+    frame["day"] = frame["day"].astype(str).str.strip().replace({
+        "sat": "土曜日開催", "sun": "日曜日開催", "土曜": "土曜日開催", "日曜": "日曜日開催"})
+    frame["course"] = frame["course"].astype(str).str.strip()
+    for col in ("race_no", "horse_no", "odds"):
+        frame[col] = pd.to_numeric(frame[col], errors="coerce")
+    if "pop_rank" in frame:
+        frame["pop_rank"] = pd.to_numeric(frame["pop_rank"], errors="coerce")
+    if frame[["race_no", "horse_no", "odds"]].isna().any().any() or (frame["odds"] <= 0).any():
+        raise ValueError("レース番号・馬番・単勝オッズに欠損または不正値があります")
+    if (~frame["day"].isin(["土曜日開催", "日曜日開催"])).any():
+        raise ValueError("day列は土曜日開催/日曜日開催（またはsat/sun）を指定してください")
+    if (~frame["race_no"].between(1, 12)).any() or (~frame["horse_no"].between(1, 18)).any():
+        raise ValueError("レース番号または馬番が範囲外です")
+    keys = ["day", "course", "race_no", "horse_no"]
+    if frame.duplicated(keys).any():
+        raise ValueError("同じ開催日区分・競馬場・レース・馬番がCSV内で重複しています")
+    return frame
+
+
+def apply_odds(races, frame, source_label):
+    # 入力にない馬のExcelオッズを「最新」と誤認しないよう、該当レースは未取得にする。
+    updated_races, updated_horses = 0, 0
+    for race in races:
+        matches = frame[(frame["day"] == race["day_label"]) &
+                        (frame["course"] == race["course"]) &
+                        (frame["race_no"] == race["race_no"])]
+        if matches.empty:
+            continue
+        updated_races += 1
+        by_no = {int(row["horse_no"]): row for _, row in matches.iterrows()}
+        odds_by_horse = {}
+        for horse in race["horses"]:
+            number = horse["horse_no"]
+            horse["odds"] = np.nan
+            horse["pop_rank"] = np.nan
+            horse["odds_source"] = "未取得（最新CSVに該当馬なし）"
+            if number in by_no:
+                row = by_no[number]
+                horse["odds"] = float(row["odds"])
+                horse["odds_source"] = source_label
+                odds_by_horse[number] = float(row["odds"])
+                if "pop_rank" in frame and pd.notna(row.get("pop_rank")):
+                    horse["pop_rank"] = int(row["pop_rank"])
+                updated_horses += 1
+        # 人気順位の指定がなければ単勝オッズから同率順位で算出。
+        sorted_odds = sorted(set(odds_by_horse.values()))
+        rank_map = {v: 1 + sum(1 for x in odds_by_horse.values() if x < v) for v in sorted_odds}
+        for horse in race["horses"]:
+            if pd.isna(horse["pop_rank"]) and horse["horse_no"] in odds_by_horse:
+                horse["pop_rank"] = rank_map[odds_by_horse[horse["horse_no"]]]
+    return updated_races, updated_horses
+
+
+st.sidebar.divider()
+st.sidebar.header("📈 単勝オッズ")
+st.sidebar.caption("Google Driveの『単勝』列を読み込み、入力済みの馬だけ表示します。人気順位は同じレースの単勝オッズから算出します。AI指数には影響しません。")
+filled = sum(pd.notna(h["odds"]) for r in all_loaded_races for h in r["horses"])
+st.sidebar.info(f"Google Drive・アップロードExcelの単勝オッズ: {filled}頭分を読み込み")
+st.sidebar.caption("最新値を表示するには、シート更新後に上の『Google Driveから最新データを再取得』を押してください。")
+
+
 def calculate_ai_indices(horses_data):
     df = pd.DataFrame(horses_data)
     # ダート戦なのでダート着順の相対成績を優先。芝のみの馬は不確実性を反映。
@@ -320,7 +418,8 @@ def calculate_ai_indices(horses_data):
                       (runs.lt(2) * 8)).where(base.notna())
     df = df.sort_values(["ai_score", "horse_no"], ascending=[False, True], na_position="last").reset_index(drop=True)
     df["idx_rank"] = range(1, len(df) + 1)
-    df["divergence"] = df["pop_rank"] - df["idx_rank"]
+    # 人気順位との差は参考表示のみ。AI指数・推奨4頭の選定には使わない。
+    df["divergence"] = pd.to_numeric(df["pop_rank"], errors="coerce") - df["idx_rank"]
     return df
 
 
@@ -365,7 +464,7 @@ def screen_race(race, min_coverage, min_gap, min_confidence, min_top_history, mi
 
 
 # --- GitHub Private repository persistence ---
-APP_VERSION = "hit-priority-1.0-history-1.0"
+APP_VERSION = "hit-priority-1.2-odds-display-only"
 
 def github_config():
     token = st.secrets.get("GITHUB_TOKEN", "")
@@ -466,6 +565,7 @@ def snapshot(date, race, metrics, df, settings):
         "race_no": int(race["race_no"]), "race_name": race["race_name"],
         "saved_at_utc": datetime.datetime.now(datetime.timezone.utc).isoformat(),
         "model_version": APP_VERSION, "settings": settings, "metrics": metrics,
+        "odds_source": odds_source_label, "odds_loaded_at_jst": odds_updated_at.isoformat() if odds_updated_at else None,
         "top4": top, "bets": [list(c) for c in itertools.combinations(sorted(top), 3)],
         "bet_unit": int(bet_unit), "horses": horses,
     }
@@ -543,6 +643,8 @@ def render_races(day, date):
         top = [int(x) for x in df.head(4)["horse_no"]]
         st.subheader(f"🏇 {race['race_name']}　評価 {metrics['score']}点")
         st.write("推奨4頭:", "・".join(map(str, top)), "／ 4位-5位指数差:", metrics["gap"])
+        sources = sorted(set(str(h.get("odds_source", "未取得")) for h in race["horses"]))
+        st.caption("単勝オッズ: " + " / ".join(sources) + " ｜ オッズ・人気は参考表示のみ（AI指数には不使用）")
         with st.expander("買い目・全馬指数"):
             st.dataframe(pd.DataFrame([{"3連複": "-".join(map(str, x)), "金額": bet_unit} for x in itertools.combinations(sorted(top), 3)]), hide_index=True)
             st.dataframe(df, hide_index=True)
