@@ -13,7 +13,6 @@ import json
 import base64
 import datetime
 import urllib.parse
-from urllib.error import HTTPError
 from urllib.error import HTTPError, URLError
 
 # 1. ページの設定
@@ -256,9 +255,10 @@ def parse_sheet_rows(rows, day_label, sheet_name=""):
             current["race_name"] = name
             current["identified"] = bool(course and number)
             current["day_label"] = day_label
+            # 見出しを参照する前に取得する（未定義変数による解析停止を防ぐ）。
+            heading = current.get("heading_raw", "")
             current["race_date"] = heading_date(heading) or heading_date(sheet_name)
             # 当該レースの距離・馬場は見出しから取れる場合のみ利用する。
-            heading = current.get("heading_raw", "")
             dist_match = re.search(r"(\d{3,4})\s*ダ", heading)
             target_distance = int(dist_match.group(1)) if dist_match else None
             current["target_distance"] = target_distance
@@ -409,7 +409,9 @@ def load_races_from_google_drive():
             content, method = download_workbook(source["id"])
             parsed = parse_workbook_bytes(content, day)
             races.extend(parsed)
-            diagnostics.append(f"{day}: {method}から {len(parsed)} レースを取得")
+            dirt_count = sum(bool(r.get("is_dirt_race")) for r in parsed)
+            identified_count = sum(bool(r.get("identified")) for r in parsed)
+            diagnostics.append(f"{day}: {method}から {len(parsed)} レースを取得（ダート判定 {dirt_count}、レース特定 {identified_count}）")
             if not parsed:
                 errors.append(f"{day}: Excelは取得できましたが、レースを解析できませんでした")
         except Exception as exc:
@@ -418,6 +420,10 @@ def load_races_from_google_drive():
 
 
 all_loaded_races, load_errors, load_diagnostics = load_races_from_google_drive()
+if not all_loaded_races:
+    st.error("Googleスプレッドシートからレースを1件も取得できていません。『比較対象0・除外0』はAIの選考結果ではなく、データ取得または解析の問題です。サイドバーの『📡 データ取得診断』を確認してください。")
+elif load_errors:
+    st.warning("土曜・日曜の一部データに読み込みエラーがあります。サイドバーの『📡 データ取得診断』を確認してください。")
 with st.sidebar.expander("📡 データ取得診断", expanded=bool(load_errors)):
     for msg in load_diagnostics:
         st.success(msg)
@@ -758,12 +764,16 @@ sun_date = st.sidebar.date_input("日曜日の開催日", value=sat_date + datet
 
 def render_races(day, date):
     selected, excluded = choose_dual(day)
-    st.info(f"比較対象 {len(selected)} レース・除外 {len(excluded)} レース")
+    loaded_count = sum(r["day_label"] == day for r in all_loaded_races)
+    st.info(f"読込 {loaded_count} レース → 比較対象 {len(selected)} レース・除外 {len(excluded)} レース")
     with st.expander("除外レースと理由"):
         for name, reason in excluded:
             st.write(name, "：", reason)
     if not selected:
-        st.warning("推奨対象レースはありません。")
+        if loaded_count == 0:
+            st.error("この開催日のレースを読み込めていません。データ取得診断を確認してください。")
+        else:
+            st.warning("読み込みは成功しましたが、推奨条件を満たすレースがありません。除外理由を確認してください。")
         return
     for race, evaluations in selected:
         st.subheader("🏇 " + race["race_name"])
