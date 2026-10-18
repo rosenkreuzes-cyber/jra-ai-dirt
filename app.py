@@ -512,7 +512,7 @@ def screen_race(race, min_coverage, min_gap, min_confidence, min_top_history, mi
 
 
 # --- GitHub Private repository persistence ---
-APP_VERSION = "dual-model-3.1-date-safe"
+APP_VERSION = "dual-model-3.2-independent-eligibility"
 
 # 旧モデルは既存appの計算式を固定して再現。オッズ・人気は不使用。
 def score_old_model(horses):
@@ -550,7 +550,7 @@ def choose_dual(day):
             # screen_race は新モデルを再計算するため、モデルごとのデータを直接渡す
             metrics, reason, _ = screen_scored_race(race, frame)
             evaluations[label] = {"metrics": metrics, "reason": reason, "df": frame}
-        if all(x["metrics"] is not None for x in evaluations.values()):
+        if any(x["metrics"] is not None for x in evaluations.values()):
             selected.append((race, evaluations))
         else:
             excluded.append((race["race_name"], "旧AI: " + str(evaluations["旧AI"]["reason"]) + " / 新AI: " + str(evaluations["新AI"]["reason"]) + (" / 見出し: " + race.get("surface_diagnostic", "")[:100] if not race.get("is_dirt_race") else "")))
@@ -779,7 +779,12 @@ sun_date = st.sidebar.date_input("日曜日の開催日", value=sat_date + datet
 
 def render_races(day, date):
     selected, excluded = choose_dual(day)
-    st.info(f"比較対象 {len(selected)} レース・除外 {len(excluded)} レース")
+    st.info(f"推奨候補 {len(selected)} レース・除外 {len(excluded)} レース")
+    st.caption("旧AIまたは新AIのどちらかが基準を満たせば表示します。各モデルの対象外判定は維持します。")
+    if selected:
+        old_ok = sum(ev["旧AI"]["metrics"] is not None for _, ev in selected)
+        new_ok = sum(ev["新AI"]["metrics"] is not None for _, ev in selected)
+        st.caption(f"候補内の選考通過：旧AI {old_ok}レース ／ 新AI {new_ok}レース")
     with st.expander("除外レースと理由"):
         for name, reason in excluded:
             st.write(name, "：", reason)
@@ -795,7 +800,7 @@ def render_races(day, date):
             top = [int(x) for x in df.head(4)["horse_no"]]
             with col:
                 st.markdown("**" + label + "**")
-                st.write("推奨4頭：", "・".join(map(str, top)))
+                st.write("推奨4頭：", "・".join(map(str, top)) if ev["metrics"] else "対象外（参考順位：" + "・".join(map(str, top)) + "）")
                 st.caption("選考通過" if ev["metrics"] else "選考対象外：" + str(ev["reason"]))
                 st.write("4位と5位の指数差：", round(float(df.iloc[3]["ai_score"] - df.iloc[4]["ai_score"]), 2) if len(df)>4 and df["ai_score"].notna().sum()>4 else "—")
         old_top = set(evaluations["旧AI"]["df"].head(4)["horse_no"])
@@ -933,7 +938,7 @@ with t4:
             for label, model in model_items.items():
                 if len(model.get("top4", [])) != 4:
                     continue
-                hit, stake, received = outcome({"top4": model["top4"], "bet_unit": pred["bet_unit"]}, result) if result and model.get("eligible",True) else (None, None, None)
+                hit, stake, received = outcome({"top4": model["top4"], "bet_unit": pred.get("bet_unit", 100)}, result) if result and model.get("eligible",True) else (None, None, None)
                 metrics = model.get("metrics") or {}
                 placed = set(map(int, result["top3"])) if result and result.get("top3") else set()
                 recommended_placed = [int(n) for n in model["top4"] if int(n) in placed]
@@ -943,7 +948,7 @@ with t4:
                     "評価点": metrics.get("score"),
                     "状態": "対象外" if not model.get("eligible",True) else ("未登録" if result is None else ("的中" if hit else "不的中")),
                     "投資額": stake, "払戻額": received,
-                    "損益": (received-stake) if result else None,
+                    "損益": (received-stake) if (result and stake is not None) else None,
                     "指数差": metrics.get("gap"), "モデル": label})
         df_hist = pd.DataFrame(records)
         if df_hist.empty:
@@ -961,16 +966,28 @@ with t4:
             c4.metric("累計損益", f"{paid-invested:+,}円")
             st.markdown("### モデル別成績")
             comparisons = []
-            for label, group in completed.groupby("モデル"):
+            # 予想は保存済みでも結果未登録なら的中率・回収率は未算出。
+            # 旧形式の予想は旧AIとして扱い、過去の新AI予想を捏造しない。
+            saved_models = ["旧AI", "新AI", "旧AI（過去保存）"]
+            available_models = list(dict.fromkeys(saved_models + df_hist["モデル"].tolist()))
+            for label in available_models:
+                group = completed[completed["モデル"] == label]
                 invested_m = int(group["投資額"].sum())
                 paid_m = int(group["払戻額"].sum())
-                comparisons.append({"モデル": label, "結果登録": len(group),
-                    "的中率": f"{(group['状態']=='的中').mean()*100:.1f}%",
+                saved = df_hist[df_hist["モデル"] == label]
+                eligible_saved = int((saved["状態"] != "対象外").sum())
+                comparisons.append({"モデル": label, "保存予想": eligible_saved,
+                    "結果登録": len(group),
+                    "的中率": f"{(group['状態']=='的中').mean()*100:.1f}%" if len(group) else "—",
                     "回収率": f"{paid_m/invested_m*100:.1f}%" if invested_m else "—",
-                    "損益": paid_m-invested_m})
+                    "損益": paid_m-invested_m if len(group) else "—"})
             if comparisons:
                 st.dataframe(pd.DataFrame(comparisons), hide_index=True, use_container_width=True)
-            st.caption("モデル別集計は予想を確定保存したレースのみ。対象外は集計しません。")
+            st.caption("新AIの結果登録が0件なら的中率・回収率は『—』です。新AIの予想を保存し、同じレースの確定結果を登録すると集計されます。旧形式の予想は旧AIとして保持します。")
+            duplicate_groups = df_hist.groupby(["日付", "レース"])["モデル"].agg(list)
+            suspicious = duplicate_groups[duplicate_groups.apply(lambda names: len(names) != len(set(names)))]
+            if len(suspicious):
+                st.warning(f"同じ日付・レース・モデルの履歴が {len(suspicious)} 組あります。既存データは自動削除しません。")
             paired = completed[completed["モデル"].isin(["旧AI", "新AI"])]
             paired_ids = paired.groupby(["日付", "レース"])["モデル"].nunique()
             paired_keys = set(paired_ids[paired_ids == 2].index)
