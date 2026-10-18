@@ -269,9 +269,18 @@ def parse_sheet_rows(rows, day_label, sheet_name=""):
             dirt_match_rev = re.search(r"(\d{3,4})\s*(?:m|メートル)?\s*(?:ダート|ダ)(?![ァ-ン])", surface_text, re.I)
             turf_match = re.search(r"(?:芝|ターフ)\s*(\d{3,4})|(\d{3,4})\s*(?:m)?\s*芝", surface_text, re.I)
             dist_match = dirt_match or dirt_match_rev
+            # JRA見出しでは「ダート 良」のように馬場種別と距離が離れたセルに
+            # 配置されることがある。距離を取得できなくても、明示されたダート表記を尊重する。
+            dirt_marker = re.search(r"(?<![ァ-ン一-龥])ダート(?![ァ-ン])|(?<![ァ-ン一-龥])ダ(?=\s|\d{3,4}|$)", surface_text)
+            turf_marker = re.search(r"(?<![ァ-ン一-龥])芝(?=\s|\d{3,4}|$)", surface_text)
             target_distance = int(dist_match.group(1)) if dist_match else None
+            # 距離だけのセルがある場合は取得する（過去走の行は含めない）。
+            if target_distance is None and dirt_marker:
+                distance_candidates = re.findall(r"(?<!\d)(?:1000|1150|1200|1300|1400|1600|1700|1800|1900|2000|2100|2400|2500)(?!\d)", surface_text)
+                if len(set(distance_candidates)) == 1:
+                    target_distance = int(distance_candidates[0])
             current["target_distance"] = target_distance
-            current["is_dirt_race"] = bool(dist_match) and not bool(turf_match and not dist_match)
+            current["is_dirt_race"] = bool(dirt_match or dirt_match_rev or dirt_marker) and not bool(turf_marker and not (dirt_match or dirt_match_rev or dirt_marker))
             current["surface_diagnostic"] = surface_text[:240]
             current["target_going"] = None
             dirt_model(current["horses"], target_distance, None)
