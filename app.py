@@ -856,10 +856,55 @@ with t3:
         if not predictions:
             st.info("保存済みの予想がありません。まず推奨レースを確定保存してください。")
         else:
-            ids = sorted(predictions, reverse=True)
-            st.caption("※ 過去に誤った日付で保存された予想は自動削除しません。GitHub上の既存記録を確認して整理してください。")
+            # 過去の誤保存レコードは残し、結果入力候補だけ安全に整理する。
+            # 月曜などの開催を一律否定しないため、非週末データも明示操作で表示可能。
+            show_all_history = st.checkbox(
+                "過去の重複・日付要確認データも表示する（確認・訂正用）", value=False,
+                key="show_unverified_result_history")
+            def _record_date(k):
+                try:
+                    return datetime.date.fromisoformat(str(predictions[k].get("race_date", ""))[:10])
+                except (ValueError, TypeError):
+                    return None
+            def _identity(k):
+                p = predictions[k]
+                course = re.sub(r"\s+", "", str(p.get("course", "")))
+                try:
+                    no = int(p.get("race_no"))
+                except (TypeError, ValueError):
+                    no = 0
+                return course, no, re.sub(r"\s+", "", str(p.get("race_name", "")))
+            all_ids = sorted(predictions, reverse=True)
+            questionable = set()
+            for k in all_ids:
+                d = _record_date(k)
+                if d is None or d.weekday() >= 5:
+                    continue
+                # 平日開催が実在する場合もあるので、削除せず要確認として扱う。
+                questionable.add(k)
+            grouped = {}
+            for k in all_ids:
+                d = _record_date(k)
+                if d is None:
+                    questionable.add(k)
+                    continue
+                group_key = (d.isoformat(), _identity(k))
+                grouped.setdefault(group_key, []).append(k)
+            for members in grouped.values():
+                if len(members) > 1:
+                    # 結果登録済み、両モデル保存済みを優先。ほかは画面からのみ省く。
+                    priority = lambda k: (k in results, bool(predictions[k].get("models")), str(predictions[k].get("saved_at_utc", "")))
+                    keeper = max(members, key=priority)
+                    questionable.update(k for k in members if k != keeper)
+            ids = all_ids if show_all_history else [k for k in all_ids if k not in questionable]
+            if questionable:
+                st.warning(f"日付要確認・重複候補 {len(questionable)} 件を結果入力候補から一時的に非表示にしています。GitHubの保存記録は削除・変更していません。月曜の正式開催などはチェックを入れて表示してください。")
+            st.caption("※ レースの日付は保存済み予想の値です。誤った日付の履歴は自動修正できません。JRAの開催日と照合してから結果を登録してください。")
+            if not ids:
+                st.info("通常表示の候補がありません。要確認データを表示する場合は上のチェックを入れてください。")
+                st.stop()
             rid = st.selectbox("結果を登録・訂正するレース", ids,
-                format_func=lambda k: predictions[k]["race_name"] + " / " + predictions[k]["race_date"] + (" 【登録済み】" if k in results else " 【未登録】"))
+                format_func=lambda k: predictions[k]["race_name"] + " / " + predictions[k]["race_date"] + (" 【登録済み】" if k in results else " 【未登録】") + (" ⚠日付要確認" if k in questionable else ""))
             pred = predictions[rid]
             old = results.get(rid)
             st.write("保存済み推奨馬番:", {k:v["top4"] for k,v in pred["models"].items()} if "models" in pred else pred["top4"])
