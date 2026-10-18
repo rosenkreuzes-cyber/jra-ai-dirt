@@ -13,6 +13,7 @@ import json
 import base64
 import datetime
 import urllib.parse
+from urllib.error import HTTPError
 from urllib.error import HTTPError, URLError
 
 # 1. ページの設定
@@ -123,6 +124,101 @@ def parse_race_heading(value, sheet_name=""):
     return {"course": course, "race_no": race_no, "race_title": race_title}
 
 
+def parse_dirt_run(raw):
+    """過去走セルを構造化。欠損はNoneのまま保持する。"""
+    t = clean_text(raw).replace("<br>", "\n")
+    m = re.search(r"(\d{3,4})\s*ダ", t)
+    if not m:
+        return None
+    distance = int(m.group(1))
+    time_m = re.search(r"(?<!\d)(\d{1,2}):(\d{2}\.\d)(?!\d)", t)
+    final_m = re.search(r"3F\s*(\d{2}\.\d)", t, re.I)
+    rank_m = re.search(r"(?<!\d)(\d{1,2})着", t)
+    field_m = re.search(r"(?<!\d)(\d{1,2})頭", t)
+    going_m = re.search(r"(?:^|\n)\s*(稍重|不良|良|重)\s*(?:\n|$)", t)
+    # 勝ち馬名(着差) は末尾付近。勝利時は着差の符号を勝ち幅に読み替える。
+    margin_m = re.search(r"[^\n()（）]+[（(]([+-]?\d+\.\d+)[)）]\s*$", t)
+    rank = int(rank_m.group(1)) if rank_m else None
+    field = int(field_m.group(1)) if field_m else None
+    return {
+        "distance": distance,
+        "time": int(time_m.group(1))*60 + float(time_m.group(2)) if time_m else None,
+        "last3f": float(final_m.group(1)) if final_m else None,
+        "margin": float(margin_m.group(1)) if margin_m else None,
+        "going": going_m.group(1) if going_m else None,
+        "rank": rank, "field": field,
+    }
+
+
+def numeric_odds(value):
+    m = re.search(r"(?<!\d)(\d+(?:\.\d+)?)(?!\d)", clean_text(value))
+    return float(m.group(1)) if m else None
+
+
+def robust_scale(values, higher_is_better=False):
+    """同レースの比較可能な標本を中央値/MADで標準化する。"""
+    import numpy as np
+    a = np.array([float(v) for v in values if v is not None and np.isfinite(v)], dtype=float)
+    if len(a) < 3:
+        return None
+    med = float(np.median(a))
+    mad = float(np.median(np.abs(a-med)))
+    spread = max(1.4826*mad, float(np.std(a))*0.5, 0.15)
+    return med, spread, (1 if higher_is_better else -1)
+
+
+def dirt_model(horses, target_distance=None, target_going=None):
+    """単勝・人気・直近順を一切使わないダート専用条件適性スコア。"""
+    import numpy as np
+    all_runs = [r for h in horses for r in h.get("dirt_histories", [])]
+    # 距離の異なる生時計は比較しない。距離帯が近いものだけで基準を構成。
+    def band(d): return int(round(d/200))*200
+    time_refs = {}
+    final_refs = {}
+    for b in set(band(r['distance']) for r in all_runs):
+        similar = [r for r in all_runs if abs(r['distance']-b)<=100]
+        # 生タイムの基準は距離完全一致かつ同じ競馬場・馬場でなければ危険。
+        # 外部標準タイムなしでは time_score は計算不能として除外する。
+        final_refs[b] = robust_scale([r['last3f'] for r in similar])
+    for h in horses:
+        runs = h.get('dirt_histories', [])
+        components = {k: [] for k in ('time','last3f','margin','distance','going')}
+        for r in runs:
+            distance = r['distance']
+            # 距離適性は近い距離での着差と着順で裏付ける（近いだけで高得点にしない）
+            if target_distance:
+                closeness = max(0., 1.-abs(distance-target_distance)/800.)
+                if r['rank'] is not None and r['field'] and r['field']>1:
+                    finish = (r['field']-r['rank'])/(r['field']-1)
+                    components['distance'].append(100*(0.5*closeness+0.5*finish)*closeness)
+            if r['last3f'] is not None:
+                ref = final_refs.get(band(distance))
+                if ref:
+                    med, spread, sign = ref
+                    components['last3f'].append(float(np.clip(50 + 16*sign*(r['last3f']-med)/spread, 0,100)))
+            if r['margin'] is not None:
+                margin = -r['margin'] if r['rank']==1 else r['margin']
+                components['margin'].append(float(np.clip(75 - 17*margin,0,100)))
+            if target_going and r['going']:
+                levels = {'良':0,'稍重':1,'重':2,'不良':3}
+                if r['going'] in levels and target_going in levels:
+                    closeness = 1-abs(levels[r['going']]-levels[target_going])/3
+                    if r['rank'] and r['field'] and r['field']>1:
+                        finish = (r['field']-r['rank'])/(r['field']-1)
+                        components['going'].append(100*closeness*finish)
+        # 走破タイムは競馬場・距離・馬場別の基準時計がないため捏造しない。
+        weights = {'time':.25,'last3f':.20,'margin':.20,'distance':.20,'going':.15}
+        values = {k: (round(float(np.mean(v)),2) if v else None) for k,v in components.items()}
+        present = [k for k,v in values.items() if v is not None]
+        weight_sum = sum(weights[k] for k in present)
+        score = sum(weights[k]*values[k] for k in present)/weight_sum if weight_sum else None
+        # 欠損が多い馬を根拠なく上位にしない（得点ではなく信頼度を別表示）。
+        h.update({f'{k}_score': values[k] for k in weights})
+        h['ai_score'] = round(score,2) if score is not None else None
+        h['evidence_coverage'] = round(100*weight_sum,1)
+    return horses
+
+
 def parse_sheet_rows(rows, day_label, sheet_name=""):
     races = []
     current = None
@@ -136,14 +232,21 @@ def parse_sheet_rows(rows, day_label, sheet_name=""):
             name = f"{course} {number}R" if course else f"開催場不明 {number}R"
             if current["race_title"]:
                 name += f" {current['race_title']}"
-            # 単勝列に入力されたオッズから人気順位を算出（同倍率は同順位）。
-            available = [h["odds"] for h in current["horses"] if pd.notna(h["odds"])]
-            for horse in current["horses"]:
-                if pd.notna(horse["odds"]):
-                    horse["pop_rank"] = 1 + sum(v < horse["odds"] for v in available)
             current["race_name"] = name
             current["identified"] = bool(course and number)
             current["day_label"] = day_label
+            # 当該レースの距離・馬場は見出しから取れる場合のみ利用する。
+            heading = current.get("heading_raw", "")
+            dist_match = re.search(r"(\d{3,4})\s*ダ", heading)
+            target_distance = int(dist_match.group(1)) if dist_match else None
+            current["target_distance"] = target_distance
+            current["target_going"] = None
+            dirt_model(current["horses"], target_distance, None)
+            # 入力されている単勝だけから人気を推定しない。全頭揃う場合のみ順位算出。
+            odds_list = [h.get("odds") for h in current["horses"]]
+            if odds_list and all(x is not None for x in odds_list):
+                for h in current["horses"]:
+                    h["pop_rank"] = 1 + sum(x < h["odds"] for x in odds_list)
             races.append(current)
         current = None
 
@@ -157,15 +260,15 @@ def parse_sheet_rows(rows, day_label, sheet_name=""):
             heading = parse_race_heading(first, sheet_name)
             if heading:
                 finish()
-                current = {**heading, "horses": []}
+                current = {**heading, "horses": [], "heading_raw": first}
                 columns = None
                 continue
         if any("馬番" in c for c in cells) and any("馬名" in c for c in cells):
             columns = {
                 "horse": next(i for i, c in enumerate(cells) if "馬番" in c),
                 "name": next(i for i, c in enumerate(cells) if "馬名" in c),
-                "odds": next((i for i, c in enumerate(cells) if c == "単勝" or c.startswith("単勝オッズ")), None),
                 "previous": [i for i, c in enumerate(cells) if re.search(r"前走|前々走|[34]走前", c)],
+                "odds": next((i for i,c in enumerate(cells) if c == "単勝" or c.startswith("単勝オッズ")), None),
             }
             continue
         if current is None or columns is None:
@@ -184,18 +287,9 @@ def parse_sheet_rows(rows, day_label, sheet_name=""):
         if not name:
             continue
         odds_match = ODDS_PATTERN.search(field)
-        odds = np.nan
-        odds_col = columns.get("odds")
-        if odds_col is not None and odds_col < len(cells):
-            raw_odds = cells[odds_col].replace(",", "").replace("倍", "").strip()
-            match = re.search(r"(?<!\d)(\d+(?:\.\d+)?)(?!\d)", raw_odds)
-            if match:
-                parsed_odds = float(match.group(1))
-                if parsed_odds > 0:
-                    odds = parsed_odds
-        if pd.isna(odds) and odds_match:
-            odds = float(odds_match.group(1))
-        popularity = np.nan  # 単勝オッズからレース単位で算出
+        odds_idx = columns.get("odds")
+        odds = numeric_odds(cells[odds_idx]) if odds_idx is not None and odds_idx < len(cells) else (float(odds_match.group(1)) if odds_match else None)
+        popularity = int(odds_match.group(2)) if odds_match else None
         histories = [cells[i] for i in previous_indices if i < len(cells) and cells[i]]
         valid_histories = [h for h in histories if re.search(r"20\d{2}年\d{1,2}月\d{1,2}日", h)]
         previous = valid_histories[0] if valid_histories else ""
@@ -221,13 +315,14 @@ def parse_sheet_rows(rows, day_label, sheet_name=""):
         dirt_score = sum(dirt_results) / len(dirt_results) if dirt_results else None
         current["horses"].append({
             "horse_no": horse_no, "name": name,
-            "pop_rank": popularity, "odds": odds, "odds_source": "Google Driveシート" if pd.notna(odds) else "未入力",
+            "pop_rank": popularity, "odds": odds,
             "time_index": time_score, "last3f_index": last3f_score,
             "track_aptitude": 75.0,
             "history_count": len(valid_histories),
             "dirt_runs": dirt_runs,
             "relative_score": relative_score,
             "dirt_score": dirt_score,
+            "dirt_histories": [r for r in (parse_dirt_run(h) for h in valid_histories) if r],
         })
     finish()
     return races
@@ -323,102 +418,11 @@ with st.sidebar.expander("📂 Excelファイルから読み込む（代替）")
             except Exception as exc:
                 st.error(f"{day}: ファイル解析エラー: {exc}")
 
-# 最新単勝オッズ: CSVアップロード、または任意の公開HTTPS CSVから取得する。
-# CSV列: day,course,race_no,horse_no,odds（pop_rankは任意）
-# dayは「土曜日開催」「日曜日開催」または sat/sun。
-ODDS_COLUMNS = {"day", "course", "race_no", "horse_no", "odds"}
-
-
-def parse_odds_csv(content):
-    frame = None
-    for encoding in ("utf-8-sig", "cp932"):
-        try:
-            frame = pd.read_csv(io.BytesIO(content), encoding=encoding, dtype={"day": str, "course": str})
-            break
-        except UnicodeDecodeError:
-            continue
-    if frame is None:
-        raise ValueError("CSVの文字コードが認識できません（UTF-8/Shift-JIS対応）")
-    frame.columns = [str(c).strip().lower() for c in frame.columns]
-    missing = ODDS_COLUMNS - set(frame.columns)
-    if missing:
-        raise ValueError("CSVに必要な列がありません: " + ", ".join(sorted(missing)))
-    if frame.empty:
-        raise ValueError("CSVにオッズデータがありません")
-    frame["day"] = frame["day"].astype(str).str.strip().replace({
-        "sat": "土曜日開催", "sun": "日曜日開催", "土曜": "土曜日開催", "日曜": "日曜日開催"})
-    frame["course"] = frame["course"].astype(str).str.strip()
-    for col in ("race_no", "horse_no", "odds"):
-        frame[col] = pd.to_numeric(frame[col], errors="coerce")
-    if "pop_rank" in frame:
-        frame["pop_rank"] = pd.to_numeric(frame["pop_rank"], errors="coerce")
-    if frame[["race_no", "horse_no", "odds"]].isna().any().any() or (frame["odds"] <= 0).any():
-        raise ValueError("レース番号・馬番・単勝オッズに欠損または不正値があります")
-    if (~frame["day"].isin(["土曜日開催", "日曜日開催"])).any():
-        raise ValueError("day列は土曜日開催/日曜日開催（またはsat/sun）を指定してください")
-    if (~frame["race_no"].between(1, 12)).any() or (~frame["horse_no"].between(1, 18)).any():
-        raise ValueError("レース番号または馬番が範囲外です")
-    keys = ["day", "course", "race_no", "horse_no"]
-    if frame.duplicated(keys).any():
-        raise ValueError("同じ開催日区分・競馬場・レース・馬番がCSV内で重複しています")
-    return frame
-
-
-def apply_odds(races, frame, source_label):
-    # 入力にない馬のExcelオッズを「最新」と誤認しないよう、該当レースは未取得にする。
-    updated_races, updated_horses = 0, 0
-    for race in races:
-        matches = frame[(frame["day"] == race["day_label"]) &
-                        (frame["course"] == race["course"]) &
-                        (frame["race_no"] == race["race_no"])]
-        if matches.empty:
-            continue
-        updated_races += 1
-        by_no = {int(row["horse_no"]): row for _, row in matches.iterrows()}
-        odds_by_horse = {}
-        for horse in race["horses"]:
-            number = horse["horse_no"]
-            horse["odds"] = np.nan
-            horse["pop_rank"] = np.nan
-            horse["odds_source"] = "未取得（最新CSVに該当馬なし）"
-            if number in by_no:
-                row = by_no[number]
-                horse["odds"] = float(row["odds"])
-                horse["odds_source"] = source_label
-                odds_by_horse[number] = float(row["odds"])
-                if "pop_rank" in frame and pd.notna(row.get("pop_rank")):
-                    horse["pop_rank"] = int(row["pop_rank"])
-                updated_horses += 1
-        # 人気順位の指定がなければ単勝オッズから同率順位で算出。
-        sorted_odds = sorted(set(odds_by_horse.values()))
-        rank_map = {v: 1 + sum(1 for x in odds_by_horse.values() if x < v) for v in sorted_odds}
-        for horse in race["horses"]:
-            if pd.isna(horse["pop_rank"]) and horse["horse_no"] in odds_by_horse:
-                horse["pop_rank"] = rank_map[odds_by_horse[horse["horse_no"]]]
-    return updated_races, updated_horses
-
-
-st.sidebar.divider()
-st.sidebar.header("📈 単勝オッズ")
-st.sidebar.caption("Google Driveの『単勝』列を読み込み、入力済みの馬だけ表示します。人気順位は同じレースの単勝オッズから算出します。AI指数には影響しません。")
-filled = sum(pd.notna(h["odds"]) for r in all_loaded_races for h in r["horses"])
-st.sidebar.info(f"Google Drive・アップロードExcelの単勝オッズ: {filled}頭分を読み込み")
-st.sidebar.caption("最新値を表示するには、シート更新後に上の『Google Driveから最新データを再取得』を押してください。")
-
-
 def calculate_ai_indices(horses_data):
     df = pd.DataFrame(horses_data)
-    # ダート戦なのでダート着順の相対成績を優先。芝のみの馬は不確実性を反映。
-    base = pd.to_numeric(df["relative_score"], errors="coerce")
-    dirt = pd.to_numeric(df["dirt_score"], errors="coerce")
-    runs = pd.to_numeric(df["history_count"], errors="coerce").fillna(0)
-    dirt_runs = pd.to_numeric(df["dirt_runs"], errors="coerce").fillna(0)
-    df["ai_score"] = (0.35 * base + 0.65 * dirt.fillna(base) -
-                      (dirt_runs.eq(0) * 15) -
-                      (runs.lt(2) * 8)).where(base.notna())
+    df["ai_score"] = pd.to_numeric(df["ai_score"], errors="coerce")
     df = df.sort_values(["ai_score", "horse_no"], ascending=[False, True], na_position="last").reset_index(drop=True)
-    df["idx_rank"] = range(1, len(df) + 1)
-    # 人気順位との差は参考表示のみ。AI指数・推奨4頭の選定には使わない。
+    df["idx_rank"] = range(1, len(df)+1)
     df["divergence"] = pd.to_numeric(df["pop_rank"], errors="coerce") - df["idx_rank"]
     return df
 
@@ -464,7 +468,117 @@ def screen_race(race, min_coverage, min_gap, min_confidence, min_top_history, mi
 
 
 # --- GitHub Private repository persistence ---
-APP_VERSION = "hit-priority-1.2-odds-display-only"
+APP_VERSION = "dual-model-3.0"
+
+# 旧モデルは既存appの計算式を固定して再現。オッズ・人気は不使用。
+def score_old_model(horses):
+    data = []
+    for horse in horses:
+        h = dict(horse)
+        relative = h.get("relative_score")
+        dirt = h.get("dirt_score")
+        if relative is None:
+            h["ai_score"] = None
+        else:
+            penalty = (15 if h.get("dirt_runs", 0) == 0 else 0) + (8 if h.get("history_count", 0) < 2 else 0)
+            h["ai_score"] = .35 * relative + .65 * (dirt if dirt is not None else relative) - penalty
+        data.append(h)
+    return calculate_ai_indices(data)
+
+
+def score_new_model(horses, race):
+    import copy
+    cloned = copy.deepcopy(horses)
+    dirt_model(cloned, race.get("target_distance"), race.get("target_going"))
+    return calculate_ai_indices(cloned)
+
+
+def model_frames(race):
+    return {"旧AI": score_old_model(race["horses"]), "新AI": score_new_model(race["horses"], race)}
+
+
+def choose_dual(day):
+    selected, excluded = [], []
+    for race in [r for r in all_loaded_races if r["day_label"] == day]:
+        frames = model_frames(race)
+        evaluations = {}
+        for label, frame in frames.items():
+            # screen_race は新モデルを再計算するため、モデルごとのデータを直接渡す
+            metrics, reason, _ = screen_scored_race(race, frame)
+            evaluations[label] = {"metrics": metrics, "reason": reason, "df": frame}
+        if any(x["metrics"] is not None for x in evaluations.values()):
+            selected.append((race, evaluations))
+        else:
+            excluded.append((race["race_name"], "旧AI: " + str(evaluations["旧AI"]["reason"]) + " / 新AI: " + str(evaluations["新AI"]["reason"])))
+    # 両モデルを同じ対象レースで比較できるよう、新AI優先・旧AI代替で並べる
+    def priority(item):
+        ev = item[1]
+        return max((v["metrics"]["score"] for v in ev.values() if v["metrics"]), default=-1)
+    selected.sort(key=priority, reverse=True)
+    for race, _ in selected[max_recommendations:]:
+        excluded.append((race["race_name"], "表示上限超過"))
+    return selected[:max_recommendations], excluded
+
+
+def screen_scored_race(race, df):
+    if not race.get("identified", True):
+        return None, "レース識別不可", df
+    if re.search(r"新馬|メイクデビュー", race.get("race_title", "")):
+        return None, "新馬戦", df
+    if len(df) < 6:
+        return None, "出走馬6頭未満", df
+    coverage = float(df["history_count"].gt(0).mean() * 100)
+    dirt_coverage = float(df["dirt_runs"].gt(0).mean() * 100)
+    if coverage < min_coverage:
+        return None, f"過去走保有率不足 ({coverage:.0f}%)", df
+    if df["ai_score"].notna().sum() < 5:
+        return None, "指数算出可能馬が5頭未満", df
+    top = df.head(4)
+    if top["history_count"].lt(min_top_history).any():
+        return None, "上位4頭の過去走数不足", df
+    top_dirt = int(top["dirt_runs"].gt(0).sum())
+    if top_dirt < min_top_dirt:
+        return None, "上位4頭のダート経験不足", df
+    gap = float(df.iloc[3]["ai_score"] - df.iloc[4]["ai_score"])
+    if gap < min_gap:
+        return None, f"指数差不足 ({gap:.1f})", df
+    avg_runs = float(top["history_count"].mean())
+    quality = min(100., .25 * coverage + .20 * dirt_coverage +
+                  .20 * min(100., avg_runs / 4 * 100) +
+                  .15 * (top_dirt / 4 * 100) +
+                  .20 * min(100., gap / 12 * 100))
+    if quality < min_confidence:
+        return None, f"評価点不足 ({quality:.0f})", df
+    return {"score": round(quality), "gap": round(gap, 1), "coverage": round(coverage),
+            "dirt_coverage": round(dirt_coverage), "top_dirt": top_dirt,
+            "top_avg_runs": round(avg_runs, 1)}, None, df
+
+
+def dual_snapshot(date, race, evaluations, settings):
+    models = {}
+    for label, ev in evaluations.items():
+        df = ev["df"]
+        top = [int(x) for x in df.head(4)["horse_no"]] if df["ai_score"].notna().sum() >= 4 else []
+        models[label] = {"top4": top, "eligible": ev["metrics"] is not None,
+                         "metrics": ev["metrics"], "reason": ev["reason"],
+                         "scores": [{"horse_no": int(r["horse_no"]), "ai_score": float(r["ai_score"]) if pd.notna(r["ai_score"]) else None}
+                                    for _, r in df.iterrows()]}
+    primary = models["新AI"] if models["新AI"]["top4"] else models["旧AI"]
+    return {"race_id": race_key(date, race), "race_date": date.isoformat(),
+            "day_label": race["day_label"], "course": race["course"],
+            "race_no": int(race["race_no"]), "race_name": race["race_name"],
+            "saved_at_utc": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+            "model_version": APP_VERSION, "settings": settings,
+            "models": models, "top4": primary["top4"], "metrics": primary["metrics"] or {"score":0,"gap":0},
+            "bet_unit": int(bet_unit)}
+
+
+def model_outcome(pred, result, label):
+    model = pred.get("models", {}).get(label)
+    if not model or not model.get("eligible") or len(model.get("top4", [])) != 4:
+        return None
+    return outcome({"top4": model["top4"], "bet_unit": pred["bet_unit"]}, result)
+
 
 def github_config():
     token = st.secrets.get("GITHUB_TOKEN", "")
@@ -551,6 +665,8 @@ def snapshot(date, race, metrics, df, settings):
     for row in df.to_dict("records"):
         clean = {}
         for k, v in row.items():
+            if k == "dirt_histories":
+                continue
             if isinstance(v, (np.integer,)):
                 v = int(v)
             elif isinstance(v, (np.floating,)):
@@ -565,7 +681,6 @@ def snapshot(date, race, metrics, df, settings):
         "race_no": int(race["race_no"]), "race_name": race["race_name"],
         "saved_at_utc": datetime.datetime.now(datetime.timezone.utc).isoformat(),
         "model_version": APP_VERSION, "settings": settings, "metrics": metrics,
-        "odds_source": odds_source_label, "odds_loaded_at_jst": odds_updated_at.isoformat() if odds_updated_at else None,
         "top4": top, "bets": [list(c) for c in itertools.combinations(sorted(top), 3)],
         "bet_unit": int(bet_unit), "horses": horses,
     }
@@ -616,49 +731,50 @@ sat_date = st.sidebar.date_input("土曜日の開催日", value=datetime.date.to
 sun_date = st.sidebar.date_input("日曜日の開催日", value=datetime.date.today() + datetime.timedelta(days=1), key="sun_date")
 
 
-def choose_races(day):
-    selected, excluded = [], []
-    for race in [r for r in all_loaded_races if r["day_label"] == day]:
-        metrics, reason, df = screen_race(race, min_coverage, min_gap, min_confidence, min_top_history, min_top_dirt)
-        if metrics is None:
-            excluded.append((race["race_name"], reason))
-        else:
-            selected.append((race, metrics, df))
-    selected.sort(key=lambda x: (x[1]["score"], x[1]["gap"]), reverse=True)
-    for r, m, _ in selected[max_recommendations:]:
-        excluded.append((r["race_name"], "上限超過"))
-    return selected[:max_recommendations], excluded
-
-
 def render_races(day, date):
-    selected, excluded = choose_races(day)
-    st.info(f"推奨 {len(selected)} レース・除外 {len(excluded)} レース")
+    selected, excluded = choose_dual(day)
+    st.info(f"比較対象 {len(selected)} レース・除外 {len(excluded)} レース")
     with st.expander("除外レースと理由"):
         for name, reason in excluded:
             st.write(name, "：", reason)
     if not selected:
-        st.warning("推奨レースはありません。")
+        st.warning("推奨対象レースはありません。")
         return
-    for race, metrics, df in selected:
-        top = [int(x) for x in df.head(4)["horse_no"]]
-        st.subheader(f"🏇 {race['race_name']}　評価 {metrics['score']}点")
-        st.write("推奨4頭:", "・".join(map(str, top)), "／ 4位-5位指数差:", metrics["gap"])
-        sources = sorted(set(str(h.get("odds_source", "未取得")) for h in race["horses"]))
-        st.caption("単勝オッズ: " + " / ".join(sources) + " ｜ オッズ・人気は参考表示のみ（AI指数には不使用）")
-        with st.expander("買い目・全馬指数"):
-            st.dataframe(pd.DataFrame([{"3連複": "-".join(map(str, x)), "金額": bet_unit} for x in itertools.combinations(sorted(top), 3)]), hide_index=True)
-            st.dataframe(df, hide_index=True)
-        if st.button("💾 このレースの予想を確定保存", key="save_" + race_key(date, race)):
-            rec = snapshot(date, race, metrics, df, settings)
+    for race, evaluations in selected:
+        st.subheader("🏇 " + race["race_name"])
+        a, b = st.columns(2)
+        for col, label in ((a, "旧AI"), (b, "新AI")):
+            ev = evaluations[label]
+            df = ev["df"]
+            top = [int(x) for x in df.head(4)["horse_no"]]
+            with col:
+                st.markdown("**" + label + "**")
+                st.write("推奨4頭：", "・".join(map(str, top)))
+                st.caption("選考通過" if ev["metrics"] else "選考対象外：" + str(ev["reason"]))
+                st.write("4位と5位の指数差：", round(float(df.iloc[3]["ai_score"] - df.iloc[4]["ai_score"]), 2) if len(df)>4 and df["ai_score"].notna().sum()>4 else "—")
+        old_top = set(evaluations["旧AI"]["df"].head(4)["horse_no"])
+        new_top = set(evaluations["新AI"]["df"].head(4)["horse_no"])
+        st.caption(f"両モデルの一致馬：{len(old_top & new_top)}頭　／　比較は同一レースの全出走馬を使用")
+        with st.expander("両モデルの全馬指数・買い目"):
+            for label, ev in evaluations.items():
+                df = ev["df"]
+                st.markdown("**" + label + "**")
+                top = sorted(int(x) for x in df.head(4)["horse_no"])
+                st.write("3連複4点：", " ／ ".join("-".join(map(str, x)) for x in itertools.combinations(top, 3)))
+                cols = [c for c in ["horse_no", "name", "odds", "pop_rank", "ai_score", "relative_score", "dirt_score", "time_score", "last3f_score", "margin_score", "distance_score", "going_score", "evidence_coverage", "idx_rank"] if c in df.columns]
+                st.dataframe(df[cols], hide_index=True, use_container_width=True)
+            st.caption("単勝・人気は表示専用。新AIの走破タイムは基準時計未整備のため未採点、当日馬場不明時は馬場適性も未採点。")
+        if st.button("💾 旧AI・新AIの予想を同時に確定保存", key="save_" + race_key(date, race)):
+            rec = dual_snapshot(date, race, evaluations, settings)
             path = f"predictions/{date.year}/{rec['race_id']}.json"
             try:
                 if put_record(path, rec):
-                    st.success("保存しました。予想は固定され、再保存しても上書きされません。")
+                    st.success("両モデルの予想を同時保存しました。再保存では上書きしません。")
                 else:
-                    st.warning("このレースの予想は保存済みです。上書きしていません。")
+                    st.warning("このレースは保存済みです。既存の予想を上書きしません。")
             except Exception as e:
                 st.error("保存失敗: " + str(e))
-                st.download_button("バックアップJSONを保存", json.dumps(rec, ensure_ascii=False, indent=2), file_name=rec["race_id"]+".json", key="backup_"+rec["race_id"])
+                st.download_button("バックアップJSON", json.dumps(rec, ensure_ascii=False, indent=2), file_name=rec["race_id"]+".json")
         st.divider()
 
 
@@ -684,7 +800,7 @@ with t3:
                 format_func=lambda k: predictions[k]["race_name"] + " / " + predictions[k]["race_date"] + (" 【登録済み】" if k in results else " 【未登録】"))
             pred = predictions[rid]
             old = results.get(rid)
-            st.write("保存済み推奨馬番:", pred["top4"])
+            st.write("保存済み推奨馬番:", {k:v["top4"] for k,v in pred["models"].items()} if "models" in pred else pred["top4"])
             if old:
                 st.info("登録済みの結果を表示しています。訂正して保存できます。予想履歴は変更しません。")
             initial = [int(x) for x in old["top3"]] if old else [1, 2, 3]
@@ -741,13 +857,21 @@ with t4:
         records = []
         for rid, pred in predictions.items():
             result = results.get(rid)
-            hit, stake, received = outcome(pred, result) if result else (None, None, None)
-            records.append({"日付": pred["race_date"], "レース": pred["race_name"],
-                "推奨4頭": ",".join(map(str, pred["top4"])), "評価点": pred["metrics"]["score"],
-                "状態": "未登録" if result is None else ("的中" if hit else "不的中"),
-                "投資額": stake, "払戻額": received,
-                "損益": (received-stake) if result else None,
-                "指数差": pred["metrics"]["gap"], "モデル": pred["model_version"]})
+            model_items = pred.get("models")
+            if model_items is None:
+                model_items = {"旧AI（過去保存）": {"top4": pred["top4"], "eligible": True,
+                                              "metrics": pred.get("metrics", {})}}
+            for label, model in model_items.items():
+                if not model.get("eligible") or len(model.get("top4", [])) != 4:
+                    continue
+                hit, stake, received = outcome({"top4": model["top4"], "bet_unit": pred["bet_unit"]}, result) if result else (None, None, None)
+                metrics = model.get("metrics") or {}
+                records.append({"日付": pred["race_date"], "レース": pred["race_name"],
+                    "推奨4頭": ",".join(map(str, model["top4"])), "評価点": metrics.get("score"),
+                    "状態": "未登録" if result is None else ("的中" if hit else "不的中"),
+                    "投資額": stake, "払戻額": received,
+                    "損益": (received-stake) if result else None,
+                    "指数差": metrics.get("gap"), "モデル": label})
         df_hist = pd.DataFrame(records)
         if df_hist.empty:
             st.info("まだ履歴がありません。")
@@ -762,6 +886,18 @@ with t4:
             c2.metric("的中率", f"{hits/n*100:.1f}%" if n else "—")
             c3.metric("回収率", f"{paid/invested*100:.1f}%" if invested else "—")
             c4.metric("累計損益", f"{paid-invested:+,}円")
+            st.markdown("### モデル別成績")
+            comparisons = []
+            for label, group in completed.groupby("モデル"):
+                invested_m = int(group["投資額"].sum())
+                paid_m = int(group["払戻額"].sum())
+                comparisons.append({"モデル": label, "結果登録": len(group),
+                    "的中率": f"{(group['状態']=='的中').mean()*100:.1f}%",
+                    "回収率": f"{paid_m/invested_m*100:.1f}%" if invested_m else "—",
+                    "損益": paid_m-invested_m})
+            if comparisons:
+                st.dataframe(pd.DataFrame(comparisons), hide_index=True, use_container_width=True)
+            st.caption("厳密な新旧比較には、両モデルが選考通過し、結果登録済みの共通レースだけを比較してください。")
             # 的中レースを緑、不的中を薄い赤、未登録を淡いグレーで区別。
             # データそのものは変更せず、表示時のみスタイルを適用する。
             def color_result_row(row):
