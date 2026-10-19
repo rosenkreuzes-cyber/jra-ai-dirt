@@ -39,7 +39,7 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-st.title("🏇 JRA 黄金パターン AI ダッシュボード [修正版]")
+st.title("🏇 JRA 黄金パターン AI ダッシュボード [入着ハイライト版]")
 
 # --- サイドバー ---
 with st.sidebar:
@@ -468,7 +468,7 @@ def calculate_ai_indices(horses_data):
 
 
 # --- GitHub Private repository persistence ---
-APP_VERSION = "dual-model-3.6-fixed-syntax"
+APP_VERSION = "dual-model-3.7-highlight-placed"
 
 def score_old_model(horses):
     data = []
@@ -719,6 +719,13 @@ sun_date = st.sidebar.date_input("日曜日の開催日", value=sat_date + datet
 def render_races(day, date):
     selected, excluded = choose_dual(day)
     st.info(f"推奨候補 {len(selected)} レース・除外 {len(excluded)} レース")
+    
+    # 登録済みの結果データをあらかじめロードしておく
+    try:
+        _, results_dict = read_all_history()
+    except:
+        results_dict = {}
+
     with st.expander("除外レースと理由"):
         for name, reason in excluded:
             st.write(name, "：", reason)
@@ -727,6 +734,12 @@ def render_races(day, date):
         return
     for race, evaluations in selected:
         st.subheader("🏇 " + race["race_name"])
+        
+        # 該当レースの確定結果（入着馬）があるか確認
+        r_key = race_key(date, race)
+        res_data = results_dict.get(r_key)
+        placed_set = set(int(x) for x in res_data["top3"]) if res_data and res_data.get("top3") else set()
+
         a, b = st.columns(2)
         for col, label in ((a, "旧AI"), (b, "新AI")):
             ev = evaluations[label]
@@ -734,8 +747,19 @@ def render_races(day, date):
             top = [int(x) for x in df.head(4)["horse_no"]]
             with col:
                 st.markdown("**" + label + "**")
-                st.write("推奨4頭：", "・".join(map(str, top)) if ev["metrics"] else "対象外（参考順位：" + "・".join(map(str, top)) + "）")
+                
+                # 入着した推奨馬を緑色で太文字ハイライトするHTML生成
+                formatted_top = []
+                for num in top:
+                    if num in placed_set:
+                        formatted_top.append(f"<span style='color: #2e7d32; font-weight: bold; font-size: 1.05rem;'>{num}番(入着)</span>")
+                    else:
+                        formatted_top.append(f"{num}番")
+                
+                rec_str = " ・ ".join(formatted_top) if ev["metrics"] else "対象外（参考：" + "・".join(map(str, top)) + "）"
+                st.markdown(f"推奨4頭： {rec_str}", unsafe_allow_html=True)
                 st.caption("選考通過" if ev["metrics"] else "選考対象外：" + str(ev["reason"]))
+
         with st.expander("両モデルの全馬指数・買い目"):
             for label, ev in evaluations.items():
                 df = ev["df"]
