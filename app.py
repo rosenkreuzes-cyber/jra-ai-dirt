@@ -39,7 +39,7 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-st.title("🏇 JRA 黄金パターン AI ダッシュボード [入着ハイライト版]")
+st.title("🏇 JRA 黄金パターン AI ダッシュボード [ガード強化版]")
 
 # --- サイドバー ---
 with st.sidebar:
@@ -223,19 +223,27 @@ def dirt_model(horses, target_distance=None, target_going=None):
                 finish = (r["field"]-r["rank"])/(r["field"]-1)
                 components["distance"].append(100*(.5*closeness+.5*finish)*closeness)
 
-        weights = {"time":.20, "distance":.20, "last3f":.15, "pace":.15, "rank_score":.20, "gate_bias":.10}
-        values = {k: round(float(np.mean(v)),2) if v else None for k,v in components.items()}
-        present = [k for k,v in values.items() if v is not None]
-        total = sum(weights[k] for k in present)
-        score = sum(weights[k]*values[k] for k in present)/total if total else None
-        
-        if score is not None:
-            h["ai_score"] = round(score, 2)
-        else:
+        # 【追加ガード】タイムまたは上り3Fのデータが両方とも無い場合は実力裏付けなしとして対象外(None)にする
+        has_time = bool(components["time"])
+        has_last3f = bool(components["last3f"])
+
+        if not has_time or not has_last3f:
             h["ai_score"] = None
+        else:
+            weights = {"time":.20, "distance":.20, "last3f":.15, "pace":.15, "rank_score":.20, "gate_bias":.10}
+            values = {k: round(float(np.mean(v)),2) if v else None for k,v in components.items()}
+            present = [k for k,v in values.items() if v is not None]
+            total = sum(weights[k] for k in present)
+            score = sum(weights[k]*values[k] for k in present)/total if total else None
             
-        h.update({f"{k}_score":values[k] for k in weights})
-        h["evidence_coverage"] = round(100*total,1)
+            if score is not None:
+                h["ai_score"] = round(score, 2)
+            else:
+                h["ai_score"] = None
+            
+            h.update({f"{k}_score":values[k] for k in weights})
+            h["evidence_coverage"] = round(100*total,1)
+            
     return horses
 
 
@@ -468,7 +476,7 @@ def calculate_ai_indices(horses_data):
 
 
 # --- GitHub Private repository persistence ---
-APP_VERSION = "dual-model-3.7-highlight-placed"
+APP_VERSION = "dual-model-3.8-missing-data-guard"
 
 def score_old_model(horses):
     data = []
@@ -720,7 +728,6 @@ def render_races(day, date):
     selected, excluded = choose_dual(day)
     st.info(f"推奨候補 {len(selected)} レース・除外 {len(excluded)} レース")
     
-    # 登録済みの結果データをあらかじめロードしておく
     try:
         _, results_dict = read_all_history()
     except:
@@ -735,7 +742,6 @@ def render_races(day, date):
     for race, evaluations in selected:
         st.subheader("🏇 " + race["race_name"])
         
-        # 該当レースの確定結果（入着馬）があるか確認
         r_key = race_key(date, race)
         res_data = results_dict.get(r_key)
         placed_set = set(int(x) for x in res_data["top3"]) if res_data and res_data.get("top3") else set()
@@ -748,7 +754,6 @@ def render_races(day, date):
             with col:
                 st.markdown("**" + label + "**")
                 
-                # 入着した推奨馬を緑色で太文字ハイライトするHTML生成
                 formatted_top = []
                 for num in top:
                     if num in placed_set:
@@ -849,7 +854,7 @@ with t4:
                 if len(model.get("top4", [])) != 4:
                     continue
                 hit, stake, received = outcome({"top4": model["top4"], "bet_unit": pred.get("bet_unit", 100)}, result) if result and model.get("eligible",True) else (None, None, None)
-                metrics = model.get("metrics") or {}
+                metrics = model.get("metrics"] or {}
                 records.append({"日付": pred["race_date"], "レース": pred["race_name"],
                     "推奨4頭": ",".join(map(str, model["top4"])),
                     "状態": "対象外" if not model.get("eligible",True) else ("未登録" if result is None else ("的中" if hit else "不的中")),
