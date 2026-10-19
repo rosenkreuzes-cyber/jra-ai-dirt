@@ -39,7 +39,7 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-st.title("🏇 JRA 黄金パターン AI ダッシュボード [ガード強化版]")
+st.title("🏇 JRA 黄金パターン AI ダッシュボード [修正完了版]")
 
 # --- サイドバー ---
 with st.sidebar:
@@ -223,7 +223,6 @@ def dirt_model(horses, target_distance=None, target_going=None):
                 finish = (r["field"]-r["rank"])/(r["field"]-1)
                 components["distance"].append(100*(.5*closeness+.5*finish)*closeness)
 
-        # 【追加ガード】タイムまたは上り3Fのデータが両方とも無い場合は実力裏付けなしとして対象外(None)にする
         has_time = bool(components["time"])
         has_last3f = bool(components["last3f"])
 
@@ -476,7 +475,7 @@ def calculate_ai_indices(horses_data):
 
 
 # --- GitHub Private repository persistence ---
-APP_VERSION = "dual-model-3.8-missing-data-guard"
+APP_VERSION = "dual-model-3.9-syntax-fixed"
 
 def score_old_model(horses):
     data = []
@@ -854,7 +853,7 @@ with t4:
                 if len(model.get("top4", [])) != 4:
                     continue
                 hit, stake, received = outcome({"top4": model["top4"], "bet_unit": pred.get("bet_unit", 100)}, result) if result and model.get("eligible",True) else (None, None, None)
-                metrics = model.get("metrics"] or {}
+                metrics = model.get("metrics") or {}
                 records.append({"日付": pred["race_date"], "レース": pred["race_name"],
                     "推奨4頭": ",".join(map(str, model["top4"])),
                     "状態": "対象外" if not model.get("eligible",True) else ("未登録" if result is None else ("的中" if hit else "不的中")),
