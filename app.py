@@ -13,7 +13,6 @@ import json
 import base64
 import datetime
 import urllib.parse
-from urllib.error import HTTPError
 from urllib.error import HTTPError, URLError
 
 # 1. ページの設定
@@ -138,7 +137,6 @@ def parse_dirt_run(raw):
     rank = int(rank_m.group(1)) if rank_m else None
     field = int(field_m.group(1)) if field_m else None
     
-    # 【追加】4コーナーの通過順位（例: 4角3番手など）を検出
     corner_pos = None
     corner_m = re.search(r"([1-9]\d*)[角コーナー]", t)
     if corner_m:
@@ -176,7 +174,7 @@ GOING_SEC_PER_1000M = {"良": 0.0, "稍重": -0.35, "重": -0.70, "不良": -0.9
 
 
 def dirt_model(horses, target_distance=None, target_going=None):
-    """Five-component dirt index + Pace (Front-runner) & Jockey Weight Bonus."""
+    """Updated dirt index with custom weights (Time 25%, Distance 20%, Last3F 20%, Margin 15%, Pace 10%, Going 10%)."""
     runs_all = [r for h in horses for r in h.get("dirt_histories", [])]
     def normalized_time(r):
         if r.get("time") is None or not r.get("going"):
@@ -208,7 +206,6 @@ def dirt_model(horses, target_distance=None, target_going=None):
                 margin = -r["margin"] if r.get("rank") == 1 else r["margin"]
                 components["margin"].append(float(np.clip(75 - 17*margin, 0, 100)))
             
-            # 【追加】前走の4角ポジション等から「逃げ・先行力」を評価
             corner_pos = r.get("corner_pos")
             if corner_pos and r.get("field", 0) > 1:
                 front_bonus = max(0.0, 1.0 - (corner_pos - 1) / max(1, r.get("field", 1) - 1))
@@ -224,17 +221,15 @@ def dirt_model(horses, target_distance=None, target_going=None):
                 finish = (r["field"]-r["rank"])/(r["field"]-1)
                 components["going"].append(100*closeness*finish)
 
-        weights = {"time":.20, "last3f":.15, "margin":.15, "distance":.15, "going":.15, "pace":.20}
+        # 指定された比重に設定 (Time 25%, Distance 20%, Last3F 20%, Margin 15%, Pace 10%, Going 10%)
+        weights = {"time":.25, "distance":.20, "last3f":.20, "margin":.15, "pace":.10, "going":.10}
         values = {k: round(float(np.mean(v)),2) if v else None for k,v in components.items()}
         present = [k for k,v in values.items() if v is not None]
         total = sum(weights[k] for k in present)
         score = sum(weights[k]*values[k] for k in present)/total if total else None
         
-        # 【追加】減量騎手ボーナスをAIスコアに反映
-        jockey_weight_bonus = h.get("jockey_bonus", 0.0)
-        
         if score is not None:
-            h["ai_score"] = round(score + jockey_weight_bonus, 2)
+            h["ai_score"] = round(score, 2)
         else:
             h["ai_score"] = None
             
@@ -339,12 +334,6 @@ def parse_sheet_rows(rows, day_label, sheet_name=""):
         odds_idx = columns.get("odds")
         odds = numeric_odds(cells[odds_idx]) if odds_idx is not None and odds_idx < len(cells) else (float(odds_match.group(1)) if odds_match else None)
         popularity = int(odds_match.group(2)) if odds_match else None
-        
-        # 【追加】軽量・減量騎手マーク（▲★☆など）の検出
-        jockey_bonus_val = 0.0
-        row_full_text = " ".join(cells)
-        if any(mark in row_full_text for mark in ["▲", "★", "☆", "△"]):
-            jockey_bonus_val = 3.5
 
         histories = [cells[i] for i in previous_indices if i < len(cells) and cells[i]]
         valid_histories = [h for h in histories if re.search(r"20\d{2}年\d{1,2}月\d{1,2}日", h)]
@@ -376,7 +365,6 @@ def parse_sheet_rows(rows, day_label, sheet_name=""):
             "dirt_runs": dirt_runs,
             "relative_score": relative_score,
             "dirt_score": dirt_score,
-            "jockey_bonus": jockey_bonus_val,
             "dirt_histories": [r for r in (parse_dirt_run(h) for h in valid_histories) if r],
         })
     finish()
@@ -479,7 +467,7 @@ def calculate_ai_indices(horses_data):
 
 
 # --- GitHub Private repository persistence ---
-APP_VERSION = "dual-model-3.3-pace-enhanced"
+APP_VERSION = "dual-model-3.4-weights-tuned"
 
 def score_old_model(horses):
     data = []
@@ -839,7 +827,7 @@ with t4:
                 metrics = model.get("metrics") or {}
                 records.append({"日付": pred["race_date"], "レース": pred["race_name"],
                     "推奨4頭": ",".join(map(str, model["top4"])),
-                    "状態": "対象外" if not model.get("eligible",True) else ("未登録" if result is None else ("的中" if hit else "不の特徴")),
+                    "状態": "対象外" if not model.get("eligible",True) else ("未登録" if result is None else ("的中" if hit else "不的中")),
                     "投資額": stake, "払戻額": received,
                     "損益": (received-stake) if (result and stake is not None) else None, "モデル": label})
         df_hist = pd.DataFrame(records)
