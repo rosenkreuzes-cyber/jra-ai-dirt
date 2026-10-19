@@ -39,13 +39,13 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-st.title("🏇 JRA 黄金パターン AI ダッシュボード [修正完了版]")
+st.title("🏇 JRA 黄金パターン AI ダッシュボード [新AIギャップ撤廃版]")
 
 # --- サイドバー ---
 with st.sidebar:
     st.header("⚙️ 設定")
     min_coverage = st.slider("最低過去走データ保有率 (%)", 50, 100, 75, 5)
-    min_gap = st.slider("上位4頭と5位の最低指数差", 0.0, 20.0, 3.0, 0.5)
+    min_gap = st.slider("上位4頭と5位の最低指数差（※旧AIのみ適用）", 0.0, 20.0, 3.0, 0.5)
     min_confidence = st.slider("推奨最低評価点（的中確率ではありません）", 40, 95, 65, 5)
     max_recommendations = st.slider("1日あたりの推奨上限", 3, 5, 5)
     min_top_history = st.slider("上位4頭の最低過去走数", 1, 4, 2)
@@ -475,7 +475,7 @@ def calculate_ai_indices(horses_data):
 
 
 # --- GitHub Private repository persistence ---
-APP_VERSION = "dual-model-3.9-syntax-fixed"
+APP_VERSION = "dual-model-3.10-no-gap-new"
 
 def score_old_model(horses):
     data = []
@@ -509,7 +509,10 @@ def choose_dual(day):
         frames = model_frames(race)
         evaluations = {}
         for label, frame in frames.items():
-            metrics, reason, _ = screen_scored_race(race, frame)
+            if label == "旧AI":
+                metrics, reason, _ = screen_scored_race_old(race, frame)
+            else:
+                metrics, reason, _ = screen_scored_race_new(race, frame)
             evaluations[label] = {"metrics": metrics, "reason": reason, "df": frame}
         if any(x["metrics"] is not None for x in evaluations.values()):
             selected.append((race, evaluations))
@@ -524,7 +527,8 @@ def choose_dual(day):
     return selected[:max_recommendations], excluded
 
 
-def screen_scored_race(race, df):
+# 旧AI用スクリーニング（指数差ギャップチェックあり）
+def screen_scored_race_old(race, df):
     if not race.get("identified", True):
         return None, "レース識別不可", df
     if not race.get("is_dirt_race"):
@@ -556,6 +560,41 @@ def screen_scored_race(race, df):
     if quality < min_confidence:
         return None, f"評価点不足 ({quality:.0f})", df
     return {"score": round(quality), "gap": round(gap, 1), "coverage": round(coverage),
+            "dirt_coverage": round(dirt_coverage), "top_dirt": top_dirt,
+            "top_avg_runs": round(avg_runs, 1)}, None, df
+
+
+# 新AI用スクリーニング（指数差ギャップチェックなし）
+def screen_scored_race_new(race, df):
+    if not race.get("identified", True):
+        return None, "レース識別不可", df
+    if not race.get("is_dirt_race"):
+        return None, "ダート条件を確認できないため対象外", df
+    if re.search(r"新馬|メイクデビュー", race.get("race_title", "")):
+        return None, "新馬戦", df
+    if len(df) < 6:
+        return None, "出走馬6頭未満", df
+    coverage = float(df["history_count"].gt(0).mean() * 100)
+    dirt_coverage = float(df["dirt_runs"].gt(0).mean() * 100)
+    if coverage < min_coverage:
+        return None, f"過去走保有率不足 ({coverage:.0f}%)", df
+    if df["ai_score"].notna().sum() < 5:
+        return None, "指数算出可能馬が5頭未満", df
+    top = df.head(4)
+    if top["history_count"].lt(min_top_history).any():
+        return None, "上位4頭の過去走数不足", df
+    top_dirt = int(top["dirt_runs"].gt(0).sum())
+    if top_dirt < min_top_dirt:
+        return None, "上位4頭のダート経験不足", df
+    
+    # 新AIではギャップ（指数差）チェックを完全に除外
+    avg_runs = float(top["history_count"].mean())
+    quality = min(100., 0.30 * coverage + 0.25 * dirt_coverage +
+                  0.25 * min(100., avg_runs / 4 * 100) +
+                  0.20 * (top_dirt / 4 * 100))
+    if quality < min_confidence:
+        return None, f"評価点不足 ({quality:.0f})", df
+    return {"score": round(quality), "gap": 0.0, "coverage": round(coverage),
             "dirt_coverage": round(dirt_coverage), "top_dirt": top_dirt,
             "top_avg_runs": round(avg_runs, 1)}, None, df
 
