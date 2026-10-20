@@ -257,7 +257,7 @@ def parse_sheet_rows(rows, day_label, sheet_name=""):
             current["day_label"] = day_label
             heading = current.get("heading_raw", "")
             current["race_date"] = heading_date(heading) or heading_date(sheet_name)
-            surface_text = heading + "\n" + "\n".join(current.get("race_info", []))
+            surface_text = heading + "\n" + "\n".join(current.get("race_info", [])[:4])
             surface_text = unicodedata.normalize("NFKC", surface_text)
             dirt_match = re.search(r"(?:ダート|ダ)\s*(\d{3,4})\s*(?:m|メートル)?", surface_text, re.I)
             dirt_match_rev = re.search(r"(\d{3,4})\s*(?:m|メートル)?\s*(?:ダート|ダ)(?![ァ-ン])", surface_text, re.I)
@@ -271,7 +271,8 @@ def parse_sheet_rows(rows, day_label, sheet_name=""):
                 if len(set(distance_candidates)) == 1:
                     target_distance = int(distance_candidates[0])
             current["target_distance"] = target_distance
-            current["is_dirt_race"] = bool(dirt_match or dirt_match_rev or dirt_marker) and not bool(turf_marker and not (dirt_match or dirt_match_rev or dirt_marker))
+            current["is_dirt_race"] = bool(dirt_match or dirt_match_rev or dirt_marker) and not bool(turf_match or turf_marker)
+            current["surface_conflict"] = bool((dirt_match or dirt_match_rev or dirt_marker) and (turf_match or turf_marker))
             current["surface_diagnostic"] = surface_text[:240]
             going_match = re.search(r"(?:ダート|ダ)\s*(?:\d{3,4}\s*m?\s*)?(稍重|不良|良|重)", surface_text)
             current["target_going"] = going_match.group(1) if going_match else None
@@ -804,6 +805,14 @@ sun_date = st.sidebar.date_input("日曜日の開催日", value=sat_date + datet
 
 
 def render_races(day, date):
+    # Never treat a race from a different date or an unverified surface as eligible.
+    # The original records in GitHub are not modified by this filter.
+    source_races = [r for r in all_loaded_races if r.get("day_label") == day]
+    mismatches = [r for r in source_races if r.get("race_date") != date]
+    if mismatches:
+        st.error(f"{day}: 開催日を確認できない／指定日と異なるレースが {len(mismatches)} 件あります。誤保存防止のため、この日の予想表示・保存を停止しました。")
+        st.caption("スプレッドシートの開催日と左側の開催日設定を確認してください。")
+        return
     selected, excluded = choose_dual(day)
     st.info(f"推奨候補 {len(selected)} レース・除外 {len(excluded)} レース")
     
@@ -864,8 +873,8 @@ def render_races(day, date):
                 cols = [c for c in ["horse_no", "name", "odds", "pop_rank", "ai_score", "margin_score", "distance_score", "going_score", "evidence_coverage", "time_score", "last3f_score", "idx_rank"] if c in df.columns]
                 st.dataframe(df[cols], hide_index=True, use_container_width=True)
         detected_date = race.get("race_date")
-        verified = st.checkbox(f"{race['race_name']} の開催日が {date} であることを確認", key="datecheck_"+race_key(date,race)) if detected_date is None else True
-        if st.button("💾 旧AI・新AIの予想を同時に確定保存", key="save_" + race_key(date, race), disabled=(not verified or (detected_date is not None and detected_date != date))):
+        verified = detected_date == date
+        if st.button("💾 旧AI・新AIの予想を同時に確定保存", key="save_" + race_key(date, race), disabled=(not verified or detected_date != date or not race.get("is_dirt_race") or race.get("surface_conflict"))):
             rec = dual_snapshot(date, race, evaluations, settings)
             path = f"predictions/{date.year}/{rec['race_id']}.json"
             try:
@@ -1016,8 +1025,10 @@ with t4:
                 st.write(f"予想履歴の重複候補: {len(dup)}ファイル（削除しません）")
                 if not dup.empty:
                     st.dataframe(dup, hide_index=True)
+            st.warning("開催日・芝ダートの履歴照合が未完了のため、結果削除は安全ロック中です。予想履歴は保持されます。")
             phrase = st.text_input("実行確認：『結果だけリセット』と入力", key="oct_reset_phrase")
-            if st.button("バックアップ後、対象結果をリセット", key="oct_reset_execute", disabled=phrase != "結果だけリセット" or not preview):
+            if st.button("バックアップ後、対象結果をリセット", key="oct_reset_execute", disabled=True):
+                # Safety lock: must audit historical race/date mappings before destructive reset.
                 try:
                     deleted, backup = reset_results_with_backup()
                     st.success(f"結果 {len(deleted)}件をリセットしました。バックアップ先: {backup}")
