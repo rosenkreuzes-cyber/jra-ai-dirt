@@ -228,9 +228,13 @@ def dirt_model(horses, target_distance=None, target_going=None):
 
 
 def heading_date(raw):
-    m = re.search(r"(20\d{2})年\s*(\d{1,2})月\s*(\d{1,2})日", clean_text(raw))
+    # Some exported JRA headings lose the leading "2" in "2026年".
+    # Only repair the exact three-digit year 026, never arbitrary years.
+    normalized = clean_text(raw)
+    normalized = re.sub(r"(?<!\d)026年(?=\s*\d{1,2}月)", "2026年", normalized)
+    m = re.search(r"(20\d{2})年\s*(\d{1,2})月\s*(\d{1,2})日", normalized)
     if not m:
-        m = re.search(r"(20\d{2})[-/](\d{1,2})[-/](\d{1,2})", clean_text(raw))
+        m = re.search(r"(20\d{2})[-/](\d{1,2})[-/](\d{1,2})", normalized)
     if not m:
         return None
     try:
