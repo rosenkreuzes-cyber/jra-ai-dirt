@@ -813,6 +813,12 @@ def render_races(day, date):
         st.error(f"{day}: 開催日を確認できない／指定日と異なるレースが {len(mismatches)} 件あります。誤保存防止のため、この日の予想表示・保存を停止しました。")
         st.caption("スプレッドシートの開催日と左側の開催日設定を確認してください。")
         return
+    # Source audit: show the actual races parsed from the chosen day's workbook.
+    with st.expander("🔎 読み込み元のレース一覧（確認用）", expanded=True):
+        st.caption("ここはGitHubの保存履歴ではなく、選択日のスプレッドシートから取得した内容です。")
+        st.dataframe(pd.DataFrame([{"開催日": str(r.get("race_date") or "不明"), "競馬場": r.get("course"), "R": r.get("race_no"), "レース名": r.get("race_name"), "ダート判定": bool(r.get("is_dirt_race")), "元シート": r.get("sheet_name")} for r in source_races]), hide_index=True, use_container_width=True)
+        if day == "日曜日開催" and any(r.get("course") == "東京" and r.get("race_no") == 12 for r in source_races):
+            st.error("日曜の読み込み元に東京12Rが存在します。Google Driveのリンク先・アップロードファイルを確認してください。")
     selected, excluded = choose_dual(day)
     st.info(f"推奨候補 {len(selected)} レース・除外 {len(excluded)} レース")
     
