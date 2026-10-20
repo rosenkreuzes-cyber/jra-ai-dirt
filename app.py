@@ -39,7 +39,7 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-st.title("🏇 JRA 黄金パターン AI ダッシュボード [構文完全修正版]")
+st.title("🏇 JRA 黄金パターン AI ダッシュボード [新AI評価点グラデーション修正版]")
 
 # --- サイドバー ---
 with st.sidebar:
@@ -475,7 +475,7 @@ def calculate_ai_indices(horses_data):
 
 
 # --- GitHub Private repository persistence ---
-APP_VERSION = "dual-model-3.13-syntax-safe"
+APP_VERSION = "dual-model-3.14-balanced-score"
 
 def score_old_model(horses):
     data = []
@@ -564,7 +564,7 @@ def screen_scored_race_old(race, df):
             "top_avg_runs": round(avg_runs, 1)}, None, df
 
 
-# 新AI用スクリーニング（指数差ギャップチェックなし）
+# 新AI用スクリーニング（指数差ギャップ撤廃 ＆ 上位馬の指数・競合度を反映したグラデーション評価）
 def screen_scored_race_new(race, df):
     if not race.get("identified", True):
         return None, "レース識別不可", df
@@ -588,9 +588,17 @@ def screen_scored_race_new(race, df):
         return None, "上位4頭のダート経験不足", df
     
     avg_runs = float(top["history_count"].mean())
-    quality = min(100., 0.30 * coverage + 0.25 * dirt_coverage +
-                  0.25 * min(100., avg_runs / 4 * 100) +
-                  0.20 * (top_dirt / 4 * 100))
+    
+    # 新AIの評価点バランス調整：
+    # 上位4頭のAI指数の平均値や、5位とのわずかな差、データ充実度を組み合わせて100点満点でグラデーションを持たせる
+    top_scores_mean = float(top["ai_score"].mean()) if "ai_score" in top.columns and top["ai_score"].notna().all() else 70.0
+    score_level = np.clip((top_scores_mean - 50.0) / 30.0 * 100.0, 40.0, 100.0)
+    
+    quality = min(100., 0.25 * coverage + 0.20 * dirt_coverage +
+                  0.20 * min(100., avg_runs / 4 * 100) +
+                  0.15 * (top_dirt / 4 * 100) +
+                  0.20 * score_level)
+    
     if quality < min_confidence:
         return None, f"評価点不足 ({quality:.0f})", df
     return {"score": round(quality), "gap": 0.0, "coverage": round(coverage),
