@@ -46,7 +46,7 @@ with st.sidebar:
     st.header("⚙️ 設定")
     min_coverage = st.slider("最低過去走データ保有率 (%)", 50, 100, 75, 5)
     min_gap = st.slider("上位4頭と5位の最低指数差（※旧AIのみ適用）", 0.0, 20.0, 3.0, 0.5)
-    min_confidence = st.slider("推奨最低評価点（的中確率ではありません）", 40, 95, 65, 5)
+    min_confidence = st.slider("推奨最低評価点（的中確率ではありません）", 40, 95, 85, 5)
     max_recommendations = st.slider("1日あたりの推奨上限", 3, 5, 5)
     min_top_history = st.slider("上位4頭の最低過去走数", 1, 4, 2)
     min_top_dirt = st.slider("上位4頭の最低ダート経験馬数", 2, 4, 3)
@@ -132,7 +132,7 @@ def parse_dirt_run(raw):
     final_m = re.search(r"3F\s*(\d{2}\.\d)", t, re.I)
     rank_m = re.search(r"(?<!\d)(\d{1,2})着", t)
     field_m = re.search(r"(?<!\d)(\d{1,2})頭", t)
-    going_m = re.search(r"(?:^|\n)\s*(稍重|不良|良|重)\s*(?:\n|$)", t)
+    going_m = re.search(r"(?:ダ(?:ート)?\s*)?(稍重|不良|良|重)(?:\s|$)", t)
     rank = int(rank_m.group(1)) if rank_m else None
     field = int(field_m.group(1)) if field_m else None
     
@@ -141,7 +141,9 @@ def parse_dirt_run(raw):
     if corner_m:
         corner_pos = int(corner_m.group(1))
 
+    margin_m = re.search(r"[（(]\s*([+-]?\d+(?:\.\d+)?)\s*[）)]", t)
     return {
+        "margin": float(margin_m.group(1)) if margin_m else None,
         "distance": distance,
         "course": next((c for c in COURSES if re.search(r"(?:^|\n)\s*"+c+r"\s*(?:\n|$)",t)), None),
         "time": int(time_m.group(1))*60 + float(time_m.group(2)) if time_m else None,
@@ -171,78 +173,57 @@ def robust_scale(values, higher_is_better=False):
 GOING_SEC_PER_1000M = {"良": 0.0, "稍重": -0.35, "重": -0.70, "不良": -0.90}
 
 
+# 新AIの5要素: 走破タイム・上がり3F・着差・距離適性・馬場状態。
+# 枠順は一律の加点に使わない。実測データが揃うまで表示専用。
+NEW_WEIGHTS = {"time": .25, "last3f": .20, "margin": .20,
+               "distance": .20, "going": .15}
+
 def dirt_model(horses, target_distance=None, target_going=None):
     runs_all = [r for h in horses for r in h.get("dirt_histories", [])]
     def normalized_time(r):
-        if r.get("time") is None or not r.get("going"):
+        if r.get("time") is None or r.get("going") not in GOING_SEC_PER_1000M:
             return None
         return r["time"] - GOING_SEC_PER_1000M[r["going"]] * r["distance"] / 1000
 
-    def time_reference(r):
-        peers = [normalized_time(q) for q in runs_all
-                 if q["distance"] == r["distance"] and q.get("course") == r.get("course")
-                 and normalized_time(q) is not None]
-        return robust_scale(peers)
+    reference = {}
+    for r in runs_all:
+        key = (r.get("course"), r["distance"])
+        reference.setdefault(key, []).append(normalized_time(r))
+    scales = {key: robust_scale(vals) for key, vals in reference.items()}
 
-    total_horses = len(horses)
     for h in horses:
-        components = {k: [] for k in ("time", "last3f", "distance", "pace", "rank_score", "gate_bias")}
-        
-        h_no = h.get("horse_no", 8)
-        if total_horses > 1:
-            gate_score = 50.0 + (h_no / total_horses) * 20.0
-        else:
-            gate_score = 60.0
-        components["gate_bias"].append(float(np.clip(gate_score, 0, 100)))
-
+        components = {k: [] for k in NEW_WEIGHTS}
         for r in h.get("dirt_histories", []):
             dist = r["distance"]
-            ref = time_reference(r)
             t = normalized_time(r)
+            ref = scales.get((r.get("course"), dist))
             if ref and t is not None:
                 med, spread, sign = ref
                 components["time"].append(float(np.clip(50 + 16*sign*(t-med)/spread, 0, 100)))
-            
             finals = [q["last3f"] for q in runs_all if abs(q["distance"]-dist) <= 100 and q.get("last3f") is not None]
             fref = robust_scale(finals)
             if fref and r.get("last3f") is not None:
                 med, spread, sign = fref
                 components["last3f"].append(float(np.clip(50 + 16*sign*(r["last3f"]-med)/spread, 0, 100)))
-            
-            if r.get("rank") and r.get("field", 0) > 1:
-                p_score = 100.0 * (r["field"] - r["rank"]) / (r["field"] - 1)
-                components["rank_score"].append(float(np.clip(p_score, 0, 100)))
-
-            corner_pos = r.get("corner_pos")
-            if corner_pos and r.get("field", 0) > 1:
-                front_bonus = max(0.0, 1.0 - (corner_pos - 1) / max(1, r.get("field", 1) - 1))
-                components["pace"].append(float(np.clip(front_bonus * 100, 0, 100)))
-
-            if target_distance and r.get("rank") and r.get("field", 0) > 1:
-                closeness = max(0., 1.-abs(dist-target_distance)/800.)
-                finish = (r["field"]-r["rank"])/(r["field"]-1)
-                components["distance"].append(100*(.5*closeness+.5*finish)*closeness)
-
-        has_time = bool(components["time"])
-        has_last3f = bool(components["last3f"])
-
-        if not has_time or not has_last3f:
-            h["ai_score"] = None
-        else:
-            weights = {"time":.20, "distance":.20, "last3f":.15, "pace":.15, "rank_score":.20, "gate_bias":.10}
-            values = {k: round(float(np.mean(v)),2) if v else None for k,v in components.items()}
-            present = [k for k,v in values.items() if v is not None]
-            total = sum(weights[k] for k in present)
-            score = sum(weights[k]*values[k] for k in present)/total if total else None
-            
-            if score is not None:
-                h["ai_score"] = round(score, 2)
-            else:
-                h["ai_score"] = None
-            
-            h.update({f"{k}_score":values[k] for k in weights})
-            h["evidence_coverage"] = round(100*total,1)
-            
+            # 着差は勝ち馬との秒差。負値（勝利時の2着馬との差）は0扱い。
+            if r.get("margin") is not None:
+                components["margin"].append(float(np.clip(90 - max(0, r["margin"]) * 22, 0, 100)))
+            if target_distance:
+                closeness = max(0., 1. - abs(dist-target_distance)/800.)
+                if r.get("rank") and r.get("field", 0) > 1:
+                    finish = (r["field"]-r["rank"])/(r["field"]-1)
+                    components["distance"].append(float(100*(.5*closeness+.5*finish)*closeness))
+            # 馬場適性は同じ馬場状態での実績に限る。対象馬場が不明なら採点しない。
+            if target_going and r.get("going") == target_going and r.get("rank") and r.get("field", 0) > 1:
+                components["going"].append(float(np.clip(100*(r["field"]-r["rank"])/(r["field"]-1), 0, 100)))
+        values = {k: round(float(np.mean(v)),2) if v else None for k,v in components.items()}
+        present = [k for k,v in values.items() if v is not None]
+        total = sum(NEW_WEIGHTS[k] for k in present)
+        # 欠損項目の重みを無条件に再配分しない。タイム/上がりの片方と着差が必要。
+        required = values["margin"] is not None and (values["time"] is not None or values["last3f"] is not None)
+        h["ai_score"] = round(sum(NEW_WEIGHTS[k]*values[k] for k in present)/total, 2) if required and total >= .45 else None
+        h.update({f"{k}_score": values[k] for k in NEW_WEIGHTS})
+        h["evidence_coverage"] = round(100*total, 1)
     return horses
 
 
@@ -292,7 +273,8 @@ def parse_sheet_rows(rows, day_label, sheet_name=""):
             current["target_distance"] = target_distance
             current["is_dirt_race"] = bool(dirt_match or dirt_match_rev or dirt_marker) and not bool(turf_marker and not (dirt_match or dirt_match_rev or dirt_marker))
             current["surface_diagnostic"] = surface_text[:240]
-            current["target_going"] = None
+            going_match = re.search(r"(?:ダート|ダ)\s*(?:\d{3,4}\s*m?\s*)?(稍重|不良|良|重)", surface_text)
+            current["target_going"] = going_match.group(1) if going_match else None
             dirt_model(current["horses"], target_distance, None)
             odds_list = [h.get("odds") for h in current["horses"]]
             if odds_list and all(x is not None for x in odds_list):
@@ -475,7 +457,7 @@ def calculate_ai_indices(horses_data):
 
 
 # --- GitHub Private repository persistence ---
-APP_VERSION = "dual-model-3.14-balanced-score"
+APP_VERSION = "dual-model-4.0-five-factor-85"
 
 def score_old_model(horses):
     data = []
@@ -522,8 +504,10 @@ def choose_dual(day):
         ev = item[1]
         return max((v["metrics"]["score"] for v in ev.values() if v["metrics"]), default=-1)
     selected.sort(key=priority, reverse=True)
+    if st.session_state.get("show_all_for_validation", False):
+        return selected, excluded
     for race, _ in selected[max_recommendations:]:
-        excluded.append((race["race_name"], "表示上限超過"))
+        excluded.append((race["race_name"], "表示上限超過（検証モードでは表示可）"))
     return selected[:max_recommendations], excluded
 
 
@@ -544,6 +528,8 @@ def screen_scored_race_old(race, df):
     if df["ai_score"].notna().sum() < 5:
         return None, "指数算出可能馬が5頭未満", df
     top = df.head(4)
+    if top["ai_score"].isna().any():
+        return None, "推奨4頭に指数欠損あり", df
     if top["history_count"].lt(min_top_history).any():
         return None, "上位4頭の過去走数不足", df
     top_dirt = int(top["dirt_runs"].gt(0).sum())
@@ -581,6 +567,8 @@ def screen_scored_race_new(race, df):
     if df["ai_score"].notna().sum() < 5:
         return None, "指数算出可能馬が5頭未満", df
     top = df.head(4)
+    if top["ai_score"].isna().any():
+        return None, "推奨4頭に指数欠損あり", df
     if top["history_count"].lt(min_top_history).any():
         return None, "上位4頭の過去走数不足", df
     top_dirt = int(top["dirt_runs"].gt(0).sum())
@@ -827,7 +815,7 @@ def render_races(day, date):
                 st.markdown("**" + label + "**")
                 top = sorted(int(x) for x in df.head(4)["horse_no"])
                 st.write("3連複4点：", " ／ ".join("-".join(map(str, x)) for x in itertools.combinations(top, 3)))
-                cols = [c for c in ["horse_no", "name", "odds", "pop_rank", "ai_score", "rank_score_score", "pace_score", "gate_bias_score", "time_score", "last3f_score", "idx_rank"] if c in df.columns]
+                cols = [c for c in ["horse_no", "name", "odds", "pop_rank", "ai_score", "margin_score", "distance_score", "going_score", "evidence_coverage", "time_score", "last3f_score", "idx_rank"] if c in df.columns]
                 st.dataframe(df[cols], hide_index=True, use_container_width=True)
         detected_date = race.get("race_date")
         verified = st.checkbox(f"{race['race_name']} の開催日が {date} であることを確認", key="datecheck_"+race_key(date,race)) if detected_date is None else True
@@ -844,6 +832,7 @@ def render_races(day, date):
         st.divider()
 
 
+st.checkbox("🔬 検証モード：推奨上限を解除して全候補を表示", key="show_all_for_validation")
 t1, t2, t3, t4 = st.tabs(["📅 土曜推奨", "📅 日曜推奨", "📝 結果登録", "📊 長期成績"])
 with t1:
     render_races("土曜日開催", sat_date)
@@ -881,13 +870,19 @@ with t3:
                     st.error("1〜3着に同じ馬番は指定できません。")
                 else:
                     now = datetime.datetime.now(datetime.timezone.utc).isoformat()
+                    revisions = list(old.get("revision_history", [])) if old else []
+                    if old:
+                        if not reason.strip():
+                            st.error("訂正理由を入力してください")
+                            st.stop()
+                        revisions.append({"updated_at_utc": now, "reason": reason, "previous_top3": old.get("top3"), "previous_payout": old.get("trio_payout_100yen")})
                     record = {
                         "race_id": rid, "race_date": pred["race_date"],
                         "top3": [int(a), int(b), int(c)],
                         "trio_payout_100yen": int(payout),
                         "saved_at_utc": old.get("saved_at_utc", now) if old else now,
                         "updated_at_utc": now,
-                        "revision_history": list(old.get("revision_history", [])) if old else [],
+                        "revision_history": revisions,
                     }
                     path = f"results/{pred['race_date'][:4]}/{rid}.json"
                     if put_record(path, record, overwrite=bool(old)):
@@ -897,39 +892,83 @@ with t3:
         st.error("履歴取得に失敗: " + str(e))
 
 with t4:
-    st.subheader("長期成績")
+    st.subheader("長期成績：モデル別")
     try:
         predictions, results = read_all_history()
         records = []
         for rid, pred in predictions.items():
             result = results.get(rid)
-            model_items = pred.get("models")
-            if model_items is None:
-                model_items = {"旧AI（過去保存）": {"top4": pred["top4"], "eligible": True, "metrics": pred.get("metrics", {})}}
-            for label, model in model_items.items():
-                if len(model.get("top4", [])) != 4:
+            models = pred.get("models") or {"旧AI（過去保存）": {"top4": pred.get("top4", []), "eligible": True}}
+            for label, model in models.items():
+                top4 = model.get("top4", [])
+                if len(top4) != 4:
                     continue
-                hit, stake, received = outcome({"top4": model["top4"], "bet_unit": pred.get("bet_unit", 100)}, result) if result and model.get("eligible",True) else (None, None, None)
-                metrics = model.get("metrics") or {}
-                records.append({"日付": pred["race_date"], "レース": pred["race_name"],
-                    "推奨4頭": ",".join(map(str, model["top4"])),
-                    "状態": "対象外" if not model.get("eligible",True) else ("未登録" if result is None else ("的中" if hit else "不的中")),
-                    "投資額": stake, "払戻額": received,
-                    "損益": (received-stake) if (result and stake is not None) else None, "モデル": label})
+                eligible = model.get("eligible", True)
+                hit, stake, paid = outcome({"top4": top4, "bet_unit": pred.get("bet_unit", 100)}, result) if result and eligible else (None, None, None)
+                records.append({"レースID": rid, "日付": pred.get("race_date"), "レース": pred.get("race_name"),
+                    "モデル": label, "推奨4頭": ",".join(map(str, top4)),
+                    "状態": "対象外" if not eligible else ("未登録" if result is None else ("的中" if hit else "不的中")),
+                    "投資額": stake, "払戻額": paid, "損益": paid-stake if stake is not None else None})
         df_hist = pd.DataFrame(records)
         if df_hist.empty:
-            st.info("まだ履歴がありません。")
+            st.info("予想履歴がありません")
         else:
-            completed = df_hist[df_hist["状態"].isin(["的中", "不的中"])]
-            n = len(completed)
-            hits = int((completed["状態"] == "的中").sum())
-            invested = int(completed["投資額"].sum())
-            paid = int(completed["払戻額"].sum())
-            c1, c2, c3, c4 = st.columns(4)
-            c1.metric("結果登録", n)
-            c2.metric("的中率", f"{hits/n*100:.1f}%" if n else "—")
-            c3.metric("回収率", f"{paid/invested*100:.1f}%" if invested else "—")
-            c4.metric("累計損益", f"{paid-invested:+,}円")
-            st.dataframe(df_hist, hide_index=True, use_container_width=True)
+            summary = []
+            for label in ["旧AI", "新AI", "旧AI（過去保存）"]:
+                sub = df_hist[df_hist["モデル"] == label]
+                complete = sub[sub["状態"].isin(["的中", "不的中"])]
+                n = len(complete)
+                hits = int((complete["状態"] == "的中").sum())
+                stake = int(complete["投資額"].sum())
+                paid = int(complete["払戻額"].sum())
+                summary.append({"モデル": label, "保存予想": int((sub["状態"] != "対象外").sum()),
+                    "結果登録": n, "的中率": f"{hits/n*100:.1f}%" if n else "—",
+                    "回収率": f"{paid/stake*100:.1f}%" if stake else "—", "損益": paid-stake if n else None})
+            st.dataframe(pd.DataFrame(summary), hide_index=True, use_container_width=True)
+            st.caption("同じレースで両AIが選考通過した予想のみを比較します。旧形式の履歴は別枠です。")
+            paired = df_hist[df_hist["モデル"].isin(["旧AI", "新AI"]) & df_hist["状態"].isin(["的中", "不的中"])]
+            both_ids = paired.groupby("レースID")["モデル"].nunique()
+            paired = paired[paired["レースID"].isin(both_ids[both_ids == 2].index)]
+            if not paired.empty:
+                paired_stats = []
+                for label, sub in paired.groupby("モデル"):
+                    stake = int(sub["投資額"].sum()); paid = int(sub["払戻額"].sum())
+                    paired_stats.append({"モデル": label, "同条件レース数": len(sub),
+                        "的中率": f"{(sub['状態']=='的中').mean()*100:.1f}%",
+                        "回収率": f"{paid/stake*100:.1f}%" if stake else "—", "損益": paid-stake})
+                st.markdown("**同一レース比較**")
+                st.dataframe(pd.DataFrame(paired_stats), hide_index=True, use_container_width=True)
+            st.markdown("**保存履歴の明細**")
+            st.dataframe(df_hist.drop(columns=["レースID"]), hide_index=True, use_container_width=True)
     except Exception as e:
         st.error("長期成績の取得に失敗: " + str(e))
+
+    with st.expander("🗑️ 予想履歴を手動削除（GitHub）"):
+        st.warning("削除すると予想履歴が消えます。結果登録データは削除しません。")
+        target_date = st.date_input("削除対象日", value=datetime.date(2026,10,19), key="delete_date")
+        if st.button("削除候補を取得", key="load_delete"):
+            try:
+                st.session_state["delete_candidates"] = list_prediction_files_for_date(target_date.isoformat())
+                st.session_state["delete_date_loaded"] = target_date.isoformat()
+            except Exception as e:
+                st.error(str(e))
+        candidates = st.session_state.get("delete_candidates", []) if st.session_state.get("delete_date_loaded") == target_date.isoformat() else []
+        selected = []
+        for item in candidates:
+            rec = item["record"]
+            if st.checkbox(f"{rec.get('race_date')} {rec.get('race_name')} / {item['path']}", key="del_"+item["path"]):
+                selected.append(item)
+        st.caption(f"選択中：{len(selected)}件")
+        confirm = st.text_input("削除する場合は『削除』と入力", key="delete_confirm")
+        if st.button("選択した予想履歴を削除", disabled=not selected or confirm != "削除", key="delete_now"):
+            success = 0
+            for item in selected:
+                try:
+                    rec = item["record"]
+                    delete_record_safely(item["path"], rec["race_id"], rec["race_date"])
+                    success += 1
+                except Exception as e:
+                    st.error(f"{item['path']}: {e}")
+            st.success(f"{success}件を削除しました")
+            st.session_state.pop("delete_candidates", None)
+            st.rerun()
