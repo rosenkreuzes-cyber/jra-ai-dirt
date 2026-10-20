@@ -1001,9 +1001,11 @@ with t4:
     try:
         predictions, results = read_all_history()
         records = []
+        legacy_count = sum(1 for pred in predictions.values() if not pred.get("models") and len(pred.get("top4", [])) == 4)
+        st.caption(f"旧形式の確定予想 {legacy_count}件を旧AIとして読み込みました（元のJSONは変更しません）。")
         for rid, pred in predictions.items():
             result = results.get(rid)
-            models = pred.get("models") or {"旧AI（過去保存）": {"top4": pred.get("top4", []), "eligible": True}}
+            models = pred.get("models") or {"旧AI": {"top4": pred.get("top4", []), "eligible": True}}
             for label, model in models.items():
                 top4 = model.get("top4", [])
                 if len(top4) != 4:
@@ -1019,7 +1021,7 @@ with t4:
             st.info("予想履歴がありません")
         else:
             summary = []
-            for label in ["旧AI", "新AI", "旧AI（過去保存）"]:
+            for label in ["旧AI", "新AI"]:
                 sub = df_hist[df_hist["モデル"] == label]
                 complete = sub[sub["状態"].isin(["的中", "不的中"])]
                 n = len(complete)
@@ -1030,7 +1032,7 @@ with t4:
                     "結果登録": n, "的中率": f"{hits/n*100:.1f}%" if n else "—",
                     "回収率": f"{paid/stake*100:.1f}%" if stake else "—", "損益": paid-stake if n else None})
             st.dataframe(pd.DataFrame(summary), hide_index=True, use_container_width=True)
-            st.caption("同じレースで両AIが選考通過した予想のみを比較します。旧形式の履歴は別枠です。")
+            st.caption("旧形式の確定予想は旧AIとして集計します。新AIは保存済み予想のみ集計し、結果確定後の再計算は過去成績に含めません。")
             paired = df_hist[df_hist["モデル"].isin(["旧AI", "新AI"]) & df_hist["状態"].isin(["的中", "不的中"])]
             both_ids = paired.groupby("レースID")["モデル"].nunique()
             paired = paired[paired["レースID"].isin(both_ids[both_ids == 2].index)]
@@ -1045,6 +1047,7 @@ with t4:
                 st.dataframe(pd.DataFrame(paired_stats), hide_index=True, use_container_width=True)
             st.markdown("**保存履歴の明細**")
             st.dataframe(df_hist.drop(columns=["レースID"]), hide_index=True, use_container_width=True)
+            st.info("新AIの過去成績が0件でも、結果確定後に再計算した予想を過去の確定予想として補完しません。")
     except Exception as e:
         st.error("長期成績の取得に失敗: " + str(e))
 
