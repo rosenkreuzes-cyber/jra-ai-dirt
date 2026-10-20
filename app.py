@@ -685,6 +685,52 @@ def delete_record_safely(path, expected_race_id, expected_date):
     })
 
 
+RESET_DATES = ("2026-10-17", "2026-10-18")
+
+
+def reset_results_with_backup(dates=RESET_DATES):
+    """Archive original result JSON bytes as records before deleting; never touch predictions."""
+    stamp = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    targets = []
+    for folder in github_list_directories("results"):
+        for path in list_files(folder):
+            record, sha = get_record(path)
+            if record and record.get("race_date") in dates:
+                rid = record.get("race_id", "")
+                if not re.fullmatch(r"20\d{2}-\d{2}-\d{2}_[^/\\]+_\d{2}R", rid):
+                    raise RuntimeError("レースIDが不正なため中止: " + path)
+                if path != f"results/{record['race_date'][:4]}/{rid}.json":
+                    raise RuntimeError("結果ファイルの保存先が想定と違います: " + path)
+                targets.append((path, record, sha))
+    # All backups must complete before deleting anything.
+    for path, record, sha in targets:
+        archive = f"backups/result_reset_{stamp}/{path}"
+        if not put_record(archive, record):
+            raise RuntimeError("バックアップが既に存在するため中止: " + archive)
+    deleted = []
+    for path, record, sha in targets:
+        # Re-read to avoid deleting a record edited during backup.
+        current, current_sha = get_record(path)
+        if current_sha != sha or current != record:
+            raise RuntimeError("結果が途中で変更されました。ここまでの削除: " + str(deleted))
+        github_request("DELETE", path, {"message": "JRA reset results 2026-10-17/18 (backup retained)", "sha": sha})
+        deleted.append(path)
+    return deleted, f"backups/result_reset_{stamp}/"
+
+
+def inspect_duplicate_predictions(dates=RESET_DATES):
+    rows = []
+    for folder in github_list_directories("predictions"):
+        for path in list_files(folder):
+            record, _ = get_record(path)
+            if record and record.get("race_date") in dates:
+                rows.append({"日付": record.get("race_date"), "レースID": record.get("race_id"),
+                             "レース": record.get("race_name"), "保存先": path,
+                             "モデル": ",".join((record.get("models") or {record.get("model_version", "旧形式"): None}).keys()),
+                             "保存日時": record.get("saved_at_utc", "")})
+    return rows
+
+
 def list_prediction_files_for_date(target_date):
     matches = []
     for folder in github_list_directories("predictions"):
@@ -942,6 +988,44 @@ with t4:
             st.dataframe(df_hist.drop(columns=["レースID"]), hide_index=True, use_container_width=True)
     except Exception as e:
         st.error("長期成績の取得に失敗: " + str(e))
+
+    with st.expander("🧹 10月17日・18日の結果だけリセット（予想は保護）"):
+        st.warning("対象は2026-10-17（土）と2026-10-18（日）の確定結果のみです。旧AIの確定予想と新AIの保存予想は変更しません。")
+        st.caption("実行前に結果JSONをGitHubの backups/ に複製します。予想履歴の重複は自動削除しません。")
+        if st.button("対象結果と重複予想を確認", key="preview_oct_reset"):
+            try:
+                current_results = []
+                for folder in github_list_directories("results"):
+                    for path in list_files(folder):
+                        rec, _ = get_record(path)
+                        if rec and rec.get("race_date") in RESET_DATES:
+                            current_results.append({"日付": rec["race_date"], "レース": rec.get("race_id"), "結果保存先": path})
+                st.session_state["oct_reset_preview"] = current_results
+                st.session_state["oct_prediction_preview"] = inspect_duplicate_predictions()
+            except Exception as exc:
+                st.error("事前確認失敗: " + str(exc))
+        if "oct_reset_preview" in st.session_state:
+            preview = st.session_state["oct_reset_preview"]
+            st.write(f"リセット対象の結果ファイル: {len(preview)}件")
+            if preview:
+                st.dataframe(pd.DataFrame(preview), hide_index=True)
+            predictions_preview = st.session_state.get("oct_prediction_preview", [])
+            if predictions_preview:
+                df_dup = pd.DataFrame(predictions_preview)
+                dup = df_dup[df_dup.duplicated("レースID", keep=False)].sort_values("レースID")
+                st.write(f"予想履歴の重複候補: {len(dup)}ファイル（削除しません）")
+                if not dup.empty:
+                    st.dataframe(dup, hide_index=True)
+            phrase = st.text_input("実行確認：『結果だけリセット』と入力", key="oct_reset_phrase")
+            if st.button("バックアップ後、対象結果をリセット", key="oct_reset_execute", disabled=phrase != "結果だけリセット" or not preview):
+                try:
+                    deleted, backup = reset_results_with_backup()
+                    st.success(f"結果 {len(deleted)}件をリセットしました。バックアップ先: {backup}")
+                    st.session_state.pop("oct_reset_preview", None)
+                    st.session_state.pop("oct_prediction_preview", None)
+                    st.rerun()
+                except Exception as exc:
+                    st.error("処理を停止しました。GitHubの backups/ と results/ を確認してください: " + str(exc))
 
     with st.expander("🗑️ 予想履歴を手動削除（GitHub）"):
         st.warning("削除すると予想履歴が消えます。結果登録データは削除しません。")
