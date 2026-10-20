@@ -39,7 +39,7 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-st.title("🏇 JRA 黄金パターン AI ダッシュボード [新AIギャップ撤廃版]")
+st.title("🏇 JRA 黄金パターン AI ダッシュボード [信頼度表示復活版]")
 
 # --- サイドバー ---
 with st.sidebar:
@@ -475,7 +475,7 @@ def calculate_ai_indices(horses_data):
 
 
 # --- GitHub Private repository persistence ---
-APP_VERSION = "dual-model-3.10-no-gap-new"
+APP_VERSION = "dual-model-3.12-with-confidence-score"
 
 def score_old_model(horses):
     data = []
@@ -587,7 +587,6 @@ def screen_scored_race_new(race, df):
     if top_dirt < min_top_dirt:
         return None, "上位4頭のダート経験不足", df
     
-    # 新AIではギャップ（指数差）チェックを完全に除外
     avg_runs = float(top["history_count"].mean())
     quality = min(100., 0.30 * coverage + 0.25 * dirt_coverage +
                   0.25 * min(100., avg_runs / 4 * 100) +
@@ -778,140 +777,4 @@ def render_races(day, date):
         st.warning("推奨対象レースはありません。")
         return
     for race, evaluations in selected:
-        st.subheader("🏇 " + race["race_name"])
-        
-        r_key = race_key(date, race)
-        res_data = results_dict.get(r_key)
-        placed_set = set(int(x) for x in res_data["top3"]) if res_data and res_data.get("top3") else set()
-
-        a, b = st.columns(2)
-        for col, label in ((a, "旧AI"), (b, "新AI")):
-            ev = evaluations[label]
-            df = ev["df"]
-            top = [int(x) for x in df.head(4)["horse_no"]]
-            with col:
-                st.markdown("**" + label + "**")
-                
-                formatted_top = []
-                for num in top:
-                    if num in placed_set:
-                        formatted_top.append(f"<span style='color: #2e7d32; font-weight: bold; font-size: 1.05rem;'>{num}番(入着)</span>")
-                    else:
-                        formatted_top.append(f"{num}番")
-                
-                rec_str = " ・ ".join(formatted_top) if ev["metrics"] else "対象外（参考：" + "・".join(map(str, top)) + "）"
-                st.markdown(f"推奨4頭： {rec_str}", unsafe_allow_html=True)
-                st.caption("選考通過" if ev["metrics"] else "選考対象外：" + str(ev["reason"]))
-
-        with st.expander("両モデルの全馬指数・買い目"):
-            for label, ev in evaluations.items():
-                df = ev["df"]
-                st.markdown("**" + label + "**")
-                top = sorted(int(x) for x in df.head(4)["horse_no"])
-                st.write("3連複4点：", " ／ ".join("-".join(map(str, x)) for x in itertools.combinations(top, 3)))
-                cols = [c for c in ["horse_no", "name", "odds", "pop_rank", "ai_score", "rank_score_score", "pace_score", "gate_bias_score", "time_score", "last3f_score", "idx_rank"] if c in df.columns]
-                st.dataframe(df[cols], hide_index=True, use_container_width=True)
-        detected_date = race.get("race_date")
-        verified = st.checkbox(f"{race['race_name']} の開催日が {date} であることを確認", key="datecheck_"+race_key(date,race)) if detected_date is None else True
-        if st.button("💾 旧AI・新AIの予想を同時に確定保存", key="save_" + race_key(date, race), disabled=(not verified or (detected_date is not None and detected_date != date))):
-            rec = dual_snapshot(date, race, evaluations, settings)
-            path = f"predictions/{date.year}/{rec['race_id']}.json"
-            try:
-                if put_record(path, rec):
-                    st.success("両モデルの予想を同時保存しました。")
-                else:
-                    st.warning("このレースはすでに保存済みです。")
-            except Exception as e:
-                st.error("保存失敗: " + str(e))
-        st.divider()
-
-
-t1, t2, t3, t4 = st.tabs(["📅 土曜推奨", "📅 日曜推奨", "📝 結果登録", "📊 長期成績"])
-with t1:
-    render_races("土曜日開催", sat_date)
-with t2:
-    render_races("日曜日開催", sun_date)
-
-with t3:
-    st.subheader("確定結果の登録・訂正")
-    if st.button("🔄 保存済み履歴を読み直す", key="refresh_history"):
-        st.rerun()
-    try:
-        predictions, results = read_all_history()
-        if not predictions:
-            st.info("保存済みの予想がありません。")
-        else:
-            ids = sorted(predictions, reverse=True)
-            rid = st.selectbox("結果を登録・訂正するレース", ids,
-                format_func=lambda k: predictions[k]["race_name"] + " / " + predictions[k]["race_date"] + (" 【登録済み】" if k in results else " 【未登録】"))
-            pred = predictions[rid]
-            old = results.get(rid)
-            initial = [int(x) for x in old["top3"]] if old else [1, 2, 3]
-            with st.form("result_form_" + rid):
-                a = st.number_input("1着馬番", 1, 18, initial[0], key="first_" + rid)
-                b = st.number_input("2着馬番", 1, 18, initial[1], key="second_" + rid)
-                c = st.number_input("3着馬番", 1, 18, initial[2], key="third_" + rid)
-                payout = st.number_input("3連複確定払戻（100円あたり・円）", 0, 100000000,
-                    int(old.get("trio_payout_100yen", 0)) if old else 0, step=10, key="payout_" + rid)
-                reason = st.text_input("訂正理由（訂正時のみ）", key="reason_" + rid) if old else ""
-                confirmed = st.checkbox("登録内容を確認しました", key="confirmed_" + rid)
-                submitted = st.form_submit_button("✏️ 訂正して保存" if old else "💾 確定結果を保存")
-            if submitted:
-                if not confirmed:
-                    st.error("確認欄にチェックを入れてください。")
-                elif len({a, b, c}) != 3:
-                    st.error("1〜3着に同じ馬番は指定できません。")
-                else:
-                    now = datetime.datetime.now(datetime.timezone.utc).isoformat()
-                    record = {
-                        "race_id": rid, "race_date": pred["race_date"],
-                        "top3": [int(a), int(b), int(c)],
-                        "trio_payout_100yen": int(payout),
-                        "saved_at_utc": old.get("saved_at_utc", now) if old else now,
-                        "updated_at_utc": now,
-                        "revision_history": list(old.get("revision_history", [])) if old else [],
-                    }
-                    path = f"results/{pred['race_date'][:4]}/{rid}.json"
-                    if put_record(path, record, overwrite=bool(old)):
-                        st.success("結果を保存しました。")
-                        st.rerun()
-    except Exception as e:
-        st.error("履歴取得に失敗: " + str(e))
-
-with t4:
-    st.subheader("長期成績")
-    try:
-        predictions, results = read_all_history()
-        records = []
-        for rid, pred in predictions.items():
-            result = results.get(rid)
-            model_items = pred.get("models")
-            if model_items is None:
-                model_items = {"旧AI（過去保存）": {"top4": pred["top4"], "eligible": True, "metrics": pred.get("metrics", {})}}
-            for label, model in model_items.items():
-                if len(model.get("top4", [])) != 4:
-                    continue
-                hit, stake, received = outcome({"top4": model["top4"], "bet_unit": pred.get("bet_unit", 100)}, result) if result and model.get("eligible",True) else (None, None, None)
-                metrics = model.get("metrics") or {}
-                records.append({"日付": pred["race_date"], "レース": pred["race_name"],
-                    "推奨4頭": ",".join(map(str, model["top4"])),
-                    "状態": "対象外" if not model.get("eligible",True) else ("未登録" if result is None else ("的中" if hit else "不的中")),
-                    "投資額": stake, "払戻額": received,
-                    "損益": (received-stake) if (result and stake is not None) else None, "モデル": label})
-        df_hist = pd.DataFrame(records)
-        if df_hist.empty:
-            st.info("まだ履歴がありません。")
-        else:
-            completed = df_hist[df_hist["状態"].isin(["的中", "不的中"])]
-            n = len(completed)
-            hits = int((completed["状態"] == "的中").sum())
-            invested = int(completed["投資額"].sum())
-            paid = int(completed["払戻額"].sum())
-            c1, c2, c3, c4 = st.columns(4)
-            c1.metric("結果登録", n)
-            c2.metric("的中率", f"{hits/n*100:.1f}%" if n else "—")
-            c3.metric("回収率", f"{paid/invested*100:.1f}%" if invested else "—")
-            c4.metric("累計損益", f"{paid-invested:+,}円")
-            st.dataframe(df_hist, hide_index=True, use_container_width=True)
-    except Exception as e:
-        st.error("長期成績の取得に失敗: " + str(e))
+        st.subheader("
