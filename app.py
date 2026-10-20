@@ -913,9 +913,30 @@ with t3:
         if not predictions:
             st.info("保存済みの予想がありません。")
         else:
-            ids = sorted(predictions, reverse=True)
+            # Filter the 17/18 October historical entries against the actual dirt source sheets.
+            audit_dates = {"2026-10-17", "2026-10-18"}
+            valid_keys = set()
+            for race in all_loaded_races:
+                d = race.get("race_date")
+                d = d.isoformat() if hasattr(d, "isoformat") else str(d)
+                if d in audit_dates and race.get("is_dirt_race") and not race.get("surface_conflict"):
+                    valid_keys.add((d, str(race.get("course")), int(race.get("race_no"))))
+            def valid_result_race(rec):
+                d = str(rec.get("race_date", ""))
+                if d not in audit_dates:
+                    return True
+                try:
+                    return (d, str(rec.get("course")), int(rec.get("race_no"))) in valid_keys
+                except (ValueError, TypeError):
+                    return False
+            ids = sorted((k for k, rec in predictions.items() if valid_result_race(rec)), reverse=True)
+            if len(ids) < len(predictions):
+                st.warning(f"開催日・ダート対象の照合に合わない履歴 {len(predictions)-len(ids)} 件を結果入力候補から除外しました。GitHubの履歴は削除していません。")
+            if not ids:
+                st.info("照合済みの結果入力対象がありません。読み込み元シートを確認してください。")
+                st.stop()
             rid = st.selectbox("結果を登録・訂正するレース", ids,
-                format_func=lambda k: predictions[k]["race_name"] + " / " + predictions[k]["race_date"] + (" 【登録済み】" if k in results else " 【未登録】"))
+                format_func=lambda k: f"{predictions[k].get('course','?')} {predictions[k].get('race_no','?')}R {predictions[k].get('race_name','')} / {predictions[k].get('race_date','')} " + ("【登録済み】" if k in results else "【未登録】"))
             pred = predictions[rid]
             old = results.get(rid)
             initial = [int(x) for x in old["top3"]] if old else [1, 2, 3]
