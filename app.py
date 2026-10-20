@@ -909,6 +909,31 @@ def render_races(day, date):
                     st.warning("このレースはすでに保存済みです。")
             except Exception as e:
                 st.error("保存失敗: " + str(e))
+        # Retrospective snapshots are deliberately isolated from pre-race history.
+        # They never overwrite an existing prediction or affect official ROI.
+        if race_key(date, race) in read_all_history()[1]:
+            with st.expander("🧪 新AIの事後検証を別保存（正式成績には加算しない）"):
+                st.caption("結果確定後に表示した新AIの4頭を、事後検証として別フォルダに記録します。旧AI・既存の予想JSONは変更しません。")
+                retro_confirm = st.checkbox("事後検証であり、事前確定予想ではないことを確認", key="retro_confirm_"+race_key(date,race))
+                if st.button("新AIの事後検証を保存", key="retro_save_"+race_key(date,race), disabled=not retro_confirm):
+                    try:
+                        rec = dual_snapshot(date, race, evaluations, settings)
+                        new_model = rec["models"].get("新AI", {})
+                        if len(new_model.get("top4", [])) != 4:
+                            st.error("新AIの4頭が揃っていないため保存できません。")
+                        else:
+                            retro = {"race_id": rec["race_id"], "race_date": rec["race_date"], "race_name": rec["race_name"],
+                                     "model": "新AI", "classification": "事後検証", "top4": new_model["top4"],
+                                     "eligible": new_model.get("eligible", False), "bet_unit": rec["bet_unit"],
+                                     "recorded_at_utc": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+                                     "model_version": APP_VERSION}
+                            path = f"retrospective/{date.year}/{rec['race_id']}.json"
+                            if put_record(path, retro):
+                                st.success("事後検証として別保存しました。正式な新AI成績には加算されません。")
+                            else:
+                                st.info("このレースの事後検証は保存済みです。上書きしません。")
+                    except Exception as exc:
+                        st.error("事後検証の保存に失敗: " + str(exc))
         st.divider()
 
 
@@ -1050,6 +1075,37 @@ with t4:
             st.info("新AIの過去成績が0件でも、結果確定後に再計算した予想を過去の確定予想として補完しません。")
     except Exception as e:
         st.error("長期成績の取得に失敗: " + str(e))
+
+    with st.expander("🧪 新AIの事後検証成績（正式成績とは別）"):
+        try:
+            retro_rows = []
+            for folder in github_list_directories("retrospective"):
+                for path in list_files(folder):
+                    if not path.endswith(".json"):
+                        continue
+                    retro, _ = get_record(path)
+                    if not retro or retro.get("classification") != "事後検証":
+                        continue
+                    rid = retro.get("race_id")
+                    result = results.get(rid)
+                    top4 = retro.get("top4", [])
+                    if len(top4) != 4:
+                        continue
+                    hit, stake, paid = outcome({"top4": top4, "bet_unit": retro.get("bet_unit", 100)}, result) if result else (None,None,None)
+                    retro_rows.append({"レース": retro.get("race_name"), "日付": retro.get("race_date"),
+                        "新AI推奨4頭": ",".join(map(str,top4)), "状態": "未登録" if result is None else ("的中" if hit else "不的中"),
+                        "投資額": stake, "払戻額": paid})
+            if retro_rows:
+                df_retro = pd.DataFrame(retro_rows)
+                st.dataframe(df_retro, hide_index=True, use_container_width=True)
+                completed = df_retro[df_retro["状態"].isin(["的中","不的中"])]
+                if not completed.empty:
+                    stake_total = int(completed["投資額"].sum()); paid_total = int(completed["払戻額"].sum())
+                    st.write(f"事後検証：{len(completed)}件 / 的中率 {(completed['状態']=='的中').mean()*100:.1f}% / 回収率 {paid_total/stake_total*100:.1f}%" if stake_total else "投資額なし")
+            else:
+                st.info("事後検証の保存履歴はまだありません。")
+        except Exception as exc:
+            st.warning("事後検証履歴を取得できません: " + str(exc))
 
     with st.expander("🧹 10月17日・18日の結果だけリセット（予想は保護）"):
         st.warning("対象は2026-10-17（土）と2026-10-18（日）の確定結果のみです。旧AIの確定予想と新AIの保存予想は変更しません。")
