@@ -263,6 +263,10 @@ def parse_sheet_rows(rows, day_label, sheet_name=""):
             current["race_date"] = heading_date(heading) or heading_date(sheet_name)
             surface_text = heading + "\n" + "\n".join(current.get("race_info", [])[:4])
             surface_text = unicodedata.normalize("NFKC", surface_text)
+            # JRA race headings use "コース：1,400メートル（ダート・左）".
+            # Earlier detection only recognized "ダート1400" and missed Tokyo races.
+            # Determine the surface from the current race's course clause first.
+            course_clause = re.search(r"コース\s*[:：]\s*[\d,，]+\s*(?:メートル|m)\s*[（(]\s*(ダート|芝)", surface_text)
             dirt_match = re.search(r"(?:ダート|ダ)\s*(\d{3,4})\s*(?:m|メートル)?", surface_text, re.I)
             dirt_match_rev = re.search(r"(\d{3,4})\s*(?:m|メートル)?\s*(?:ダート|ダ)(?![ァ-ン])", surface_text, re.I)
             turf_match = re.search(r"(?:芝|ターフ)\s*(\d{3,4})|(\d{3,4})\s*(?:m)?\s*芝", surface_text, re.I)
@@ -275,8 +279,16 @@ def parse_sheet_rows(rows, day_label, sheet_name=""):
                 if len(set(distance_candidates)) == 1:
                     target_distance = int(distance_candidates[0])
             current["target_distance"] = target_distance
-            current["is_dirt_race"] = bool(dirt_match or dirt_match_rev or dirt_marker) and not bool(turf_match or turf_marker)
-            current["surface_conflict"] = bool((dirt_match or dirt_match_rev or dirt_marker) and (turf_match or turf_marker))
+            if course_clause:
+                current["is_dirt_race"] = course_clause.group(1) == "ダート"
+                current["surface_conflict"] = False
+                if target_distance is None:
+                    distance_from_clause = re.search(r"コース\s*[:：]\s*([\d,，]+)", surface_text)
+                    if distance_from_clause:
+                        current["target_distance"] = int(re.sub(r"[,，]", "", distance_from_clause.group(1)))
+            else:
+                current["is_dirt_race"] = bool(dirt_match or dirt_match_rev or dirt_marker) and not bool(turf_match or turf_marker)
+                current["surface_conflict"] = bool((dirt_match or dirt_match_rev or dirt_marker) and (turf_match or turf_marker))
             current["surface_diagnostic"] = surface_text[:240]
             going_match = re.search(r"(?:ダート|ダ)\s*(?:\d{3,4}\s*m?\s*)?(稍重|不良|良|重)", surface_text)
             current["target_going"] = going_match.group(1) if going_match else None
@@ -824,6 +836,9 @@ def render_races(day, date):
         if day == "日曜日開催" and any(r.get("course") == "東京" and r.get("race_no") == 12 for r in source_races):
             st.error("日曜の読み込み元に東京12Rが存在します。Google Driveのリンク先・アップロードファイルを確認してください。")
     selected, excluded = choose_dual(day)
+    # Always show source races even if the model screens them out.
+    source_dirt = [r for r in source_races if r.get("is_dirt_race")]
+    st.caption(f"読み込み元のダートレース：{len(source_dirt)}件（東京 {sum(r.get('course') == '東京' for r in source_dirt)}件）")
     st.info(f"推奨候補 {len(selected)} レース・除外 {len(excluded)} レース")
     
     try:
@@ -931,7 +946,11 @@ with t3:
                     return False
             ids = sorted((k for k, rec in predictions.items() if valid_result_race(rec)), reverse=True)
             if len(ids) < len(predictions):
-                st.warning(f"開催日・ダート対象の照合に合わない履歴 {len(predictions)-len(ids)} 件を結果入力候補から除外しました。GitHubの履歴は削除していません。")
+                rejected = [rec for rec in predictions.values() if not valid_result_race(rec)]
+                st.warning(f"開催日・ダート対象の照合に合わない履歴 {len(rejected)} 件を結果入力候補から除外しました。GitHubの履歴は削除していません。")
+                with st.expander("結果登録から除外した履歴と理由"):
+                    for rec in rejected:
+                        st.write(f"{rec.get('race_date')} {rec.get('race_name')}: 同日の元シートに一致するダートレースがない、または解析できていません")
             if not ids:
                 st.info("照合済みの結果入力対象がありません。読み込み元シートを確認してください。")
                 st.stop()
