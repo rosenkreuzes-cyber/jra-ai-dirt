@@ -639,6 +639,35 @@ def github_config():
     return token, repo
 
 
+def _github_http_error(error, operation):
+    """Surface useful rate-limit diagnostics without ever logging credentials."""
+    raw = error.read().decode("utf-8", errors="replace")
+    try:
+        message = str(json.loads(raw).get("message", ""))
+    except (ValueError, AttributeError):
+        message = raw[:180]
+    headers = error.headers
+    remaining = headers.get("X-RateLimit-Remaining", "不明")
+    reset = headers.get("X-RateLimit-Reset", "")
+    retry_after = headers.get("Retry-After", "")
+    reset_text = "不明"
+    if reset.isdigit():
+        reset_text = datetime.datetime.fromtimestamp(int(reset), datetime.timezone.utc).astimezone(
+            datetime.timezone(datetime.timedelta(hours=9))).strftime("%m/%d %H:%M JST")
+    if error.code == 403 and remaining == "0":
+        cause = "GitHub API利用上限に到達"
+    elif error.code in (403, 429) and ("secondary rate limit" in message.lower() or retry_after):
+        cause = "短時間のAPIアクセス制限"
+    elif error.code == 403:
+        cause = "GitHubアクセス権限・認証またはAPI制限"
+    else:
+        cause = "GitHub APIエラー"
+    # Do not expose the full server body (it can contain private URLs).
+    return RuntimeError(f"{operation}: {cause} (HTTP {error.code}, 残りAPI回数={remaining}, "
+                        f"上限解除={reset_text}, Retry-After={retry_after or 'なし'}, "
+                        f"GitHub応答={message[:150]})")
+
+
 def github_request(method, path, payload=None):
     token, repo = github_config()
     url = "https://api.github.com/repos/" + repo + "/contents/" + urllib.parse.quote(path, safe="/")
@@ -651,15 +680,15 @@ def github_request(method, path, payload=None):
         "Content-Type": "application/json",
     })
     try:
-        with urllib.request.urlopen(req, timeout=25) as response:
+        with urllib.request.urlopen(req, timeout=15) as response:
             return json.loads(response.read().decode("utf-8"))
     except HTTPError as e:
-        body = e.read().decode("utf-8", errors="replace")[:250]
         if e.code == 404 and method == "GET":
             return None
-        if e.code in (403, 429):
-            raise RuntimeError(f"GitHub APIのアクセス制限または権限エラー (HTTP {e.code})。しばらく待ってから再試行してください。詳細: {body}") from e
-        raise RuntimeError(f"GitHub HTTP {e.code}: {body}") from e
+        raise _github_http_error(e, method + " " + path) from e
+    except (TimeoutError, OSError) as e:
+        raise RuntimeError(f"GitHub通信失敗 ({method} {path}): {type(e).__name__}。"
+                           "保存結果が不明な場合はGitHubの履歴を確認してください") from e
 
 
 def get_record(path):
@@ -684,6 +713,7 @@ def put_record(path, record, overwrite=False):
         try:
             github_request("PUT", path, payload)
             read_all_history.clear()
+            st.session_state.pop("last_good_history", None)
             return True
         except RuntimeError as e:
             if "HTTP 409" in str(e) and attempt == 0:
@@ -705,6 +735,7 @@ def delete_record_safely(path, expected_race_id, expected_date):
         "sha": sha,
     })
     read_all_history.clear()
+    st.session_state.pop("last_good_history", None)
 
 
 RESET_DATES = ("2026-10-17", "2026-10-18")
@@ -764,25 +795,19 @@ def list_prediction_files_for_date(target_date):
 
 
 def list_files(directory):
-    token, repo = github_config()
-    url = "https://api.github.com/repos/" + repo + "/contents/" + urllib.parse.quote(directory, safe="/") + "?per_page=1000"
-    req = urllib.request.Request(url, headers={"Authorization": "Bearer " + token,
-        "Accept": "application/vnd.github+json", "X-GitHub-Api-Version": "2022-11-28", "User-Agent": "JRA-Streamlit-History"})
-    try:
-        with urllib.request.urlopen(req, timeout=25) as response:
-            items = json.loads(response.read().decode("utf-8"))
-    except HTTPError as e:
-        if e.code == 404:
-            return []
-        raise RuntimeError(f"GitHub一覧取得エラー HTTP {e.code}") from e
-    return [x["path"] for x in items if x.get("type") == "file" and x["name"].endswith(".json")]
+    items = github_request("GET", directory)
+    if items is None:
+        return []
+    if not isinstance(items, list):
+        raise RuntimeError("GitHub一覧が配列ではありません: " + directory)
+    return [x["path"] for x in items if x.get("type") == "file" and x.get("name", "").endswith(".json")]
 
 
 def race_key(date, race):
     return f"{date.isoformat()}_{race['course']}_{int(race['race_no']):02d}R"
 
 
-@st.cache_data(ttl=90, show_spinner=False)
+@st.cache_data(ttl=600, show_spinner=False)
 def read_all_history():
     predictions, results = {}, {}
     for kind, target in (("predictions", predictions), ("results", results)):
@@ -791,21 +816,17 @@ def read_all_history():
                 rec, _ = get_record(path)
                 if rec and rec.get("race_id"):
                     target[rec["race_id"]] = rec
+    st.session_state["last_good_history"] = (predictions, results)
     return predictions, results
 
 
 def github_list_directories(root):
-    token, repo = github_config()
-    url = "https://api.github.com/repos/" + repo + "/contents/" + root
-    req = urllib.request.Request(url, headers={"Authorization": "Bearer " + token,
-        "Accept": "application/vnd.github+json", "User-Agent": "JRA-Streamlit-History"})
-    try:
-        with urllib.request.urlopen(req, timeout=25) as response:
-            return [x["path"] for x in json.loads(response.read().decode("utf-8")) if x["type"] == "dir"]
-    except HTTPError as e:
-        if e.code == 404:
-            return []
-        raise RuntimeError(f"履歴フォルダ取得失敗 HTTP {e.code}") from e
+    items = github_request("GET", root)
+    if items is None:
+        return []
+    if not isinstance(items, list):
+        raise RuntimeError("GitHubフォルダ一覧が配列ではありません: " + root)
+    return [x["path"] for x in items if x.get("type") == "dir"]
 
 
 def outcome(pred, result):
@@ -868,8 +889,8 @@ def render_races(day, date):
     try:
         _, results_dict = read_all_history()
     except Exception as history_error:
-        results_dict = {}
-        st.warning("GitHub履歴の取得に失敗しました。予想表示は継続できますが、入着表示は一時的に利用できません: " + str(history_error))
+        results_dict = st.session_state.get("last_good_history", ({}, {}))[1]
+        st.warning("GitHub履歴の取得に失敗しました。前回取得済みの結果があれば参考表示します（最新ではない可能性があります）: " + str(history_error))
 
     with st.expander("除外レースと理由"):
         for name, reason in excluded:
