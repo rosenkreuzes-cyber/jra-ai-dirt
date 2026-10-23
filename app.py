@@ -11,6 +11,8 @@ import unicodedata
 import zipfile
 import json
 import base64
+import io
+import zipfile
 import datetime
 import calendar
 import urllib.parse
@@ -807,16 +809,59 @@ def race_key(date, race):
     return f"{date.isoformat()}_{race['course']}_{int(race['race_no']):02d}R"
 
 
+def _github_archive_history():
+    """Download one repository snapshot rather than N Contents API requests.
+
+    The archive endpoint requires one authenticated API call and follows a
+    redirect to GitHub's archive host. Never put the token in the URL.
+    """
+    token, repo = github_config()
+    url = "https://api.github.com/repos/" + repo + "/zipball"
+    req = urllib.request.Request(url, headers={
+        "Authorization": "Bearer " + token,
+        "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+        "User-Agent": "JRA-Streamlit-History",
+    })
+    try:
+        with urllib.request.urlopen(req, timeout=35) as response:
+            archive_bytes = response.read(35 * 1024 * 1024 + 1)
+    except HTTPError as e:
+        raise _github_http_error(e, "GET history archive") from e
+    except (OSError, TimeoutError) as e:
+        raise RuntimeError("GitHub履歴の一括取得に失敗: " + type(e).__name__) from e
+    if len(archive_bytes) > 35 * 1024 * 1024:
+        raise RuntimeError("履歴アーカイブが35MBを超えました。取得を停止しました")
+    predictions, results = {}, {}
+    try:
+        with zipfile.ZipFile(io.BytesIO(archive_bytes)) as archive:
+            entries = archive.infolist()
+            if len(entries) > 10000:
+                raise RuntimeError("履歴ファイル数が上限を超えました")
+            for item in entries:
+                if item.is_dir() or not item.filename.endswith(".json"):
+                    continue
+                parts = item.filename.split("/")
+                # GitHub zipball has one generated top-level directory.
+                if len(parts) != 4 or parts[1] not in ("predictions", "results"):
+                    continue
+                if not re.fullmatch(r"\d{4}", parts[2]):
+                    continue
+                if item.file_size > 1024 * 1024:
+                    raise RuntimeError("履歴JSONが1MBを超えました: " + parts[-1])
+                record = json.loads(archive.read(item).decode("utf-8"))
+                if not isinstance(record, dict) or not record.get("race_id"):
+                    continue
+                target = predictions if parts[1] == "predictions" else results
+                target[record["race_id"]] = record
+    except (zipfile.BadZipFile, UnicodeError, ValueError) as e:
+        raise RuntimeError("GitHub履歴アーカイブの解析に失敗: " + type(e).__name__) from e
+    return predictions, results
+
+
 @st.cache_data(ttl=600, show_spinner=False)
 def read_all_history():
-    predictions, results = {}, {}
-    for kind, target in (("predictions", predictions), ("results", results)):
-        for folder in github_list_directories(kind):
-            for path in list_files(folder):
-                rec, _ = get_record(path)
-                if rec and rec.get("race_id"):
-                    target[rec["race_id"]] = rec
-    st.session_state["last_good_history"] = (predictions, results)
+    predictions, results = _github_archive_history()
     return predictions, results
 
 
