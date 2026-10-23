@@ -426,7 +426,7 @@ def download_workbook(file_id):
     raise RuntimeError(" / ".join(failures))
 
 
-@st.cache_data(ttl=300)
+@st.cache_data(ttl=60)
 def load_races_from_google_drive():
     races, errors, diagnostics = [], [], []
     for source in SOURCES:
@@ -816,25 +816,29 @@ settings = {"min_coverage": min_coverage, "min_gap": min_gap,
     "min_top_history": min_top_history, "min_top_dirt": min_top_dirt}
 
 st.sidebar.divider()
-st.sidebar.header("📆 開催日（保存時に必須）")
-sat_date = st.sidebar.date_input("土曜日の開催日", value=datetime.date.today() - datetime.timedelta(days=(datetime.date.today().weekday()+2)%7), key="sat_date")
-sun_date = st.sidebar.date_input("日曜日の開催日", value=sat_date + datetime.timedelta(days=1), key="sun_date")
+st.sidebar.header("📆 開催日（Google Driveから自動取得）")
 
-# Current-week source validation: avoid reusing previous-week records after the
-# two linked Google Sheets are updated. Existing saved predictions are untouched.
-st.sidebar.caption("今週末の開催日を指定し、Google Driveの最新データを再取得してください。")
+def source_date(day_label):
+    records = [r for r in all_loaded_races if r.get("day_label") == day_label]
+    dates = sorted({r.get("race_date") for r in records if isinstance(r.get("race_date"), datetime.date)})
+    unknown = sum(not isinstance(r.get("race_date"), datetime.date) for r in records)
+    if not records or len(dates) != 1 or unknown:
+        st.sidebar.error(f"{day_label}: 開催日を確定できません（取得{len(records)}件・日付候補{len(dates)}種類・日付不明{unknown}件）。保存を停止します。")
+        return None
+    return dates[0]
+
+sat_date = source_date("土曜日開催")
+sun_date = source_date("日曜日開催")
 with st.sidebar.expander("📅 更新データの開催日確認", expanded=True):
     for day_label, expected in (("土曜日開催", sat_date), ("日曜日開催", sun_date)):
         records = [r for r in all_loaded_races if r.get("day_label") == day_label]
         dates = sorted({str(r.get("race_date") or "不明") for r in records})
-        st.write(f"{day_label}: {len(records)}レース / シート記載日: {', '.join(dates) if dates else '取得なし'} / 指定日: {expected.isoformat()}")
-        if records and any(r.get("race_date") != expected for r in records):
-            st.error(f"{day_label}のシート記載日と指定日が一致しません。更新後のシートまたは開催日設定を確認してください。")
-        elif not records:
-            st.warning(f"{day_label}のレースを取得できませんでした。")
+        st.write(f"{day_label}: {len(records)}レース / シート記載日: {', '.join(dates) if dates else '取得なし'}")
+        if expected:
+            st.success(f"自動設定：{expected.isoformat()}")
         else:
-            st.success(f"{day_label}の日付照合OK")
-
+            st.error("開催日未確定：予想の確定保存を停止")
+st.sidebar.caption("日付の手入力は不要です。Google Driveの内容を更新したら『最新データを再取得』を押してください。")
 
 
 def render_races(day, date):
@@ -842,15 +846,14 @@ def render_races(day, date):
     # The original records in GitHub are not modified by this filter.
     source_races = [r for r in all_loaded_races if r.get("day_label") == day]
     mismatches = [r for r in source_races if r.get("race_date") != date]
-    if mismatches:
-        st.error(f"{day}: 開催日を確認できない／指定日と異なるレースが {len(mismatches)} 件あります。誤保存防止のため、この日の予想表示・保存を停止しました。")
-        st.caption("スプレッドシートの開催日と左側の開催日設定を確認してください。")
-        return
     # Source audit: show the actual races parsed from the chosen day's workbook.
     with st.expander("🔎 読み込み元のレース一覧（確認用）", expanded=True):
         st.caption("ここはGitHubの保存履歴ではなく、選択日のスプレッドシートから取得した内容です。")
         st.dataframe(pd.DataFrame([{"開催日": str(r.get("race_date") or "不明"), "競馬場": r.get("course"), "R": r.get("race_no"), "レース名": r.get("race_name"), "ダート判定": bool(r.get("is_dirt_race")), "元シート": r.get("sheet_name")} for r in source_races]), hide_index=True, use_container_width=True)
         st.caption("レースの芝・ダート判定は読み込み元のコース情報に従います。特定のレース番号を日付だけで除外しません。")
+    if date is None or mismatches:
+        st.error(f"{day}: シートの開催日が未確定、または不一致のレースが{len(mismatches)}件あります。予想の確定保存を停止しました。")
+        return
     selected, excluded = choose_dual(day)
     # Always show source races even if the model screens them out.
     source_dirt = [r for r in source_races if r.get("is_dirt_race")]
