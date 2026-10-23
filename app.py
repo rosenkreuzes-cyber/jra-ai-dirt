@@ -657,6 +657,8 @@ def github_request(method, path, payload=None):
         body = e.read().decode("utf-8", errors="replace")[:250]
         if e.code == 404 and method == "GET":
             return None
+        if e.code in (403, 429):
+            raise RuntimeError(f"GitHub APIのアクセス制限または権限エラー (HTTP {e.code})。しばらく待ってから再試行してください。詳細: {body}") from e
         raise RuntimeError(f"GitHub HTTP {e.code}: {body}") from e
 
 
@@ -681,6 +683,7 @@ def put_record(path, record, overwrite=False):
             payload["sha"] = sha
         try:
             github_request("PUT", path, payload)
+            read_all_history.clear()
             return True
         except RuntimeError as e:
             if "HTTP 409" in str(e) and attempt == 0:
@@ -701,6 +704,7 @@ def delete_record_safely(path, expected_race_id, expected_date):
         "message": "JRA history: manually delete incorrect prediction " + path,
         "sha": sha,
     })
+    read_all_history.clear()
 
 
 RESET_DATES = ("2026-10-17", "2026-10-18")
@@ -778,6 +782,7 @@ def race_key(date, race):
     return f"{date.isoformat()}_{race['course']}_{int(race['race_no']):02d}R"
 
 
+@st.cache_data(ttl=90, show_spinner=False)
 def read_all_history():
     predictions, results = {}, {}
     for kind, target in (("predictions", predictions), ("results", results)):
@@ -862,8 +867,9 @@ def render_races(day, date):
     
     try:
         _, results_dict = read_all_history()
-    except:
+    except Exception as history_error:
         results_dict = {}
+        st.warning("GitHub履歴の取得に失敗しました。予想表示は継続できますが、入着表示は一時的に利用できません: " + str(history_error))
 
     with st.expander("除外レースと理由"):
         for name, reason in excluded:
@@ -930,7 +936,7 @@ def render_races(day, date):
                 st.error("保存失敗: " + str(e))
         # Retrospective snapshots are deliberately isolated from pre-race history.
         # They never overwrite an existing prediction or affect official ROI.
-        if race_key(date, race) in read_all_history()[1]:
+        if r_key in results_dict:
             with st.expander("🧪 新AIの事後検証を別保存（正式成績には加算しない）"):
                 st.caption("結果確定後に表示した新AIの4頭を、事後検証として別フォルダに記録します。旧AI・既存の予想JSONは変更しません。")
                 retro_confirm = st.checkbox("事後検証であり、事前確定予想ではないことを確認", key="retro_confirm_"+race_key(date,race))
@@ -966,6 +972,7 @@ with t2:
 with t3:
     st.subheader("確定結果の登録・訂正")
     if st.button("🔄 保存済み履歴を読み直す", key="refresh_history"):
+        read_all_history.clear()
         st.rerun()
     try:
         predictions, results = read_all_history()
