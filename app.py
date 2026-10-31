@@ -112,7 +112,7 @@ def parse_race_heading(value, sheet_name=""):
     race_no = None
     race_line_index = None
     for i, line in enumerate(lines):
-        match = re.search(r"(?<!\d)(?:第\s*)?(1[0-2]|[1-9])\s*(?:レース|R|Ｒ)(?![A-Za-z0-9])", line, re.I)
+        match = re.fullmatch(r"(?:第\s*)?(1[0-2]|[1-9])\s*(?:レース|R|Ｒ)", line, re.I)
         if match:
             race_no = int(match.group(1))
             race_line_index = i
@@ -120,7 +120,7 @@ def parse_race_heading(value, sheet_name=""):
     if race_no is None:
         return None
     following = lines[race_line_index + 1:]
-    following = [x for x in following if not re.search(r"ウインファイヴ|レース目|発走時刻", x)]
+    following = [x for x in following if not re.search(r"ウインファイヴ|レース目", x)]
     race_title = following[0] if following else ""
     return {"course": course, "race_no": race_no, "race_title": race_title}
 
@@ -239,8 +239,6 @@ def heading_date(raw):
     if not m:
         m = re.search(r"(20\d{2})[-/](\d{1,2})[-/](\d{1,2})", normalized)
     if not m:
-        m = re.search(r"(20\d{2})[._年\s]+(\d{1,2})[._月\s]+(\d{1,2})(?:日)?", normalized)
-    if not m:
         return None
     try:
         return datetime.date(*map(int, m.groups()))
@@ -310,18 +308,11 @@ def parse_sheet_rows(rows, day_label, sheet_name=""):
         if not any(cells):
             continue
         first = cells[0]
-        # 見出しが先頭列以外にある場合や「1R」表記にも対応。
-        # 過去走セルの「1R」をレース見出しと誤認しないよう、表の列見出し前だけ探索。
-        if True:
-            heading = None
-            for candidate in cells[:5]:
-                if ("発走時刻" in candidate or re.search(r"20\\d{2}年\\s*\\d{1,2}月\\s*\\d{1,2}日", candidate)) and re.search(r"(?:第\\s*)?(?:1[0-2]|[1-9])\\s*(?:レース|R|Ｒ)(?![A-Za-z0-9])", candidate, re.I):
-                    heading = parse_race_heading(candidate, sheet_name)
-                    if heading:
-                        break
+        if first and ("発走時刻" in first or "レース" in first):
+            heading = parse_race_heading(first, sheet_name)
             if heading:
                 finish()
-                current = {**heading, "horses": [], "heading_raw": "\n".join(cells), "race_info": [], "sheet_name": sheet_name}
+                current = {**heading, "horses": [], "heading_raw": " ".join(cells), "race_info": [], "sheet_name": sheet_name}
                 columns = None
                 continue
         if any("馬番" in c for c in cells) and any("馬名" in c for c in cells):
@@ -339,12 +330,27 @@ def parse_sheet_rows(rows, day_label, sheet_name=""):
         hi, ni, previous_indices = columns["horse"], columns["name"], columns["previous"]
         if max(hi, ni) >= len(cells):
             continue
+        # Some exported workbooks have an entirely empty 馬番 column.
+        # Preserve the horse rows for analysis, but never regard an inferred
+        # sequential position as a verified betting horse number.
+        inferred_number = False
         try:
             horse_no = int(float(cells[hi]))
             if not 1 <= horse_no <= 18 or float(cells[hi]) != horse_no:
                 continue
         except (ValueError, TypeError):
+            if not cells[ni] or not previous_indices:
+                continue
+            if not any(i < len(cells) and cells[i] for i in previous_indices):
+                continue
+            horse_no = len(current["horses"]) + 1
+            if horse_no > 18:
+                continue
+            inferred_number = True
+        if any(h["horse_no"] == horse_no for h in current["horses"]):
             continue
+        if inferred_number:
+            current["horse_numbers_unverified"] = True
         field = cells[ni]
         name = field.split("\n")[0].strip()
         if not name:
@@ -377,6 +383,7 @@ def parse_sheet_rows(rows, day_label, sheet_name=""):
         dirt_score = sum(dirt_results) / len(dirt_results) if dirt_results else None
         current["horses"].append({
             "horse_no": horse_no, "name": name,
+            "horse_no_verified": not inferred_number,
             "pop_rank": popularity, "odds": odds,
             "time_index": time_score, "last3f_index": last3f_score,
             "track_aptitude": 75.0,
@@ -437,35 +444,6 @@ def download_workbook(file_id):
     raise RuntimeError(" / ".join(failures))
 
 
-def workbook_audit(data, day):
-    """Display what the app actually downloaded, independently of prediction parsing."""
-    from openpyxl import load_workbook
-    wb = load_workbook(io.BytesIO(data), read_only=True, data_only=True)
-    messages = []
-    try:
-        for sheet in wb.worksheets:
-            heading_count = 0
-            horse_headers = 0
-            dates = set()
-            samples = []
-            for row in sheet.iter_rows(values_only=True):
-                cells = [clean_text(v) for v in row]
-                for cell in cells[:5]:
-                    if "発走時刻" in cell and re.search(r"(?:1[0-2]|[1-9])\\s*(?:レース|R|Ｒ)", cell):
-                        heading_count += 1
-                        d = heading_date(cell)
-                        if d:
-                            dates.add(d.isoformat())
-                        if len(samples) < 2:
-                            samples.append(cell[:110].replace("\\n", " / "))
-                if any("馬番" in c for c in cells) and any("馬名" in c for c in cells):
-                    horse_headers += 1
-            messages.append(f"{day} / {sheet.title}: レース見出し{heading_count}件・馬名表見出し{horse_headers}件・日付{','.join(sorted(dates)) or '不明'} / 例: {'; '.join(samples) or 'なし'}")
-    finally:
-        wb.close()
-    return messages
-
-
 @st.cache_data(ttl=60)
 def load_races_from_google_drive():
     races, errors, diagnostics = [], [], []
@@ -475,8 +453,7 @@ def load_races_from_google_drive():
             content, method = download_workbook(source["id"])
             parsed = parse_workbook_bytes(content, day)
             races.extend(parsed)
-            diagnostics.append(f"{day}: {method}から {len(parsed)} レースを取得")
-            diagnostics.extend(workbook_audit(content, day))
+            diagnostics.append(f"{day}: {method}から {len(parsed)} レースを取得 / 馬番空欄レース {sum(bool(r.get('horse_numbers_unverified')) for r in parsed)}件")
             if not parsed:
                 errors.append(f"{day}: Excelは取得できましたが、レースを解析できませんでした")
         except Exception as exc:
@@ -497,9 +474,6 @@ with st.sidebar.expander("📂 Excelファイルから読み込む（代替）")
     for upload, day in ((uploaded_sat, "土曜日開催"), (uploaded_sun, "日曜日開催")):
         if upload is not None:
             try:
-                st.info("アップロードファイルの内容: " + upload.name)
-                for message in workbook_audit(upload.getvalue(), day):
-                    st.write(message)
                 replacement = parse_workbook_bytes(upload.getvalue(), day)
                 if not replacement:
                     st.error(f"{day}: レースが見つかりませんでした")
@@ -964,14 +938,17 @@ def render_races(day, date):
         st.caption("ここはGitHubの保存履歴ではなく、選択日のスプレッドシートから取得した内容です。")
         st.dataframe(pd.DataFrame([{"開催日": str(r.get("race_date") or "不明"), "競馬場": r.get("course"), "R": r.get("race_no"), "レース名": r.get("race_name"), "ダート判定": bool(r.get("is_dirt_race")), "元シート": r.get("sheet_name")} for r in source_races]), hide_index=True, use_container_width=True)
         st.caption("レースの芝・ダート判定は読み込み元のコース情報に従います。特定のレース番号を日付だけで除外しません。")
+    unverified = [r for r in source_races if r.get("horse_numbers_unverified")]
+    if unverified:
+        st.warning(f"{len(unverified)}レースでExcelの馬番が空欄です。出走順の仮番号で指数を参考計算しますが、実際の馬番との一致が確認できないため、買い目と予想の確定保存は停止します。")
     if not source_races:
-        st.error(f"{day}: 読み込めたレースは0件です。開催日不一致ではなく、取得元ファイルまたはレース表の解析を確認してください。サイドバーの『データ取得診断』も参照してください。")
+        st.error(f"{day}: 読み込みレース0件です。Google Driveの参照先・公開設定、またはExcelの形式を確認してください。")
         return
     if date is None:
-        st.error(f"{day}: 開催日を確定できません。日付不明のレースまたは複数開催日が含まれます。予想の確定保存を停止しました。")
+        st.error(f"{day}: 開催日を確定できません。読み込みレース{len(source_races)}件、日付不明または複数の日付があります。")
         return
     if mismatches:
-        st.error(f"{day}: 開催日が{date.isoformat()}と一致しないレースが{len(mismatches)}件あります。予想の確定保存を停止しました。")
+        st.error(f"{day}: 開催日が不一致のレースが{len(mismatches)}件あります。確定保存を停止しました。")
         return
     selected, excluded = choose_dual(day)
     # Always show source races even if the model screens them out.
@@ -993,6 +970,8 @@ def render_races(day, date):
         return
     for race, evaluations in selected:
         st.subheader("🏇 " + race["race_name"])
+        if race.get("horse_numbers_unverified"):
+            st.warning("馬番が空欄のExcelです。以下の順位は仮の出走順であり、実際の馬番ではありません。予想確定保存は無効です。")
         
         r_key = race_key(date, race)
         res_data = results_dict.get(r_key)
@@ -1017,10 +996,10 @@ def render_races(day, date):
                     else:
                         formatted_top.append(f"{num}番")
                 
-                rec_str = " ・ ".join(formatted_top) if ev["metrics"] else "対象外（参考：" + "・".join(map(str, top)) + "）"
+                rec_str = ("馬番未確認のため非表示" if race.get("horse_numbers_unverified") else (" ・ ".join(formatted_top) if ev["metrics"] else "対象外（参考：" + "・".join(map(str, top)) + "）"))
                 st.markdown(f"推奨4頭： {rec_str}", unsafe_allow_html=True)
                 
-                if ev["metrics"] and len(top) >= 4:
+                if ev["metrics"] and len(top) >= 4 and not race.get("horse_numbers_unverified"):
                     sorted_top4 = sorted(top)
                     combos = list(itertools.combinations(sorted_top4, 3))
                     combos_str = " ／ ".join("-".join(map(str, c)) for c in combos)
@@ -1033,12 +1012,15 @@ def render_races(day, date):
                 df = ev["df"]
                 st.markdown("**" + label + "**")
                 top = sorted(int(x) for x in df.head(4)["horse_no"])
-                st.write("3連複4点：", " ／ ".join("-".join(map(str, x)) for x in itertools.combinations(top, 3)))
+                if race.get("horse_numbers_unverified"):
+                    st.write("馬番未確認：買い目は表示しません。指数は参考値です。")
+                else:
+                    st.write("3連複4点：", " ／ ".join("-".join(map(str, x)) for x in itertools.combinations(top, 3)))
                 cols = [c for c in ["horse_no", "name", "odds", "pop_rank", "ai_score", "margin_score", "distance_score", "going_score", "evidence_coverage", "time_score", "last3f_score", "idx_rank"] if c in df.columns]
                 st.dataframe(df[cols], hide_index=True, use_container_width=True)
         detected_date = race.get("race_date")
         verified = detected_date == date
-        if st.button("💾 旧AI・新AIの予想を同時に確定保存", key="save_" + race_key(date, race), disabled=(not verified or detected_date != date or not race.get("is_dirt_race") or race.get("surface_conflict"))):
+        if st.button("💾 旧AI・新AIの予想を同時に確定保存", key="save_" + race_key(date, race), disabled=(not verified or detected_date != date or not race.get("is_dirt_race") or race.get("surface_conflict") or race.get("horse_numbers_unverified", False))):
             rec = dual_snapshot(date, race, evaluations, settings)
             path = f"predictions/{date.year}/{rec['race_id']}.json"
             try:
@@ -1054,7 +1036,7 @@ def render_races(day, date):
             with st.expander("🧪 新AIの事後検証を別保存（正式成績には加算しない）"):
                 st.caption("結果確定後に表示した新AIの4頭を、事後検証として別フォルダに記録します。旧AI・既存の予想JSONは変更しません。")
                 retro_confirm = st.checkbox("事後検証であり、事前確定予想ではないことを確認", key="retro_confirm_"+race_key(date,race))
-                if st.button("新AIの事後検証を保存", key="retro_save_"+race_key(date,race), disabled=not retro_confirm):
+                if st.button("新AIの事後検証を保存", key="retro_save_"+race_key(date,race), disabled=(not retro_confirm or race.get("horse_numbers_unverified", False))):
                     try:
                         rec = dual_snapshot(date, race, evaluations, settings)
                         new_model = rec["models"].get("新AI", {})
