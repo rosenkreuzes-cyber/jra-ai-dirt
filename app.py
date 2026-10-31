@@ -112,7 +112,7 @@ def parse_race_heading(value, sheet_name=""):
     race_no = None
     race_line_index = None
     for i, line in enumerate(lines):
-        match = re.fullmatch(r"(?:第\s*)?(1[0-2]|[1-9])\s*(?:レース|R|Ｒ)", line, re.I)
+        match = re.search(r"(?<!\d)(?:第\s*)?(1[0-2]|[1-9])\s*(?:レース|R|Ｒ)(?![A-Za-z0-9])", line, re.I)
         if match:
             race_no = int(match.group(1))
             race_line_index = i
@@ -120,7 +120,7 @@ def parse_race_heading(value, sheet_name=""):
     if race_no is None:
         return None
     following = lines[race_line_index + 1:]
-    following = [x for x in following if not re.search(r"ウインファイヴ|レース目", x)]
+    following = [x for x in following if not re.search(r"ウインファイヴ|レース目|発走時刻", x)]
     race_title = following[0] if following else ""
     return {"course": course, "race_no": race_no, "race_title": race_title}
 
@@ -239,6 +239,8 @@ def heading_date(raw):
     if not m:
         m = re.search(r"(20\d{2})[-/](\d{1,2})[-/](\d{1,2})", normalized)
     if not m:
+        m = re.search(r"(20\d{2})[._年\s]+(\d{1,2})[._月\s]+(\d{1,2})(?:日)?", normalized)
+    if not m:
         return None
     try:
         return datetime.date(*map(int, m.groups()))
@@ -308,11 +310,18 @@ def parse_sheet_rows(rows, day_label, sheet_name=""):
         if not any(cells):
             continue
         first = cells[0]
-        if first and ("発走時刻" in first or "レース" in first):
-            heading = parse_race_heading(first, sheet_name)
+        # 見出しが先頭列以外にある場合や「1R」表記にも対応。
+        # 過去走セルの「1R」をレース見出しと誤認しないよう、表の列見出し前だけ探索。
+        if columns is None or current is None:
+            heading = None
+            for candidate in cells[:5]:
+                if re.search(r"(?:第\s*)?(?:1[0-2]|[1-9])\s*(?:レース|R|Ｒ)(?![A-Za-z0-9])", candidate, re.I):
+                    heading = parse_race_heading(candidate, sheet_name)
+                    if heading:
+                        break
             if heading:
                 finish()
-                current = {**heading, "horses": [], "heading_raw": " ".join(cells), "race_info": [], "sheet_name": sheet_name}
+                current = {**heading, "horses": [], "heading_raw": "\n".join(cells), "race_info": [], "sheet_name": sheet_name}
                 columns = None
                 continue
         if any("馬番" in c for c in cells) and any("馬名" in c for c in cells):
@@ -922,8 +931,14 @@ def render_races(day, date):
         st.caption("ここはGitHubの保存履歴ではなく、選択日のスプレッドシートから取得した内容です。")
         st.dataframe(pd.DataFrame([{"開催日": str(r.get("race_date") or "不明"), "競馬場": r.get("course"), "R": r.get("race_no"), "レース名": r.get("race_name"), "ダート判定": bool(r.get("is_dirt_race")), "元シート": r.get("sheet_name")} for r in source_races]), hide_index=True, use_container_width=True)
         st.caption("レースの芝・ダート判定は読み込み元のコース情報に従います。特定のレース番号を日付だけで除外しません。")
-    if date is None or mismatches:
-        st.error(f"{day}: シートの開催日が未確定、または不一致のレースが{len(mismatches)}件あります。予想の確定保存を停止しました。")
+    if not source_races:
+        st.error(f"{day}: 読み込めたレースは0件です。開催日不一致ではなく、取得元ファイルまたはレース表の解析を確認してください。サイドバーの『データ取得診断』も参照してください。")
+        return
+    if date is None:
+        st.error(f"{day}: 開催日を確定できません。日付不明のレースまたは複数開催日が含まれます。予想の確定保存を停止しました。")
+        return
+    if mismatches:
+        st.error(f"{day}: 開催日が{date.isoformat()}と一致しないレースが{len(mismatches)}件あります。予想の確定保存を停止しました。")
         return
     selected, excluded = choose_dual(day)
     # Always show source races even if the model screens them out.
