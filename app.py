@@ -312,10 +312,10 @@ def parse_sheet_rows(rows, day_label, sheet_name=""):
         first = cells[0]
         # 見出しが先頭列以外にある場合や「1R」表記にも対応。
         # 過去走セルの「1R」をレース見出しと誤認しないよう、表の列見出し前だけ探索。
-        if columns is None or current is None:
+        if True:
             heading = None
             for candidate in cells[:5]:
-                if re.search(r"(?:第\s*)?(?:1[0-2]|[1-9])\s*(?:レース|R|Ｒ)(?![A-Za-z0-9])", candidate, re.I):
+                if ("発走時刻" in candidate or re.search(r"20\\d{2}年\\s*\\d{1,2}月\\s*\\d{1,2}日", candidate)) and re.search(r"(?:第\\s*)?(?:1[0-2]|[1-9])\\s*(?:レース|R|Ｒ)(?![A-Za-z0-9])", candidate, re.I):
                     heading = parse_race_heading(candidate, sheet_name)
                     if heading:
                         break
@@ -437,6 +437,35 @@ def download_workbook(file_id):
     raise RuntimeError(" / ".join(failures))
 
 
+def workbook_audit(data, day):
+    """Display what the app actually downloaded, independently of prediction parsing."""
+    from openpyxl import load_workbook
+    wb = load_workbook(io.BytesIO(data), read_only=True, data_only=True)
+    messages = []
+    try:
+        for sheet in wb.worksheets:
+            heading_count = 0
+            horse_headers = 0
+            dates = set()
+            samples = []
+            for row in sheet.iter_rows(values_only=True):
+                cells = [clean_text(v) for v in row]
+                for cell in cells[:5]:
+                    if "発走時刻" in cell and re.search(r"(?:1[0-2]|[1-9])\\s*(?:レース|R|Ｒ)", cell):
+                        heading_count += 1
+                        d = heading_date(cell)
+                        if d:
+                            dates.add(d.isoformat())
+                        if len(samples) < 2:
+                            samples.append(cell[:110].replace("\\n", " / "))
+                if any("馬番" in c for c in cells) and any("馬名" in c for c in cells):
+                    horse_headers += 1
+            messages.append(f"{day} / {sheet.title}: レース見出し{heading_count}件・馬名表見出し{horse_headers}件・日付{','.join(sorted(dates)) or '不明'} / 例: {'; '.join(samples) or 'なし'}")
+    finally:
+        wb.close()
+    return messages
+
+
 @st.cache_data(ttl=60)
 def load_races_from_google_drive():
     races, errors, diagnostics = [], [], []
@@ -447,6 +476,7 @@ def load_races_from_google_drive():
             parsed = parse_workbook_bytes(content, day)
             races.extend(parsed)
             diagnostics.append(f"{day}: {method}から {len(parsed)} レースを取得")
+            diagnostics.extend(workbook_audit(content, day))
             if not parsed:
                 errors.append(f"{day}: Excelは取得できましたが、レースを解析できませんでした")
         except Exception as exc:
@@ -467,6 +497,9 @@ with st.sidebar.expander("📂 Excelファイルから読み込む（代替）")
     for upload, day in ((uploaded_sat, "土曜日開催"), (uploaded_sun, "日曜日開催")):
         if upload is not None:
             try:
+                st.info("アップロードファイルの内容: " + upload.name)
+                for message in workbook_audit(upload.getvalue(), day):
+                    st.write(message)
                 replacement = parse_workbook_bytes(upload.getvalue(), day)
                 if not replacement:
                     st.error(f"{day}: レースが見つかりませんでした")
