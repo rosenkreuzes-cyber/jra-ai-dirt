@@ -1298,3 +1298,144 @@ with t4:
             st.success(f"{success}件を削除しました")
             st.session_state.pop("delete_candidates", None)
             st.rerun()
+
+
+# ============================================================
+# Ver15: 履歴ベースの堅実性・激走可能性・3連複価値分析
+# 独立した検証機能。既存の予想/保存/GitHub履歴を変更しない。
+# ============================================================
+
+def v15_read_csv(data):
+    for encoding in ('utf-8-sig', 'utf-8', 'cp932'):
+        try:
+            return pd.read_csv(io.BytesIO(data), encoding=encoding, dtype={'馬ID': str, 'レースID': str})
+        except UnicodeDecodeError:
+            continue
+    raise ValueError('CSVの文字コードを解釈できません')
+
+
+def v15_num(s):
+    return pd.to_numeric(s, errors='coerce')
+
+
+def v15_date(s):
+    return pd.to_datetime(s, errors='coerce')
+
+
+def v15_feature_table(entries, histories):
+    needed_e = {'開催日','レースID','馬ID','馬番','馬名','人気','オッズ'}
+    needed_h = {'馬ID','日付','距離','着順','頭数','着差','上り','タイム','人気'}
+    if not needed_e.issubset(entries.columns) or not needed_h.issubset(histories.columns):
+        raise ValueError('出走表または過去成績CSVに必要な列がありません')
+    e, h = entries.copy(), histories.copy()
+    e['馬ID'] = e['馬ID'].astype(str).str.strip()
+    h['馬ID'] = h['馬ID'].astype(str).str.strip()
+    e['開催日_dt'] = v15_date(e['開催日'])
+    h['日付_dt'] = v15_date(h['日付'])
+    if e['開催日_dt'].isna().any():
+        raise ValueError('出走表の開催日が不明です。検証を停止しました')
+    if e.duplicated(['レースID','馬ID']).any():
+        raise ValueError('同一レース内に馬IDの重複があります')
+    h['着順_n'] = v15_num(h['着順'])
+    h['頭数_n'] = v15_num(h['頭数'])
+    h['着差_n'] = v15_num(h['着差'])
+    h['上り_n'] = v15_num(h['上り'])
+    h['距離_n'] = v15_num(h['距離'].astype(str).str.extract(r'(\d{3,4})')[0])
+    h['芝ダ'] = h['距離'].astype(str).str[0]
+    h['finish_pct'] = (h['頭数_n']-h['着順_n'])/(h['頭数_n']-1)
+    h.loc[~h['finish_pct'].between(0,1),'finish_pct'] = np.nan
+    h['top3'] = np.where(h['着順_n'].notna(),(h['着順_n']<=3).astype(float),np.nan)
+    # Race-day results are used ONLY in retrospective scoring, never as predictors.
+    rows=[]
+    for _, r in e.iterrows():
+        target = r['開催日_dt']
+        past = h[(h['馬ID']==r['馬ID']) & (h['日付_dt']<target)].sort_values('日付_dt',ascending=False)
+        dirt = past[past['芝ダ']=='ダ'].head(12)
+        all_recent = past.head(8)
+        target_dist = np.nan
+        race_history = h[(h['馬ID']==r['馬ID']) & (h['日付_dt']==target)]
+        # target distance from same-day results is NOT used for features.
+        # The user may supply an explicit target-distance mapping via the UI.
+        rows.append({'レースID':r['レースID'],'馬ID':r['馬ID'],'馬番':r['馬番'],'馬名':r['馬名'],
+          '開催日':str(target.date()),'オッズ':r['オッズ'],'人気':r['人気'],
+          '過去走数':len(past),'ダート走数':len(dirt),
+          'ダート近5走3着内率':dirt.head(5)['top3'].mean(),
+          'ダート近5走着順相対値':dirt.head(5)['finish_pct'].mean(),
+          'ダート近5走安定性':1-dirt.head(5)['finish_pct'].std(ddof=0) if len(dirt)>=2 else np.nan,
+          'ダート最高相対値':dirt['finish_pct'].max(),
+          'ダート近3走相対値':dirt.head(3)['finish_pct'].mean(),
+          'ダート近5走平均着差':dirt.head(5)['着差_n'].clip(lower=0).mean(),
+          '芝含む近8走3着内率':all_recent['top3'].mean(),
+          '今回着順_検証専用':race_history['着順_n'].iloc[0] if len(race_history) else np.nan})
+    f=pd.DataFrame(rows)
+    # Rank normalization per race, not across races of different quality.
+    keys=['ダート近5走3着内率','ダート近5走着順相対値','ダート近5走安定性','ダート最高相対値','ダート近3走相対値','ダート近5走平均着差']
+    for key in keys:
+        values=f[key] if key!='ダート近5走平均着差' else -f[key]
+        f[key+'_順位尺度']=values.groupby(f['レースID']).rank(pct=True,method='average')
+    # These are heuristics, NOT calibrated probabilities; weights need time-split training data.
+    f['堅実性指数']=100*(.30*f['ダート近5走3着内率_順位尺度']+.30*f['ダート近5走着順相対値_順位尺度']+
+                     .20*f['ダート近5走安定性_順位尺度']+.20*f['ダート近5走平均着差_順位尺度'])
+    f['激走余地']= (f['ダート最高相対値']-f['ダート近3走相対値']).clip(lower=0)
+    f['激走余地_順位尺度']=f.groupby('レースID')['激走余地'].rank(pct=True,method='average')
+    f['激走指数']=100*(.45*f['ダート最高相対値_順位尺度']+.35*f['激走余地_順位尺度']+
+                    .20*f['ダート近3走相対値_順位尺度'])
+    f.loc[f['ダート走数']<2,['堅実性指数','激走指数']]=np.nan
+    f['能力総合']=.70*f['堅実性指数']+.30*f['激走指数']
+    f['能力順位']=f.groupby('レースID')['能力総合'].rank(ascending=False,method='min')
+    f['人気_n']=v15_num(f['人気'])
+    f['人気乖離']=f['人気_n']-f['能力順位']
+    f['候補分類']=np.select([f['能力総合'].isna(),(f['堅実性指数']>=65)&(f['能力順位']<=5),
+                              (f['激走指数']>=65)&(f['人気乖離']>=3)],
+                             ['未評価','堅実候補','人気薄激走候補'],default='比較候補')
+    return f
+
+
+def v15_tickets(frame, max_horses=5):
+    results=[]
+    for rid, group in frame.groupby('レースID',sort=False):
+        valid=group.dropna(subset=['能力総合']).sort_values('能力総合',ascending=False)
+        if len(valid)<4:
+            continue
+        # Anchor: high stability. Value challenger only if evidence supports it.
+        core=valid.sort_values(['堅実性指数','能力総合'],ascending=False).head(3)
+        other=valid[~valid['馬ID'].isin(core['馬ID'])]
+        challenger=other.sort_values(['能力総合','激走指数'],ascending=False).head(max_horses-3)
+        chosen=pd.concat([core,challenger]).drop_duplicates('馬ID').head(max_horses)
+        if len(chosen)<3:continue
+        for combo in itertools.combinations(chosen.to_dict('records'),3):
+            nums=sorted(int(x['馬番']) for x in combo)
+            ability=float(np.mean([x['能力総合'] for x in combo]))
+            value=float(np.mean([max(0,x['人気乖離']) for x in combo if pd.notna(x['人気乖離'])])) if any(pd.notna(x['人気乖離']) for x in combo) else np.nan
+            finishes=[x['今回着順_検証専用'] for x in combo]
+            hit=bool(all(pd.notna(x) for x in finishes) and set(int(x) for x in finishes)=={1,2,3})
+            results.append({'レースID':rid,'3連複組合せ':'-'.join(map(str,nums)),'能力平均_参考':round(ability,1),
+              '人気乖離平均_参考':round(value,2) if pd.notna(value) else np.nan,
+              '事後的中判定_検証専用':hit,'3連複払戻100円':np.nan})
+    return pd.DataFrame(results)
+
+
+st.divider()
+st.header('🧪 Ver15 新AI：堅実性 × 激走余地 × 3連複価値')
+st.caption('検証用の独立機能です。従来の旧AI・新AIやGitHub保存履歴は変更しません。指数は予測確率ではありません。')
+with st.expander('📂 netkeiba CSVから新AIを分析',expanded=False):
+    v15_a=st.file_uploader('出走表CSV（20261101_出走表.csv）',type=['csv'],key='v15_entry')
+    v15_b=st.file_uploader('過去成績CSV（当日結果が含まれていても自動除外）',type=['csv'],key='v15_history')
+    st.caption('過去走は開催日より前だけを使用します。今回の着順は事後検証専用列に隔離します。')
+    if v15_a is not None and v15_b is not None:
+        try:
+            v15_f=v15_feature_table(v15_read_csv(v15_a.getvalue()),v15_read_csv(v15_b.getvalue()))
+            v15_t=v15_tickets(v15_f)
+            st.metric('出走馬',len(v15_f))
+            st.metric('能力評価可能馬',int(v15_f['能力総合'].notna().sum()))
+            st.metric('予想用ダート履歴ゼロ',int(v15_f['ダート走数'].eq(0).sum()))
+            st.warning('この1開催日の成績だけでは的中率の向上は実証できません。以下は仮説の事後点検であり、予測精度の保証ではありません。')
+            st.dataframe(v15_f[['レースID','馬番','馬名','過去走数','ダート走数','堅実性指数','激走指数','能力総合','能力順位','人気','人気乖離','候補分類']],hide_index=True,use_container_width=True)
+            st.download_button('馬別Ver15分析CSV',v15_f.to_csv(index=False).encode('utf-8-sig'),'Ver15_馬別分析.csv','text/csv',key='v15_download_horse')
+            if not v15_t.empty:
+                st.subheader('3連複組合せ（研究用）')
+                st.caption('組合せは候補を列挙したもので、配当期待値の高い順ではありません。実際の3連複払戻は別途必要です。')
+                st.dataframe(v15_t,hide_index=True,use_container_width=True)
+                st.download_button('3連複検証CSV',v15_t.to_csv(index=False).encode('utf-8-sig'),'Ver15_3連複検証.csv','text/csv',key='v15_download_trio')
+        except Exception as v15_err:
+            st.error('Ver15の解析を停止しました: '+str(v15_err))
