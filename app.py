@@ -1,4 +1,4 @@
-﻿import streamlit as st
+import streamlit as st
 import pandas as pd
 import numpy as np
 import itertools
@@ -482,6 +482,45 @@ with st.sidebar.expander("📂 Excelファイルから読み込む（代替）")
                     st.success(f"{day}: {len(replacement)} レースを読み込みました")
             except Exception as exc:
                 st.error(f"{day}: ファイル解析エラー: {exc}")
+
+
+# 結果が確認できた入着馬のみを緑色で表示する（予想指数には影響させない）。
+def green_placed_rows(frame, placed_numbers, number_col='horse_no'):
+    placed = {int(x) for x in placed_numbers if pd.notna(x)}
+    def paint(row):
+        try:
+            matched = pd.notna(row[number_col]) and int(row[number_col]) in placed
+        except (ValueError, TypeError, KeyError):
+            matched = False
+        return ['background-color: #174a32; color: #b8f7cb; font-weight: bold' if matched else '' for _ in row]
+    return frame.style.apply(paint, axis=1)
+
+
+def green_ticket_rows(frame, winning_numbers):
+    winning = {int(x) for x in winning_numbers if pd.notna(x)}
+    def paint(row):
+        try:
+            nums = {int(x) for x in str(row['3連複組合せ']).split('-')}
+            matched = len(winning) == 3 and nums == winning
+        except (ValueError, TypeError, KeyError):
+            matched = False
+        return ['background-color: #174a32; color: #b8f7cb; font-weight: bold' if matched else '' for _ in row]
+    return frame.style.apply(paint, axis=1)
+
+
+def green_combo_html(combos, placed_numbers):
+    placed = {int(x) for x in placed_numbers if pd.notna(x)}
+    parts = []
+    for combo in combos:
+        formatted = []
+        for n in combo:
+            n = int(n)
+            formatted.append(f"<strong style='color:#69e6a0'>{n}</strong>" if n in placed else str(n))
+        content = '-'.join(formatted)
+        if len(placed) == 3 and set(combo) == placed:
+            content = f"<span style='background:#174a32;color:#b8f7cb;font-weight:bold;padding:2px 5px;border-radius:4px'>{content} (的中)</span>"
+        parts.append(content)
+    return ' ／ '.join(parts)
 
 def calculate_ai_indices(horses_data):
     df = pd.DataFrame(horses_data)
@@ -1015,9 +1054,11 @@ def render_races(day, date):
                 if race.get("horse_numbers_unverified"):
                     st.write("馬番未確認：買い目は表示しません。指数は参考値です。")
                 else:
-                    st.write("3連複4点：", " ／ ".join("-".join(map(str, x)) for x in itertools.combinations(top, 3)))
+                    st.markdown("3連複4点： " + green_combo_html(list(itertools.combinations(top, 3)), placed_set), unsafe_allow_html=True)
                 cols = [c for c in ["horse_no", "name", "odds", "pop_rank", "ai_score", "margin_score", "distance_score", "going_score", "evidence_coverage", "time_score", "last3f_score", "idx_rank"] if c in df.columns]
-                st.dataframe(df[cols], hide_index=True, use_container_width=True)
+                st.dataframe(green_placed_rows(df[cols], placed_set), hide_index=True, use_container_width=True)
+                if placed_set:
+                    st.caption("緑色＝結果登録済みの3着以内馬。的中した3連複組合せも緑色で表示します。")
         detected_date = race.get("race_date")
         verified = detected_date == date
         if st.button("💾 旧AI・新AIの予想を同時に確定保存", key="save_" + race_key(date, race), disabled=(not verified or detected_date != date or not race.get("is_dirt_race") or race.get("surface_conflict") or race.get("horse_numbers_unverified", False))):
@@ -1532,12 +1573,45 @@ else:
         st.metric('能力評価可能馬', int(v15_f['能力総合'].notna().sum()))
         st.metric('予想用ダート履歴ゼロ', int(v15_f['ダート走数'].eq(0).sum()))
         st.warning('この1開催日の成績だけでは的中率向上は実証できません。以下は研究用の暫定指数です。')
-        st.dataframe(v15_f[['レースID','馬番','馬名','過去走数','ダート走数','堅実性指数','激走指数','能力総合','能力順位','人気','人気乖離','候補分類']],hide_index=True,use_container_width=True)
+        v15_cols = ['レースID','馬番','馬名','過去走数','ダート走数','堅実性指数','激走指数','能力総合','能力順位','人気','人気乖離','候補分類']
+        # 取得CSVに当日結果が存在する場合だけ、事後検証用に着順を表示・着色。
+        # 当日結果は能力指数・予想候補の選択には一切使わない。
+        v15_result_rows = v15_f[v15_f['今回着順_検証専用'].between(1, 3)]
+        v15_placed_by_race = {
+            str(rid): set(pd.to_numeric(group['馬番'], errors='coerce').dropna().astype(int))
+            for rid, group in v15_result_rows.groupby('レースID')
+        }
+        v15_display = v15_f[v15_cols].copy()
+        v15_display['結果（検証用）'] = v15_f['今回着順_検証専用'].apply(
+            lambda x: f'{int(x)}着（入着）' if pd.notna(x) and 1 <= x <= 3 else
+                      (f'{int(x)}着' if pd.notna(x) else '未登録'))
+        def v15_paint(row):
+            placed = v15_placed_by_race.get(str(row['レースID']), set())
+            try:
+                matched = int(row['馬番']) in placed
+            except (ValueError, TypeError):
+                matched = False
+            return ['background-color: #174a32; color: #b8f7cb; font-weight: bold' if matched else '' for _ in row]
+        st.dataframe(v15_display.style.apply(v15_paint, axis=1),hide_index=True,use_container_width=True)
+        if v15_placed_by_race:
+            st.caption('緑色＝CSVで当日結果が確認できた3着以内馬（事後検証表示）。予想指数には当日結果を使用していません。')
+        else:
+            st.caption('当日結果がCSVに未登録のため、入着馬の緑色表示は行いません。')
         st.download_button('馬別Ver15分析CSV',v15_f.to_csv(index=False).encode('utf-8-sig'),'Ver15_馬別分析.csv','text/csv',key='v15_download_horse')
         if not v15_t.empty:
             st.subheader('3連複組合せ（研究用）')
             st.caption('組合せは候補を列挙したもので、配当期待値の高い順ではありません。実際の3連複払戻は別途必要です。')
-            st.dataframe(v15_t,hide_index=True,use_container_width=True)
+            def v15_ticket_paint(row):
+                placed = v15_placed_by_race.get(str(row['レースID']), set())
+                try:
+                    nums = {int(x) for x in str(row['3連複組合せ']).split('-')}
+                    matched = len(placed) == 3 and nums == placed
+                except (ValueError, TypeError):
+                    matched = False
+                return ['background-color: #174a32; color: #b8f7cb; font-weight: bold' if matched else '' for _ in row]
+            st.dataframe(v15_t.style.apply(v15_ticket_paint, axis=1),hide_index=True,use_container_width=True)
+            if v15_placed_by_race:
+                st.caption('緑色＝CSVの確定着順と一致した3連複組合せ。結果未登録のレースは判定しません。')
             st.download_button('3連複検証CSV',v15_t.to_csv(index=False).encode('utf-8-sig'),'Ver15_3連複検証.csv','text/csv',key='v15_download_trio')
     except Exception as v15_err:
         st.error('Ver15の解析を停止しました: ' + str(v15_err))
