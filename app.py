@@ -1,4 +1,4 @@
-import streamlit as st
+﻿import streamlit as st
 import pandas as pd
 import numpy as np
 import itertools
@@ -1418,24 +1418,126 @@ def v15_tickets(frame, max_horses=5):
 st.divider()
 st.header('🧪 Ver15 新AI：堅実性 × 激走余地 × 3連複価値')
 st.caption('検証用の独立機能です。従来の旧AI・新AIやGitHub保存履歴は変更しません。指数は予測確率ではありません。')
-with st.expander('📂 netkeiba CSVから新AIを分析',expanded=False):
-    v15_a=st.file_uploader('出走表CSV（20261101_出走表.csv）',type=['csv'],key='v15_entry')
-    v15_b=st.file_uploader('過去成績CSV（当日結果が含まれていても自動除外）',type=['csv'],key='v15_history')
-    st.caption('過去走は開催日より前だけを使用します。今回の着順は事後検証専用列に隔離します。')
-    if v15_a is not None and v15_b is not None:
+# Google Drive CSV: shared-link / file-ID supported. Private files require a
+# separately authorized API integration; do not mistake an HTML login page for CSV.
+def v15_drive_id(value):
+    value = (value or '').strip()
+    if not value:
+        return ''
+    m = re.search(r'/file/d/([A-Za-z0-9_-]+)', value)
+    if not m:
+        m = re.search(r'[?&]id=([A-Za-z0-9_-]+)', value)
+    if m:
+        return m.group(1)
+    if re.fullmatch(r'[A-Za-z0-9_-]{15,}', value):
+        return value
+    raise ValueError('Google DriveのCSVファイルIDまたは共有URLを指定してください')
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def v15_download_drive_csv(file_id):
+    urls = [
+        'https://drive.google.com/uc?export=download&id=' + urllib.parse.quote(file_id),
+        'https://drive.usercontent.google.com/download?id=' + urllib.parse.quote(file_id) + '&export=download&confirm=t',
+    ]
+    failures = []
+    for url in urls:
         try:
-            v15_f=v15_feature_table(v15_read_csv(v15_a.getvalue()),v15_read_csv(v15_b.getvalue()))
-            v15_t=v15_tickets(v15_f)
-            st.metric('出走馬',len(v15_f))
-            st.metric('能力評価可能馬',int(v15_f['能力総合'].notna().sum()))
-            st.metric('予想用ダート履歴ゼロ',int(v15_f['ダート走数'].eq(0).sum()))
-            st.warning('この1開催日の成績だけでは的中率の向上は実証できません。以下は仮説の事後点検であり、予測精度の保証ではありません。')
-            st.dataframe(v15_f[['レースID','馬番','馬名','過去走数','ダート走数','堅実性指数','激走指数','能力総合','能力順位','人気','人気乖離','候補分類']],hide_index=True,use_container_width=True)
-            st.download_button('馬別Ver15分析CSV',v15_f.to_csv(index=False).encode('utf-8-sig'),'Ver15_馬別分析.csv','text/csv',key='v15_download_horse')
-            if not v15_t.empty:
-                st.subheader('3連複組合せ（研究用）')
-                st.caption('組合せは候補を列挙したもので、配当期待値の高い順ではありません。実際の3連複払戻は別途必要です。')
-                st.dataframe(v15_t,hide_index=True,use_container_width=True)
-                st.download_button('3連複検証CSV',v15_t.to_csv(index=False).encode('utf-8-sig'),'Ver15_3連複検証.csv','text/csv',key='v15_download_trio')
-        except Exception as v15_err:
-            st.error('Ver15の解析を停止しました: '+str(v15_err))
+            req = urllib.request.Request(url, headers={'User-Agent':'Mozilla/5.0','Accept':'text/csv,*/*'})
+            with urllib.request.urlopen(req, timeout=35) as response:
+                data = response.read(25 * 1024 * 1024 + 1)
+                content_type = response.headers.get('Content-Type', '')
+            if len(data) > 25 * 1024 * 1024:
+                raise ValueError('CSVが25MBを超えています')
+            if not data:
+                raise ValueError('空ファイルが返されました')
+            preview = data[:512].lstrip().lower()
+            if b'<html' in preview or b'<!doctype html' in preview or 'text/html' in content_type.lower():
+                raise ValueError('CSVではなくHTMLが返されました（共有権限またはGoogleの確認画面）')
+            if data[:2] == b'PK':
+                raise ValueError('CSVではなくZIP/Excelです')
+            df = v15_read_csv(data)
+            if df.empty:
+                raise ValueError('CSVの行がありません')
+            return data
+        except Exception as exc:
+            failures.append(type(exc).__name__ + ': ' + str(exc)[:160])
+    raise RuntimeError(' / '.join(failures))
+
+
+def v15_secret(key):
+    try:
+        return str(st.secrets.get(key, '') or '')
+    except Exception:
+        return ''
+
+
+# 固定のGoogle Drive CSV。ファイルの並び順が逆でも列構造で判定する。
+V15_DRIVE_FILES = (
+    '1z8iQTy4XaKYeJgF4CZaRADlncFDwaVld',
+    '1xhvpu6Qtk_VPCk2p4epC_8S_JruGSzxL',
+)
+
+
+def v15_csv_role(data):
+    frame = v15_read_csv(data)
+    cols = set(frame.columns)
+    if {'開催日', 'レースID', '馬ID', '馬番', '馬名'}.issubset(cols):
+        return '出走表'
+    if {'馬ID', '日付', '距離', '着順', '頭数'}.issubset(cols):
+        return '過去成績'
+    return '不明'
+
+
+with st.expander('📡 Ver15 Google Drive自動取得（固定リンク登録済み）', expanded=True):
+    st.caption('登録済みの2ファイルを自動取得し、CSVの列名から出走表と過去成績を識別します。ファイルの登録順は問いません。')
+    v15_auto = st.checkbox('Google DriveのCSVを自動取得', value=True, key='v15_drive_auto')
+    if st.button('🔄 Ver15のCSVを再取得', key='v15_drive_reload'):
+        v15_download_drive_csv.clear()
+        st.rerun()
+    st.caption('Google Driveの共有権限は「リンクを知っている全員・閲覧者」が必要です。ファイルを削除して再アップロードするとIDが変わるため、同じファイルを更新してください。')
+
+with st.expander('📂 Ver15 CSV手動アップロード（予備）', expanded=False):
+    v15_a = st.file_uploader('出走表CSV', type=['csv'], key='v15_entry')
+    v15_b = st.file_uploader('過去成績CSV', type=['csv'], key='v15_history')
+
+v15_entry_bytes = v15_a.getvalue() if v15_a is not None else None
+v15_history_bytes = v15_b.getvalue() if v15_b is not None else None
+v15_entry_source = '手動アップロード' if v15_entry_bytes is not None else ''
+v15_history_source = '手動アップロード' if v15_history_bytes is not None else ''
+if v15_auto and (v15_entry_bytes is None or v15_history_bytes is None):
+    for file_id in V15_DRIVE_FILES:
+        try:
+            downloaded = v15_download_drive_csv(file_id)
+            role = v15_csv_role(downloaded)
+            if role == '出走表' and v15_entry_bytes is None:
+                v15_entry_bytes, v15_entry_source = downloaded, 'Google Drive'
+            elif role == '過去成績' and v15_history_bytes is None:
+                v15_history_bytes, v15_history_source = downloaded, 'Google Drive'
+            elif role == '不明':
+                st.error('Google DriveファイルID ' + file_id + ' のCSV列名を認識できません。出走表/過去成績の元CSVか確認してください。')
+            else:
+                st.warning('Google DriveファイルID ' + file_id + ' は ' + role + ' と判定されましたが、同じ種類が既に登録されています。')
+        except Exception as err:
+            st.error('Ver15 Google Drive取得失敗（ID: ' + file_id + '）: ' + str(err))
+
+if v15_entry_bytes is None or v15_history_bytes is None:
+    st.info('Ver15の分析には出走表CSVと過去成績CSVの両方が必要です。Google Driveの各ファイルIDを登録するか、手動アップロードしてください。')
+else:
+    try:
+        v15_f = v15_feature_table(v15_read_csv(v15_entry_bytes), v15_read_csv(v15_history_bytes))
+        v15_t = v15_tickets(v15_f)
+        st.success(f'Ver15データ取得成功：出走表={v15_entry_source} / 過去成績={v15_history_source}')
+        st.metric('出走馬', len(v15_f))
+        st.metric('能力評価可能馬', int(v15_f['能力総合'].notna().sum()))
+        st.metric('予想用ダート履歴ゼロ', int(v15_f['ダート走数'].eq(0).sum()))
+        st.warning('この1開催日の成績だけでは的中率向上は実証できません。以下は研究用の暫定指数です。')
+        st.dataframe(v15_f[['レースID','馬番','馬名','過去走数','ダート走数','堅実性指数','激走指数','能力総合','能力順位','人気','人気乖離','候補分類']],hide_index=True,use_container_width=True)
+        st.download_button('馬別Ver15分析CSV',v15_f.to_csv(index=False).encode('utf-8-sig'),'Ver15_馬別分析.csv','text/csv',key='v15_download_horse')
+        if not v15_t.empty:
+            st.subheader('3連複組合せ（研究用）')
+            st.caption('組合せは候補を列挙したもので、配当期待値の高い順ではありません。実際の3連複払戻は別途必要です。')
+            st.dataframe(v15_t,hide_index=True,use_container_width=True)
+            st.download_button('3連複検証CSV',v15_t.to_csv(index=False).encode('utf-8-sig'),'Ver15_3連複検証.csv','text/csv',key='v15_download_trio')
+    except Exception as v15_err:
+        st.error('Ver15の解析を停止しました: ' + str(v15_err))
