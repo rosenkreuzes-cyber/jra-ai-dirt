@@ -16,6 +16,7 @@ import zipfile
 import datetime
 import calendar
 import urllib.parse
+import time
 from urllib.error import HTTPError, URLError
 
 # 1. ページの設定
@@ -42,7 +43,7 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-st.title("🏇 JRA 黄金パターン AI ダッシュボード [新AI評価点グラデーション修正版]")
+st.title("🏇 JRA 黄金パターン AI ダッシュボード【3連複人気取得対応】")
 
 # --- サイドバー ---
 with st.sidebar:
@@ -50,11 +51,15 @@ with st.sidebar:
     min_coverage = st.slider("最低過去走データ保有率 (%)", 50, 100, 75, 5)
     min_gap = st.slider("上位4頭と5位の最低指数差（※旧AIのみ適用）", 0.0, 20.0, 3.0, 0.5)
     min_confidence = st.slider("推奨最低評価点（的中確率ではありません）", 40, 95, 85, 5)
-    max_recommendations = st.slider("1日あたりの推奨上限", 3, 5, 5)
+    max_recommendations = st.slider("1日あたりの指数候補表示上限（購入数ではありません）", 1, 5, 5)
     min_top_history = st.slider("上位4頭の最低過去走数", 1, 4, 2)
     min_top_dirt = st.slider("上位4頭の最低ダート経験馬数", 2, 4, 3)
     bet_unit = st.number_input("1点あたりの金額 (円)", min_value=100, max_value=10000, value=100, step=100, key="box_unit")
     if st.button("🔄 Google Driveから最新データを再取得"):
+        st.session_state.pop("mobile_scraped_races", None)
+        st.session_state.pop("mobile_scrape_meta", None)
+        st.session_state["trio_refresh_pending"] = True
+        st.session_state.pop("trio_market_snapshots", None)
         st.cache_data.clear()
         st.rerun()
 
@@ -246,6 +251,18 @@ def heading_date(raw):
         return None
 
 
+
+def parse_prior_history_date(value):
+    """成績文字列から実開催日を取得。不明な履歴は予想に使わない。"""
+    value = clean_text(value)
+    m = re.search(r"(20\d{2})\s*(?:年|[-/])\s*(\d{1,2})\s*(?:月|[-/])\s*(\d{1,2})\s*日?", value)
+    if not m:
+        return None
+    try:
+        return datetime.date(*(int(x) for x in m.groups()))
+    except ValueError:
+        return None
+
 def parse_sheet_rows(rows, day_label, sheet_name=""):
     races = []
     current = None
@@ -312,7 +329,10 @@ def parse_sheet_rows(rows, day_label, sheet_name=""):
             heading = parse_race_heading(first, sheet_name)
             if heading:
                 finish()
-                current = {**heading, "horses": [], "heading_raw": " ".join(cells), "race_info": [], "sheet_name": sheet_name}
+                current = {**heading, "horses": [], "heading_raw": " ".join(cells),
+                           "race_info": [], "sheet_name": sheet_name,
+                           "race_date": heading_date(" ".join(cells)) or heading_date(sheet_name),
+                           "除外した当日以降の履歴": 0, "除外した日付不明履歴": 0}
                 columns = None
                 continue
         if any("馬番" in c for c in cells) and any("馬名" in c for c in cells):
@@ -361,7 +381,17 @@ def parse_sheet_rows(rows, day_label, sheet_name=""):
         popularity = int(odds_match.group(2)) if odds_match else None
 
         histories = [cells[i] for i in previous_indices if i < len(cells) and cells[i]]
-        valid_histories = [h for h in histories if re.search(r"20\d{2}年\d{1,2}月\d{1,2}日", h)]
+        # 発走前の履歴だけ。今回の開催日と同日・未来・日付不明は指数へ渡さない。
+        valid_histories = []
+        cutoff = current.get("race_date")
+        for h in histories:
+            run_date = parse_prior_history_date(h)
+            if run_date is None or not isinstance(cutoff, datetime.date):
+                current["除外した日付不明履歴"] += 1
+            elif run_date >= cutoff:
+                current["除外した当日以降の履歴"] += 1
+            else:
+                valid_histories.append(h)
         previous = valid_histories[0] if valid_histories else ""
         time_score, last3f_score = parse_horse_history(previous)
         history_scores = []
@@ -395,6 +425,13 @@ def parse_sheet_rows(rows, day_label, sheet_name=""):
         })
     finish()
     return races
+
+
+def summarize_history_exclusions(races):
+    return {
+        "当日以降": sum(int(r.get("除外した当日以降の履歴", 0)) for r in races),
+        "日付不明": sum(int(r.get("除外した日付不明履歴", 0)) for r in races),
+    }
 
 
 def parse_workbook_bytes(data, day_label):
@@ -461,8 +498,448 @@ def load_races_from_google_drive():
     return races, errors, diagnostics
 
 
+# ============================================================
+# スマートフォンから直接取得（Colab不要）
+# netkeiba公開ページをStreamlitサーバー側で取得する。
+# 旧AI・新AIのスコア関数は改変しない。
+# ============================================================
+
+def mobile_browser_session():
+    import requests
+    session = requests.Session()
+    session.headers.update({
+        "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                       "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"),
+        "Accept-Language": "ja-JP,ja;q=0.9,en;q=0.6",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    })
+    return session
+
+
+def mobile_get_soup(url, session=None, tries=3):
+    import requests
+    from bs4 import BeautifulSoup
+    session = session or mobile_browser_session()
+    failures = []
+    for attempt in range(1, tries + 1):
+        try:
+            response = session.get(url, timeout=(8, 23), allow_redirects=True)
+            response.raise_for_status()
+            if len(response.content) < 250:
+                raise RuntimeError("HTML本文が短すぎます")
+            soup = BeautifulSoup(response.content, "html.parser")
+            body_text = soup.get_text(" ", strip=True)[:500].lower()
+            if any(t in body_text for t in ("access denied", "captcha", "アクセスが集中")):
+                raise RuntimeError("提供元がアクセスを制限しています")
+            return soup
+        except requests.HTTPError as exc:
+            status = getattr(exc.response, "status_code", None)
+            failures.append(f"{attempt}回目 HTTP {status}")
+            if status in (403, 404):
+                break
+        except Exception as exc:
+            failures.append(f"{attempt}回目 {type(exc).__name__}: {str(exc)[:120]}")
+        if attempt < tries:
+            time.sleep(min(attempt * 1.0, 2.5))
+    raise RuntimeError(" / ".join(failures))
+
+
+def mobile_race_list(soup, target_date, min_race=6, max_race=12):
+    ids = []
+    for element in soup.select('a[href*="race_id="]'):
+        href = element.get("href", "")
+        ids += re.findall(r"race_id=(\d{12})", href)
+    if not ids:
+        ids = re.findall(r"race_id=(\d{12})", str(soup))
+    year = str(target_date.year)
+    valid = []
+    for rid in dict.fromkeys(ids):
+        if not rid.startswith(year):
+            continue
+        if not (rid[4:6] in TRIO_VENUE_CODES.values()):
+            continue
+        n = int(rid[-2:])
+        if min_race <= n <= max_race:
+            valid.append(rid)
+    return sorted(valid)
+
+
+def mobile_race_surface(soup):
+    # 出走表のレース条件欄だけを使う。ページ全文の芝・ダート混在は使わない。
+    selectors = (".RaceData01", ".RaceData02", ".RaceData03", ".RaceData", ".race_data")
+    metadata = " ".join(
+        el.get_text(" ", strip=True)
+        for sel in selectors for el in soup.select(sel)
+    )
+    normalized = unicodedata.normalize("NFKC", metadata)
+    patterns = [
+        (r"(?:ダート|ダ)\s*([0-9]{3,4})\s*m?", "ダート"),
+        (r"(?:芝)\s*([0-9]{3,4})\s*m?", "芝"),
+        (r"(?:障害|障)\s*([0-9]{3,4})\s*m?", "障害"),
+        (r"([0-9]{3,4})\s*(?:m|メートル)\s*[（(]\s*(ダート|芝|障害)", "逆順"),
+    ]
+    found = []
+    for pattern, label in patterns:
+        for m in re.finditer(pattern, normalized):
+            surface = m.group(2) if label == "逆順" else label
+            found.append((surface, int(m.group(1))))
+    if not found:
+        return "不明", None, metadata
+    surfaces = {a for a, _ in found}
+    if len(surfaces) != 1:
+        return "不明", None, metadata
+    surface = found[0][0]
+    distances = {distance for s, distance in found if s == surface}
+    if len(distances) != 1:
+        return "不明", None, metadata
+    return surface, distances.pop(), metadata
+
+
+def mobile_visible_text(node):
+    return node.get_text(" ", strip=True) if node else ""
+
+
+def mobile_number(value, lo=1, hi=18):
+    text = unicodedata.normalize("NFKC", str(value)).strip()
+    m = re.fullmatch(r"\d{1,3}", text)
+    if m:
+        n = int(text)
+        return n if lo <= n <= hi else None
+    return None
+
+
+def mobile_parse_shutuba(soup, rid, target_date):
+    venue = next((name for name, code in TRIO_VENUE_CODES.items() if code == rid[4:6]), None)
+    if not venue:
+        raise ValueError("競馬場コードが不明")
+    surface, distance, race_metadata = mobile_race_surface(soup)
+    course_title_node = soup.select_one(".RaceName")
+    race_title = mobile_visible_text(course_title_node).strip() or f"{int(rid[-2:])}R"
+    race_num = int(rid[-2:])
+    text = unicodedata.normalize("NFKC", " ".join(
+        mobile_visible_text(soup.select_one(sel))
+        for sel in (".RaceData01", ".RaceData02", ".RaceData03")
+    ))
+    start_m = re.search(r"(?<!\d)(\d{1,2}):(\d{2})\s*発走", text)
+    if not start_m:
+        start_m = re.search(r"発走\s*(\d{1,2}):(\d{2})", text)
+    start_text = (f"発走時刻：{int(start_m.group(1))}時{int(start_m.group(2))}分" if start_m else "発走時刻不明")
+    heading = (f"{target_date.year}年{target_date.month}月{target_date.day}日 "
+               f"第{int(rid[6:8])}回{venue}第{int(rid[8:10])}日 {start_text} "
+               f"{race_num}R {surface}{distance if distance else ''}m")
+    race = {
+        "course": venue, "race_no": race_num, "race_title": race_title,
+        "race_name": f"{venue} {race_num}R {race_title}",
+        "race_date": target_date, "heading_raw": heading,
+        "race_info": [race_metadata], "sheet_name": "スマホ直接取得(netkeiba)",
+        "identified": True, "netkeiba_race_id": rid, "horses": [],
+        "is_dirt_race": surface == "ダート", "surface_conflict": surface == "不明",
+        "surface_diagnostic": race_metadata[:240], "target_distance": distance,
+        "target_going": None, "horse_numbers_unverified": False,
+        "除外した当日以降の履歴": 0, "除外した日付不明履歴": 0,
+    }
+    if surface != "ダート":
+        return race, [], "芝・障害のため対象外" if surface != "不明" else "コース条件不明"
+    table = soup.select_one("table.ShutubaTable, table.RaceTable01")
+    if table is None:
+        raise RuntimeError("出走表テーブルが取得できません（アクセス制限・HTML変更の可能性）")
+    entrants = []
+    problems = []
+    rows = table.select("tbody tr") or table.select("tr")
+    for tr in rows:
+        horse_link = tr.select_one('a[href*="/horse/"]')
+        if horse_link is None:
+            continue
+        href = horse_link.get("href", "")
+        hm = re.search(r"/horse/(\d{8,12})", href)
+        if not hm:
+            problems.append("馬IDなし")
+            continue
+        horse_id = hm.group(1)
+        name = mobile_visible_text(horse_link)
+        node = tr.select_one("td.Umaban, td[class*='Umaban']")
+        horse_number = mobile_number(mobile_visible_text(node)) if node else None
+        if horse_number is None:
+            # 馬番を行番号から推定しない。
+            problems.append(f"馬番未確定:{name}")
+            continue
+        odds = None
+        for selector in ("td.Odds", "td[class*='Odds']", "td.Popular", "td[class*='Popular']"):
+            cell = tr.select_one(selector)
+            if cell:
+                m = re.search(r"(?<!\d)(\d+\.\d+)(?!\d)", mobile_visible_text(cell))
+                if m:
+                    odds = float(m.group(1))
+                    break
+        popularity = None
+        for selector in ("td.Ninki", "td[class*='Ninki']", "td.Rank", "[class*='NinkiRank']"):
+            cell = tr.select_one(selector)
+            if cell:
+                m = re.search(r"(?:^|\s)(\d{1,2})(?:番人気)?(?:\s|$)", mobile_visible_text(cell))
+                if m:
+                    popularity = mobile_number(m.group(1))
+                    break
+        entrants.append({
+            "レースID":rid, "開催日":target_date.isoformat(), "馬番":horse_number,
+            "馬名":name, "馬ID":horse_id, "オッズ":odds, "人気":popularity,
+        })
+    if not entrants:
+        raise RuntimeError("出走表から有効な馬番・馬名・馬IDを取得できません")
+    nums = [row["馬番"] for row in entrants]
+    if len(nums) != len(set(nums)):
+        problems.append("馬番重複")
+    official_match = re.search(r"(\d{1,2})\s*頭", unicodedata.normalize("NFKC", race_metadata))
+    if official_match and len(entrants) != int(official_match.group(1)):
+        problems.append(f"頭数不一致:{len(entrants)}/{official_match.group(1)}")
+    if problems:
+        race["horse_numbers_unverified"] = True
+    return race, entrants, "; ".join(problems)
+
+
+def mobile_horse_histories(soup, horse_id, target_date, limit=None):
+    table = soup.select_one("table.db_h_race_results")
+    if table is None:
+        raise RuntimeError("過去成績テーブルがありません")
+    aliases = {
+        "日付": {"日付", "年月日"}, "開催": {"開催", "場所"},
+        "レース名": {"レース名", "競走名"}, "頭数": {"頭数", "出走頭数"},
+        "着順": {"着順", "着"}, "タイム": {"タイム", "走破タイム"},
+        "着差": {"着差"}, "上り": {"上り", "上がり", "上り3F", "上がり3F"},
+        "距離": {"距離"}, "馬場": {"馬場", "馬場状態"},
+        "馬番": {"馬番", "馬番号"}, "人気": {"人気"}, "通過": {"通過", "コーナー通過順"},
+        "ペース": {"ペース"},
+    }
+    keymap = {unicodedata.normalize("NFKC", alias).replace(" ", ""): key
+              for key, variants in aliases.items() for alias in variants}
+    headers = None
+    data = []
+    excluded_today = 0
+    excluded_undated = 0
+    for tr in table.select("tr"):
+        cells = tr.find_all(["th", "td"], recursive=False)
+        if not cells:
+            continue
+        vals = [mobile_visible_text(cell) for cell in cells]
+        normalized = [unicodedata.normalize("NFKC", str(v)).replace(" ", "") for v in vals]
+        if "日付" in normalized and ("レース名" in normalized or "競走名" in normalized):
+            headers = [keymap.get(v, "") for v in normalized]
+            continue
+        if headers is None or len(vals) != len(headers):
+            continue
+        r = {key: value for key, value in zip(headers, vals) if key}
+        dm = re.search(r"(20\d{2})[./年-](\d{1,2})[./月-](\d{1,2})", r.get("日付", ""))
+        if not dm:
+            excluded_undated += 1
+            continue
+        try:
+            run_date = datetime.date(*(int(s) for s in dm.groups()))
+        except ValueError:
+            excluded_undated += 1
+            continue
+        if run_date >= target_date:
+            excluded_today += 1
+            continue
+        r["馬ID"] = horse_id
+        r["日付"] = run_date.isoformat()
+        data.append(r)
+        if limit and len(data) >= limit:
+            break
+    data.sort(key=lambda r: r["日付"], reverse=True)
+    return data, excluded_today, excluded_undated
+
+
+def mobile_history_run_string(r):
+    # 元のExcel履歴パーサーに渡すための文字列（指数ロジックは変更しない）。
+    distance = unicodedata.normalize("NFKC", r.get("距離", ""))
+    dist_m = re.search(r"(?:ダート|ダ|芝)\s*([0-9]{3,4})", distance)
+    is_dirt = bool(re.search(r"(?:ダート|ダ)\s*\d{3,4}", distance))
+    if not dist_m:
+        dist_m = re.search(r"([0-9]{3,4})\s*(?:ダート|ダ|芝)", distance)
+        is_dirt = bool(re.search(r"[0-9]{3,4}\s*(?:ダート|ダ)", distance))
+    d = int(dist_m.group(1)) if dist_m else None
+    surface_text = f"{d}{'ダ' if is_dirt else '芝'}" if d else distance
+    rank = unicodedata.normalize("NFKC", r.get("着順", ""))
+    rank_m = re.fullmatch(r"\s*(\d{1,2})\s*", rank)
+    rank_text = f"{rank_m.group(1)}着" if rank_m else rank
+    field = r.get("頭数", "")
+    field_m = re.search(r"\d{1,2}", str(field))
+    field_text = f"{field_m.group(0)}頭" if field_m else ""
+    last3f = unicodedata.normalize("NFKC", r.get("上り", ""))
+    margin = unicodedata.normalize("NFKC", r.get("着差", ""))
+    margin_text = f"({margin})" if re.fullmatch(r"[+-]?\d+(?:\.\d+)?", margin) else ""
+    going = unicodedata.normalize("NFKC", r.get("馬場", ""))
+    course = re.sub(r"[^一-龥ぁ-んァ-ン]", "", r.get("開催", ""))
+    venue = next((v for v in COURSES if v in course), "")
+    return "\n".join([r["日付"].replace("-", "/"), venue, field_text, rank_text,
+                      surface_text + " " + going, r.get("タイム", ""),
+                      "3F" + last3f if re.fullmatch(r"\d{2}\.\d", last3f) else "",
+                      margin_text])
+
+
+def mobile_horse_from_runs(entry, runs, target_date):
+    all_before = [r for r in runs if isinstance(r.get("日付"), str) and r["日付"] < target_date.isoformat()]
+    # 既存Excelが4走分のため、指数の入力は直近4走に揃える。全履歴はCSVに残す。
+    latest = sorted(all_before, key=lambda r: r["日付"], reverse=True)[:4]
+    texts = [mobile_history_run_string(r) for r in latest]
+    time_score, last3f_score = parse_horse_history(texts[0] if texts else "")
+    scores = []
+    dirt_runs = 0
+    for txt in texts:
+        ranking = re.search(r"(?<!\d)(\d{1,2})着", txt)
+        field = re.search(r"(?<!\d)(\d{1,2})頭", txt)
+        is_dirt = bool(re.search(r"\d{3,4}\s*ダ", txt))
+        if is_dirt:
+            dirt_runs += 1
+        if ranking and field:
+            rank, total = int(ranking.group(1)), int(field.group(1))
+            if total > 1 and 1 <= rank <= total:
+                scores.append((100 * (total-rank) / (total-1), is_dirt))
+    weighted = [(value, 1.0 if dirt else .65) for value, dirt in scores]
+    relative = sum(v*w for v,w in weighted)/sum(w for _,w in weighted) if weighted else None
+    dirt_scores = [value for value,dirt in scores if dirt]
+    return {
+        "horse_no":int(entry["馬番"]), "name":entry["馬名"],
+        "horse_no_verified":True, "horse_id":entry["馬ID"],
+        "pop_rank":entry.get("人気"), "odds":entry.get("オッズ"),
+        "time_index":time_score, "last3f_index":last3f_score,
+        "track_aptitude":75.0, "history_count":len(texts), "dirt_runs":dirt_runs,
+        "relative_score":relative,
+        "dirt_score":sum(dirt_scores)/len(dirt_scores) if dirt_scores else None,
+        "dirt_histories":[v for v in (parse_dirt_run(txt) for txt in texts) if v],
+    }
+
+
+def mobile_fetch_date(target_date, min_race=6, max_race=12):
+    """レース一覧・出走表・過去成績を取得して、アプリ既存形式に変換。"""
+    import concurrent.futures
+    session = mobile_browser_session()
+    page = mobile_get_soup(
+        f"https://race.netkeiba.com/top/race_list.html?kaisai_date={target_date:%Y%m%d}",
+        session=session, tries=3)
+    race_ids = mobile_race_list(page, target_date, min_race, max_race)
+    if not race_ids:
+        raise RuntimeError("指定日のJRAレースIDを取得できません。開催日・アクセス制限をご確認ください")
+    progress = st.progress(0.0, text="出走表を取得中")
+    race_records = []
+    entries = []
+    diagnostics = []
+    for i, rid in enumerate(race_ids, 1):
+        stamp = datetime.datetime.now(TRIO_JST).isoformat(timespec="seconds")
+        try:
+            race_soup = mobile_get_soup(
+                f"https://race.netkeiba.com/race/shutuba.html?race_id={rid}",
+                session=session, tries=3)
+            race, horses, message = mobile_parse_shutuba(race_soup, rid, target_date)
+            if race["is_dirt_race"]:
+                if horses:
+                    race_records.append(race)
+                    entries.extend(horses)
+                    result = "ダート出走表取得（馬番要確認）" if race["horse_numbers_unverified"] else "ダート出走表取得成功"
+                else:
+                    result = "ダート出走表なし"
+            else:
+                result = "ダート以外対象外" if not race["surface_conflict"] else "コース不明"
+            diagnostics.append({"レースID":rid,"処理結果":result,"取得頭数":len(horses),
+                                "理由":message,"取得日時JST":stamp})
+        except Exception as exc:
+            diagnostics.append({"レースID":rid,"処理結果":"取得失敗","取得頭数":0,
+                                "理由":str(exc)[:400],"取得日時JST":stamp})
+        progress.progress(i / max(len(race_ids),1) * .3,
+                          text=f"出走表 {i}/{len(race_ids)}件（ダート{len(race_records)}件）")
+        time.sleep(.35)
+    if not race_records:
+        progress.empty()
+        raise RuntimeError("ダート出走表を取得できませんでした。" + str(diagnostics[-5:]))
+    entries_by_horse = {e["馬ID"]:e for e in entries}
+    histories = {}
+    horse_errors = {}
+    excluded_same_day = 0
+    excluded_no_date = 0
+    skips_by_horse = {}
+    def fetch_horse(one):
+        hid, entry = one
+        try:
+            horse_soup = mobile_get_soup(f"https://db.netkeiba.com/horse/{hid}/", tries=2)
+            run_list, excluded_today, excluded_unknown = mobile_horse_histories(horse_soup, hid, target_date)
+            for run in run_list:
+                run["馬名"] = entry["馬名"]
+            return hid, run_list, excluded_today, excluded_unknown, ""
+        except Exception as exc:
+            return hid, [], 0, 0, str(exc)[:250]
+    with concurrent.futures.ThreadPoolExecutor(max_workers=3) as pool:
+        futures = [pool.submit(fetch_horse, one) for one in entries_by_horse.items()]
+        for i, future in enumerate(concurrent.futures.as_completed(futures), 1):
+            hid, rows, skip_day, skip_unknown, error = future.result()
+            histories[hid] = rows
+            skips_by_horse[hid] = (skip_day, skip_unknown)
+            excluded_same_day += skip_day
+            excluded_no_date += skip_unknown
+            if error:
+                horse_errors[hid] = error
+            progress.progress(.3 + .7 * i/max(len(futures), 1),
+                              text=f"各馬の過去成績 {i}/{len(futures)}頭")
+    progress.empty()
+    for race in race_records:
+        this_entries = [e for e in entries if e["レースID"] == race["netkeiba_race_id"]]
+        race["horses"] = [mobile_horse_from_runs(e, histories.get(e["馬ID"], []), target_date)
+                           for e in this_entries]
+        race["除外した当日以降の履歴"] = sum(skips_by_horse.get(e["馬ID"], (0, 0))[0] for e in this_entries)
+        race["除外した日付不明履歴"] = sum(skips_by_horse.get(e["馬ID"], (0, 0))[1] for e in this_entries)
+        dirt_model(race["horses"], race.get("target_distance"), race.get("target_going"))
+        if horse_errors:
+            miss = sum(e["馬ID"] in horse_errors for e in this_entries)
+            if miss:
+                diagnostics.append({"レースID":race["netkeiba_race_id"],"処理結果":"過去成績一部失敗",
+                                    "取得頭数":len(this_entries), "理由":f"{miss}頭の履歴取得失敗",
+                                    "取得日時JST":datetime.datetime.now(TRIO_JST).isoformat(timespec="seconds")})
+    all_history = [run for rows in histories.values() for run in rows]
+    all_history.sort(key=lambda r:(r.get("馬ID", ""), r.get("日付", "")), reverse=True)
+    for hid, error in horse_errors.items():
+        diagnostics.append({"レースID":"","処理結果":"馬履歴取得失敗",
+                            "取得頭数":0,"理由":f"{entries_by_horse[hid]['馬名']}({hid}):{error}",
+                            "取得日時JST":datetime.datetime.now(TRIO_JST).isoformat(timespec="seconds")})
+    day_label = ("土曜日開催" if target_date.weekday() == 5 else
+                 "日曜日開催" if target_date.weekday() == 6 else "指定日開催")
+    for race in race_records:
+        race["day_label"] = day_label
+    meta = {"date":target_date.isoformat(), "race_ids":len(race_ids), "dirt_races":len(race_records),
+            "horses":len(entries), "past_runs":len(all_history),
+            "excluded_today_or_later":excluded_same_day, "excluded_unknown_date":excluded_no_date,
+            "history_errors":len(horse_errors),
+            "fetched_at":datetime.datetime.now(TRIO_JST).isoformat(timespec="seconds")}
+    return race_records, entries, all_history, diagnostics, meta
+
+
+def mobile_export_zip(entries, histories, diagnostics, trio_snaps, meta):
+    payload = io.BytesIO()
+    prefix = meta.get("date", "mobile").replace("-", "")
+    with zipfile.ZipFile(payload, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        datasets = {
+            f"{prefix}_出走表.csv":pd.DataFrame(entries),
+            f"{prefix}_過去成績_当日以降除外.csv":pd.DataFrame(histories),
+            f"{prefix}_取得診断.csv":pd.DataFrame(diagnostics),
+            f"{prefix}_3連複オッズ人気.csv":trio_allmarket_csv(trio_snaps),
+        }
+        for filename, frame in datasets.items():
+            archive.writestr(filename, frame.to_csv(index=False).encode("utf-8-sig"))
+        archive.writestr(f"{prefix}_取得情報.json", json.dumps(meta, ensure_ascii=False, indent=2).encode("utf-8"))
+    return payload.getvalue()
+
+
 all_loaded_races, load_errors, load_diagnostics = load_races_from_google_drive()
+
+# スマホ直接取得したレースは、同じ開催曜日のDriveシートに優先させる。
+# 通信が失敗しても前回取得済みのデータは消さない。
+mobile_saved = st.session_state.get("mobile_scraped_races", [])
+if mobile_saved:
+    mobile_days = {r.get("day_label") for r in mobile_saved}
+    all_loaded_races = [r for r in all_loaded_races if r.get("day_label") not in mobile_days] + mobile_saved
+    load_diagnostics.append(f"スマホ直接取得：{len(mobile_saved)}ダートレース / "
+                            f"{st.session_state.get('mobile_scrape_meta',{}).get('fetched_at','')} JST")
+
 with st.sidebar.expander("📡 データ取得診断", expanded=bool(load_errors)):
+    excluded_summary = summarize_history_exclusions(all_loaded_races)
+    st.info(f"予想から除外済み：当日以降 {excluded_summary['当日以降']}走 / 日付不明 {excluded_summary['日付不明']}走")
     for msg in load_diagnostics:
         st.success(msg)
     for msg in load_errors:
@@ -955,6 +1432,8 @@ def source_date(day_label):
 
 sat_date = source_date("土曜日開催")
 sun_date = source_date("日曜日開催")
+special_date = (source_date("指定日開催") if any(r.get("day_label") == "指定日開催" for r in all_loaded_races)
+                else None)
 with st.sidebar.expander("📅 更新データの開催日確認", expanded=True):
     for day_label, expected in (("土曜日開催", sat_date), ("日曜日開催", sun_date)):
         records = [r for r in all_loaded_races if r.get("day_label") == day_label]
@@ -993,7 +1472,7 @@ def render_races(day, date):
     # Always show source races even if the model screens them out.
     source_dirt = [r for r in source_races if r.get("is_dirt_race")]
     st.caption(f"読み込み元のダートレース：{len(source_dirt)}件（東京 {sum(r.get('course') == '東京' for r in source_dirt)}件）")
-    st.info(f"推奨候補 {len(selected)} レース・除外 {len(excluded)} レース")
+    st.info(f"指数からの候補 {len(selected)} レース・除外 {len(excluded)} レース（購入確定ではありません）")
     
     try:
         _, results_dict = read_all_history()
@@ -1046,6 +1525,28 @@ def render_races(day, date):
 
                 st.caption("選考通過" if ev["metrics"] else "選考対象外：" + str(ev["reason"]))
 
+        # 3連複4頭BOXの4通りに、取得した人気とオッズを対応表示。
+        # 馬番未確定時は組合せを表示しない（出走表順を馬番と誤認しない）。
+        netkeiba_rid = trio_race_id(race)
+        snapshot = st.session_state.get("trio_market_snapshots", {}).get(netkeiba_rid) if netkeiba_rid else None
+        if race.get("horse_numbers_unverified"):
+            st.caption("3連複人気は馬番未確定のため表示しません。")
+        elif snapshot:
+            st.markdown("**📊 3連複・買い目ごとの人気とオッズ**")
+            st.caption(f"{snapshot.get('timing', '時刻不明')} / 取得 {snapshot.get('fetched_at', '')} JST / 人気が欠損した買い目は空欄です")
+            market_rows = []
+            for label, ev in evaluations.items():
+                four = [int(n) for n in ev["df"].head(4)["horse_no"]]
+                market_rows.extend(trio_ticket_rows(label, four, snapshot))
+            if market_rows:
+                st.dataframe(pd.DataFrame(market_rows), hide_index=True, use_container_width=True)
+                if any(row["取得状態"] != "取得" or pd.isna(row["3連複人気"]) for row in market_rows):
+                    st.warning("一部の組合せのオッズ・人気が未取得です。人気を推測で補完しません。")
+            else:
+                st.caption("4頭BOXの馬番が揃っていません。")
+        else:
+            st.caption("📱 3連複の人気・オッズは未取得です。画面上部の取得ボタンで更新できます。")
+
         with st.expander("両モデルの全馬指数・買い目"):
             for label, ev in evaluations.items():
                 df = ev["df"]
@@ -1061,7 +1562,11 @@ def render_races(day, date):
                     st.caption("緑色＝結果登録済みの3着以内馬。的中した3連複組合せも緑色で表示します。")
         detected_date = race.get("race_date")
         verified = detected_date == date
-        if st.button("💾 旧AI・新AIの予想を同時に確定保存", key="save_" + race_key(date, race), disabled=(not verified or detected_date != date or not race.get("is_dirt_race") or race.get("surface_conflict") or race.get("horse_numbers_unverified", False))):
+        save_timing = trio_snapshot_kind(race, datetime.datetime.now(TRIO_JST))
+        pre_start = save_timing == "発走前取得"
+        if not pre_start:
+            st.caption(f"確定保存不可：{save_timing}。結果を知った後のデータを事前予想に混ぜません。")
+        if st.button("💾 旧AI・新AIの予想を同時に確定保存", key="save_" + race_key(date, race), disabled=(not verified or not pre_start or detected_date != date or not race.get("is_dirt_race") or race.get("surface_conflict") or race.get("horse_numbers_unverified", False))):
             rec = dual_snapshot(date, race, evaluations, settings)
             path = f"predictions/{date.year}/{rec['race_id']}.json"
             try:
@@ -1099,12 +1604,439 @@ def render_races(day, date):
         st.divider()
 
 
+
+# ============================================================
+# スマートフォン向け：3連複オッズ・人気をその場で取得
+# 取得元は netkeiba のオッズデータ（type=7）。
+# 3連複の人気順位はAPIの3番目の値をそのまま使用し、
+# 提供がない場合は推測やオッズ順位の代入をしない。
+# ============================================================
+
+TRIO_VENUE_CODES = {
+    "札幌":"01", "函館":"02", "福島":"03", "新潟":"04", "東京":"05",
+    "中山":"06", "中京":"07", "京都":"08", "阪神":"09", "小倉":"10"
+}
+TRIO_JST = datetime.timezone(datetime.timedelta(hours=9))
+
+
+def trio_race_id(race):
+    """JRA開催見出しの回次・日次・開催場から12桁netkeiba IDを作る。推測補完しない。"""
+    date = race.get("race_date")
+    if not isinstance(date, datetime.date):
+        return None
+    official_id = race.get("netkeiba_race_id")
+    if official_id is not None:
+        rid = str(official_id)
+        venue = str(race.get("course", ""))
+        if (re.fullmatch(r"20\d{10}", rid) and rid[:4] == str(date.year)
+                and TRIO_VENUE_CODES.get(venue) == rid[4:6]
+                and int(rid[-2:]) == int(race.get("race_no", 0))):
+            return rid
+        return None
+    heading = unicodedata.normalize("NFKC", str(race.get("heading_raw", "")))
+    heading = re.sub(r"\s+", "", heading)
+    venue = str(race.get("course") or "")
+    number = race.get("race_no")
+    if venue not in TRIO_VENUE_CODES or not number:
+        return None
+    m = re.search(r"(?:第)?(\d{1,2})回" + re.escape(venue) + r"(?:第)?(\d{1,2})日", heading)
+    if not m:
+        return None
+    kai, day = map(int, m.groups())
+    if not (1 <= kai <= 9 and 1 <= day <= 12 and 1 <= int(number) <= 12):
+        return None
+    heading_day = heading_date(heading)
+    if heading_day is not None and heading_day != date:
+        return None
+    return f"{date.year:04d}{TRIO_VENUE_CODES[venue]}{kai:02d}{day:02d}{int(number):02d}"
+
+
+def trio_combo_key(raw):
+    """3連複の組合せキーを (馬番, 馬番, 馬番) に正規化する。"""
+    s = unicodedata.normalize("NFKC", str(raw)).strip()
+    if re.fullmatch(r"\d{6}", s):
+        vals = [int(s[i:i+2]) for i in (0, 2, 4)]
+    elif re.fullmatch(r"[1-9]{3}", s):
+        vals = [int(v) for v in s]
+    else:
+        parts = re.split(r"[-_/：:,\s]+", s)
+        if len(parts) != 3 or not all(re.fullmatch(r"\d{1,2}", p) for p in parts):
+            return None
+        vals = [int(p) for p in parts]
+    if len(set(vals)) != 3 or any(not (1 <= n <= 18) for n in vals):
+        return None
+    return tuple(sorted(vals))
+
+
+def trio_parse_payload(payload):
+    """公式人気として返された整数のみを格納する。人気が無い時はNone。"""
+    if not isinstance(payload, dict):
+        raise ValueError("オッズの返答がJSONオブジェクトではありません")
+    if str(payload.get("status", "")).lower() in ("ng", "error", "fail"):
+        raise ValueError("オッズ提供元が取得失敗を返しました")
+    block = payload.get("data")
+    if not isinstance(block, dict):
+        raise ValueError("オッズデータ領域がありません")
+    groups = block.get("odds")
+    group = groups.get("7", groups.get(7)) if isinstance(groups, dict) else None
+    if not isinstance(group, dict) or not group:
+        raise ValueError("3連複のオッズがありません（未発売または取得制限）")
+    data = {}
+    for key, item in group.items():
+        combo = trio_combo_key(key)
+        if combo is None or not isinstance(item, (list, tuple)) or not item:
+            continue
+        try:
+            odds = float(str(item[0]).replace(",", ""))
+            if not (0 < odds < 1000000) or not np.isfinite(odds):
+                continue
+        except (ValueError, TypeError):
+            continue
+        popularity = None
+        if len(item) >= 3 and re.fullmatch(r"\d{1,4}", str(item[2]).strip()):
+            n = int(str(item[2]).strip())
+            if 1 <= n <= 816:  # 最大18頭の3連複全通り
+                popularity = n
+        data[combo] = {"odds": odds, "popularity": popularity}
+    if not data:
+        raise ValueError("3連複の組合せ・オッズ形式が読み取れません")
+    return data, block.get("official_datetime", "")
+
+
+def trio_fetch_race(rid):
+    if not re.fullmatch(r"20\d{10}", str(rid)):
+        raise ValueError("レースID形式が不正です")
+    params = urllib.parse.urlencode({
+        "pid":"api_get_jra_odds", "race_id":rid, "type":"7", "action":"init",
+        "sort":"odds", "compress":"0", "output":"json"
+    })
+    url = "https://race.netkeiba.com/api/api_get_jra_odds.html?" + params
+    req = urllib.request.Request(url, headers={
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124.0 Safari/537.36",
+        "Accept":"application/json, text/javascript, */*",
+        "Referer": f"https://race.netkeiba.com/odds/index.html?race_id={rid}&type=b7",
+    })
+    with urllib.request.urlopen(req, timeout=12) as response:
+        raw = response.read(3 * 1024 * 1024)
+        if len(raw) >= 3 * 1024 * 1024:
+            raise ValueError("オッズAPIの応答が大きすぎます")
+    content = raw.decode("utf-8-sig", errors="replace").strip()
+    if not content.startswith("{"):
+        jm = re.fullmatch(r"[a-zA-Z_$][\w$]*\((.*)\)\s*;?", content, re.S)
+        if jm:
+            content = jm.group(1)
+    try:
+        payload = json.loads(content)
+    except (json.JSONDecodeError, ValueError):
+        raise ValueError("JSONではない応答です。アクセス制限や仕様変更の可能性があります")
+    return trio_parse_payload(payload)
+
+
+def trio_snapshot_kind(race, fetched_at):
+    """発走前取得かどうか。不明・発走後は事前データとして利用しない。"""
+    d = race.get("race_date")
+    if not isinstance(d, datetime.date):
+        return "開催日不明・検証対象外"
+    m = re.search(r"発走時刻\s*[:：]\s*(\d{1,2})時\s*(\d{1,2})分", str(race.get("heading_raw", "")))
+    if not m:
+        return "発走時刻不明・参考"
+    hour, minute = int(m.group(1)), int(m.group(2))
+    if hour > 23 or minute > 59:
+        return "発走時刻不明・参考"
+    start = datetime.datetime.combine(d, datetime.time(hour, minute), tzinfo=TRIO_JST)
+    return "発走前取得" if fetched_at < start else "発走時刻以降・事後参考"
+
+
+def trio_ticket_rows(model_name, numbers, snapshot):
+    market = snapshot.get("market", {})
+    rows = []
+    if len(numbers) != 4 or len(set(numbers)) != 4:
+        return rows
+    for combo in itertools.combinations(sorted(int(x) for x in numbers), 3):
+        rec = market.get(combo)
+        rows.append({
+            "モデル": model_name,
+            "組合せ": "-".join(map(str, combo)),
+            "3連複オッズ": rec.get("odds") if rec else None,
+            "3連複人気": rec.get("popularity") if rec else None,
+            "取得状態": "取得" if rec else "未取得",
+        })
+    return rows
+
+
+def trio_market_summary(market):
+    if not market:
+        return "未取得"
+    return f"取得 {len(market)}組 / 人気順位あり {sum(r.get('popularity') is not None for r in market.values())}組"
+
+
+def trio_fetch_race_with_retry(rid, max_attempts=3):
+    """アクセスエラーのみ再試行。人気・オッズ未提供も失敗理由を保存。"""
+    errors = []
+    for attempt in range(1, max_attempts + 1):
+        try:
+            market, official_time = trio_fetch_race(rid)
+            return market, official_time, attempt
+        except Exception as exc:
+            errors.append(f"{attempt}回目: {type(exc).__name__}: {exc}")
+            if attempt < max_attempts:
+                time.sleep(min(1.5 * attempt, 3.0))
+    raise RuntimeError(" | ".join(errors))
+
+
+def trio_collect_for_loaded_races(races):
+    updates, errors, diagnostics = {}, [], []
+    candidates = {}
+    for race in races:
+        if not race.get("is_dirt_race") or not race.get("identified", True):
+            continue
+        rid = trio_race_id(race)
+        if not rid:
+            message = f"{race.get('race_name', 'レース')}: 回次・開催日・日次のいずれかが不明"
+            errors.append(message)
+            diagnostics.append({"レース名":race.get("race_name", ""), "レースID":"",
+                                "結果":"取得不可", "試行回数":0, "理由":message,
+                                "取得日時JST": datetime.datetime.now(TRIO_JST).isoformat(timespec="seconds")})
+            continue
+        candidates[rid] = race
+    if not candidates:
+        return updates, errors, diagnostics
+    bar = st.progress(0, text="3連複人気を取得しています")
+    try:
+        for idx, (rid, race) in enumerate(candidates.items(), start=1):
+            stamp = datetime.datetime.now(TRIO_JST)
+            try:
+                market, official_time, attempts = trio_fetch_race_with_retry(rid)
+                # 頭数と全組合せ数の一致を確認。部分取得を「成功」と扱わない。
+                known_numbers = {int(h['horse_no']) for h in race.get('horses', [])
+                                 if h.get('horse_no_verified') and h.get('horse_no') is not None}
+                if (not race.get('horse_numbers_unverified') and len(known_numbers) >= 3):
+                    expected = len(known_numbers) * (len(known_numbers)-1) * (len(known_numbers)-2) // 6
+                    if len(market) != expected:
+                        raise ValueError(f"3連複組合せ数が不一致：{len(market)}/{expected}組")
+                stamp = datetime.datetime.now(TRIO_JST)
+                updates[rid] = {
+                    "market": market, "official_datetime": str(official_time or ""),
+                    "fetched_at": stamp.isoformat(timespec="seconds"),
+                    "timing": trio_snapshot_kind(race, stamp),
+                    "race_name": str(race.get("race_name", "")),
+                    "race_date": race.get("race_date").isoformat(),
+                }
+                diagnostics.append({"レース名":race.get("race_name", ""), "レースID":rid,
+                                    "結果":"取得成功", "試行回数":attempts, "理由":"",
+                                    "取得組合せ":len(market),
+                                    "人気順位あり":sum(x.get("popularity") is not None for x in market.values()),
+                                    "データ区分":updates[rid]["timing"], "取得日時JST":stamp.isoformat(timespec="seconds")})
+            except Exception as exc:
+                message = f"{race.get('race_name')} ({rid}): {exc}"
+                errors.append(message)
+                diagnostics.append({"レース名":race.get("race_name", ""), "レースID":rid,
+                                    "結果":"取得失敗", "試行回数":3, "理由":str(exc),
+                                    "取得組合せ":0, "人気順位あり":0,
+                                    "データ区分":"未取得", "取得日時JST":stamp.isoformat(timespec="seconds")})
+            bar.progress(idx / len(candidates), text=f"3連複人気取得 {idx}/{len(candidates)}レース")
+    finally:
+        bar.empty()
+    return updates, errors, diagnostics
+
+def trio_allmarket_csv(snapshots):
+    rows = []
+    for rid, obj in snapshots.items():
+        for combo, rec in obj.get("market", {}).items():
+            rows.append({
+                "レースID":rid, "開催日":obj.get("race_date"), "レース名":obj.get("race_name"),
+                "3連複組合せ":"-".join(map(str, combo)), "オッズ":rec.get("odds"),
+                "3連複人気":rec.get("popularity"), "取得日時JST":obj.get("fetched_at"),
+                "データ区分":obj.get("timing"), "提供元更新時刻":obj.get("official_datetime"),
+            })
+    return pd.DataFrame(rows, columns=[
+        "レースID", "開催日", "レース名", "3連複組合せ", "オッズ", "3連複人気",
+        "取得日時JST", "データ区分", "提供元更新時刻"
+    ])
+
+
+def trio_store_snapshot_github(snapshots, diagnostics):
+    """既存のGitHub保存先に市場データを1スナップショットとして記録する。"""
+    now = datetime.datetime.now(TRIO_JST)
+    stamp = now.strftime("%Y%m%dT%H%M%S%f")
+    path = f"market_snapshots/{now.year}/{stamp}.json"
+    markets = []
+    for rid, obj in snapshots.items():
+        combos = [{"組合せ":"-".join(map(str, combo)),
+                   "オッズ": rec.get("odds"), "3連複人気": rec.get("popularity")}
+                  for combo, rec in sorted(obj.get("market", {}).items())]
+        markets.append({"レースID":rid,
+                        "開催日":obj.get("race_date"), "レース名":obj.get("race_name"),
+                        "取得日時JST":obj.get("fetched_at"), "データ区分":obj.get("timing"),
+                        "提供元更新時刻":obj.get("official_datetime"), "組合せ":combos})
+    record = {"保存日時JST": now.isoformat(timespec="seconds"),
+              "取得元":"netkeiba・3連複オッズ人気（type=7）",
+              "取得レース数":len(markets), "各レース市場データ":markets, "取得診断":diagnostics,
+              "注記":"発走後取得は過去の予想・回収率検証に利用不可"}
+    put_record(path, record, overwrite=False)
+    return path
+
+
+# ============================================================
+# スマホからの日付指定→出走表→過去成績→3連複オッズ人気のワンタップ取得
+# 端末にはPython/Colab不要。処理はStreamlitサーバー側で実行される。
+# ============================================================
+st.subheader("📱 スマホで出走表・過去成績・3連複人気を取得")
+st.caption("日付を選んで押すだけ。6〜12Rのダートだけ対象に、netkeibaから直接取得します。Colab不要。")
+mobile_selected_date = st.date_input(
+    "取得する開催日", value=datetime.datetime.now(TRIO_JST).date(),
+    key="mobile_target_date"
+)
+if st.button("📲 出走表＋過去成績＋3連複人気を一括取得", key="mobile_fetch_all",
+             type="primary", use_container_width=True):
+    st.session_state["mobile_fetch_message"] = ""
+    try:
+        with st.spinner("対象日のダートレースと過去成績を取得中..."):
+            races, entries, histories, diagnostics, meta = mobile_fetch_date(mobile_selected_date)
+        # 3連複は個別エラーでも、出走表・過去成績を保持する。
+        with st.spinner("3連複の組合せ別オッズ・人気を取得中..."):
+            markets, errs, market_diag = trio_collect_for_loaded_races(races)
+        st.session_state["mobile_scraped_races"] = races
+        st.session_state["mobile_entries"] = entries
+        st.session_state["mobile_histories"] = histories
+        st.session_state["mobile_diagnostics"] = diagnostics + market_diag
+        meta["trio_races"] = len(markets)
+        meta["trio_combinations"] = sum(len(v.get("market",{})) for v in markets.values())
+        meta["trio_errors"] = len(errs)
+        st.session_state["mobile_scrape_meta"] = meta
+        st.session_state["trio_market_snapshots"] = markets
+        st.session_state["trio_market_errors"] = errs
+        st.session_state["trio_market_diagnostics"] = market_diag
+        st.session_state["trio_market_github_save"] = ""
+        if markets:
+            try:
+                saved_path = trio_store_snapshot_github(markets, market_diag)
+                st.session_state["trio_market_github_save"] = "取得日時付きでGitHubへ保存: " + saved_path
+            except Exception as save_exc:
+                st.session_state["trio_market_github_save"] = "GitHub自動保存不可: " + str(save_exc)
+        st.session_state["mobile_fetch_message"] = (
+            f"直接取得成功：ダート{len(races)}レース・{len(entries)}頭・"
+            f"発走前履歴{len(histories)}件・3連複{meta['trio_combinations']}組。"
+            f"取得エラーの内訳は診断CSVをご確認ください。"
+        )
+        st.rerun()
+    except Exception as exc:
+        st.error(f"直接取得に失敗しました：{type(exc).__name__}: {exc}")
+        st.info("netkeibaのアクセス制限・HTML変更・ネットワーク障害の可能性があります。" 
+                "既存のDrive読み込みは引き続き利用できます。")
+
+if st.session_state.get("mobile_fetch_message"):
+    st.success(st.session_state["mobile_fetch_message"])
+    meta = st.session_state.get("mobile_scrape_meta", {})
+    st.caption(f"取得日時：{meta.get('fetched_at','不明')} JST / "
+               f"当日以降の履歴除外 {meta.get('excluded_today_or_later',0)}件 / "
+               f"履歴取得失敗 {meta.get('history_errors',0)}頭")
+    if meta.get("trio_races", 0) == 0:
+        st.warning("3連複市場データは取得できませんでした。出走表と履歴は保存されています。")
+    mobile_zip = mobile_export_zip(
+        st.session_state.get("mobile_entries", []),
+        st.session_state.get("mobile_histories", []),
+        st.session_state.get("mobile_diagnostics", []),
+        st.session_state.get("trio_market_snapshots", {}), meta)
+    st.download_button("📦 スマホで取得した全データと診断をZIP保存", data=mobile_zip,
+                       file_name=f"{meta.get('date','JRA')}_スマホ直接取得.zip",
+                       mime="application/zip", use_container_width=True,
+                       key="mobile_download_all")
+    if st.session_state.get("mobile_diagnostics"):
+        with st.expander("スマホ直接取得の成功・失敗診断"):
+            st.dataframe(pd.DataFrame(st.session_state["mobile_diagnostics"]),
+                         hide_index=True, use_container_width=True)
+
+st.divider()
+st.caption("既存のGoogle Driveシートを使いたい場合は、こちらで3連複オッズ・人気だけ更新できます。")
+if "trio_market_snapshots" not in st.session_state:
+    st.session_state["trio_market_snapshots"] = {}
+if "trio_market_errors" not in st.session_state:
+    st.session_state["trio_market_errors"] = []
+if "trio_market_diagnostics" not in st.session_state:
+    st.session_state["trio_market_diagnostics"] = []
+
+if st.button("🔄 Driveシート＋3連複人気だけ再取得", key="mobile_fetch_trio", use_container_width=True):
+    st.session_state.pop("mobile_scraped_races", None)
+    st.session_state.pop("mobile_fetch_message", None)
+    st.session_state["trio_refresh_pending"] = True
+    load_races_from_google_drive.clear()
+    st.rerun()
+if st.session_state.pop("trio_refresh_pending", False):
+    with st.spinner("netkeibaから3連複人気を取得中..."):
+        # 古い値を成功結果として表示しない（失敗時にも取得済み扱いしない）
+        st.session_state["trio_market_snapshots"] = {}
+        st.session_state["trio_market_diagnostics"] = []
+        st.session_state["trio_market_errors"] = []
+        st.session_state["trio_market_github_save"] = ""
+        data, errs, diagnostics = trio_collect_for_loaded_races(all_loaded_races)
+        st.session_state["trio_market_snapshots"] = data
+        st.session_state["trio_market_errors"] = errs
+        st.session_state["trio_market_diagnostics"] = diagnostics
+        st.session_state["trio_market_github_save"] = ""
+        if data:
+            try:
+                saved_path = trio_store_snapshot_github(data, diagnostics)
+                st.session_state["trio_market_github_save"] = "取得日時付きでGitHubへ保存: " + saved_path
+            except Exception as save_exc:
+                # 外部ストレージが使えなくても取得結果を失わずZIP保存できる。
+                st.session_state["trio_market_github_save"] = "GitHubへの自動保存不可: " + str(save_exc)
+    if data:
+        st.success(f"取得成功：{len(data)}レース。各4頭BOXの4点に人気順位を表示します。")
+    else:
+        st.warning("3連複の人気を取得できませんでした。発売前・アクセス制限・回次不明などが考えられます。")
+
+if st.session_state.get("trio_market_github_save"):
+    message = st.session_state["trio_market_github_save"]
+    if message.startswith("取得日時付き"):
+        st.success(message)
+    else:
+        st.warning(message + "。以下のZIP保存をご利用ください。")
+
+trio_snapshots = st.session_state["trio_market_snapshots"]
+if trio_snapshots:
+    st.caption(" / ".join(f"{v['race_name']}: {trio_market_summary(v['market'])}" for v in list(trio_snapshots.values())[:8]))
+    for v in trio_snapshots.values():
+        if v.get("timing") != "発走前取得":
+            st.warning("発走時刻以降に取得した市場データが含まれます。過去の予想・バックテストに混ぜないでください。")
+            break
+    market_csv = trio_allmarket_csv(trio_snapshots)
+    st.download_button("📥 取得した3連複オッズ・人気をCSV保存", data=market_csv.to_csv(index=False).encode("utf-8-sig"),
+                       file_name="JRA_3連複オッズ人気_取得結果.csv", mime="text/csv", key="trio_market_download", use_container_width=True)
+# スマホから取得失敗もCSVに保存できるようにする（成功・失敗両方のログ）。
+if st.session_state["trio_market_diagnostics"]:
+    diag_df = pd.DataFrame(st.session_state["trio_market_diagnostics"])
+    st.download_button("📥 3連複取得診断・失敗理由CSV", data=diag_df.to_csv(index=False).encode("utf-8-sig"),
+                       file_name="JRA_3連複人気_取得診断.csv", mime="text/csv", key="trio_diagnostic_download", use_container_width=True)
+    bundle = io.BytesIO()
+    with zipfile.ZipFile(bundle, "w", zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr("3連複オッズ人気.csv", trio_allmarket_csv(st.session_state["trio_market_snapshots"]).to_csv(index=False).encode("utf-8-sig"))
+        zf.writestr("取得診断.csv", diag_df.to_csv(index=False).encode("utf-8-sig"))
+    st.download_button("📦 取得結果＋診断をZIP保存", data=bundle.getvalue(),
+                       file_name="JRA_3連複取得結果_診断一式.zip", mime="application/zip", key="trio_bundle_download", use_container_width=True)
+
+if st.session_state["trio_market_errors"]:
+    with st.expander(f"取得できなかったレース・理由（{len(st.session_state['trio_market_errors'])}件）"):
+        for err in st.session_state["trio_market_errors"]:
+            st.write(err)
+st.caption("人気順位とオッズだけで回収率100%を保証することはできません。指数候補は購入確定ではなく、購入しない判断も可能です。")
+
 st.checkbox("🔬 検証モード：推奨上限を解除して全候補を表示", key="show_all_for_validation")
-t1, t2, t3, t4 = st.tabs(["📅 土曜推奨", "📅 日曜推奨", "📝 結果登録", "📊 長期成績"])
-with t1:
+tab_labels = ["📅 土曜推奨", "📅 日曜推奨"]
+if special_date is not None:
+    tab_labels.append("📅 指定日推奨")
+tab_labels += ["📝 結果登録", "📊 長期成績"]
+tabs = st.tabs(tab_labels)
+with tabs[0]:
     render_races("土曜日開催", sat_date)
-with t2:
+with tabs[1]:
     render_races("日曜日開催", sun_date)
+next_tab_index = 2
+if special_date is not None:
+    with tabs[next_tab_index]:
+        render_races("指定日開催", special_date)
+    next_tab_index += 1
+t3, t4 = tabs[next_tab_index:next_tab_index+2]
 
 with t3:
     st.subheader("確定結果の登録・訂正")
@@ -1339,279 +2271,3 @@ with t4:
             st.success(f"{success}件を削除しました")
             st.session_state.pop("delete_candidates", None)
             st.rerun()
-
-
-# ============================================================
-# Ver15: 履歴ベースの堅実性・激走可能性・3連複価値分析
-# 独立した検証機能。既存の予想/保存/GitHub履歴を変更しない。
-# ============================================================
-
-def v15_read_csv(data):
-    for encoding in ('utf-8-sig', 'utf-8', 'cp932'):
-        try:
-            return pd.read_csv(io.BytesIO(data), encoding=encoding, dtype={'馬ID': str, 'レースID': str})
-        except UnicodeDecodeError:
-            continue
-    raise ValueError('CSVの文字コードを解釈できません')
-
-
-def v15_num(s):
-    return pd.to_numeric(s, errors='coerce')
-
-
-def v15_date(s):
-    return pd.to_datetime(s, errors='coerce')
-
-
-def v15_feature_table(entries, histories):
-    needed_e = {'開催日','レースID','馬ID','馬番','馬名','人気','オッズ'}
-    needed_h = {'馬ID','日付','距離','着順','頭数','着差','上り','タイム','人気'}
-    if not needed_e.issubset(entries.columns) or not needed_h.issubset(histories.columns):
-        raise ValueError('出走表または過去成績CSVに必要な列がありません')
-    e, h = entries.copy(), histories.copy()
-    e['馬ID'] = e['馬ID'].astype(str).str.strip()
-    h['馬ID'] = h['馬ID'].astype(str).str.strip()
-    e['開催日_dt'] = v15_date(e['開催日'])
-    h['日付_dt'] = v15_date(h['日付'])
-    if e['開催日_dt'].isna().any():
-        raise ValueError('出走表の開催日が不明です。検証を停止しました')
-    if e.duplicated(['レースID','馬ID']).any():
-        raise ValueError('同一レース内に馬IDの重複があります')
-    h['着順_n'] = v15_num(h['着順'])
-    h['頭数_n'] = v15_num(h['頭数'])
-    h['着差_n'] = v15_num(h['着差'])
-    h['上り_n'] = v15_num(h['上り'])
-    h['距離_n'] = v15_num(h['距離'].astype(str).str.extract(r'(\d{3,4})')[0])
-    h['芝ダ'] = h['距離'].astype(str).str[0]
-    h['finish_pct'] = (h['頭数_n']-h['着順_n'])/(h['頭数_n']-1)
-    h.loc[~h['finish_pct'].between(0,1),'finish_pct'] = np.nan
-    h['top3'] = np.where(h['着順_n'].notna(),(h['着順_n']<=3).astype(float),np.nan)
-    # Race-day results are used ONLY in retrospective scoring, never as predictors.
-    rows=[]
-    for _, r in e.iterrows():
-        target = r['開催日_dt']
-        past = h[(h['馬ID']==r['馬ID']) & (h['日付_dt']<target)].sort_values('日付_dt',ascending=False)
-        dirt = past[past['芝ダ']=='ダ'].head(12)
-        all_recent = past.head(8)
-        target_dist = np.nan
-        race_history = h[(h['馬ID']==r['馬ID']) & (h['日付_dt']==target)]
-        # target distance from same-day results is NOT used for features.
-        # The user may supply an explicit target-distance mapping via the UI.
-        rows.append({'レースID':r['レースID'],'馬ID':r['馬ID'],'馬番':r['馬番'],'馬名':r['馬名'],
-          '開催日':str(target.date()),'オッズ':r['オッズ'],'人気':r['人気'],
-          '過去走数':len(past),'ダート走数':len(dirt),
-          'ダート近5走3着内率':dirt.head(5)['top3'].mean(),
-          'ダート近5走着順相対値':dirt.head(5)['finish_pct'].mean(),
-          'ダート近5走安定性':1-dirt.head(5)['finish_pct'].std(ddof=0) if len(dirt)>=2 else np.nan,
-          'ダート最高相対値':dirt['finish_pct'].max(),
-          'ダート近3走相対値':dirt.head(3)['finish_pct'].mean(),
-          'ダート近5走平均着差':dirt.head(5)['着差_n'].clip(lower=0).mean(),
-          '芝含む近8走3着内率':all_recent['top3'].mean(),
-          '今回着順_検証専用':race_history['着順_n'].iloc[0] if len(race_history) else np.nan})
-    f=pd.DataFrame(rows)
-    # Rank normalization per race, not across races of different quality.
-    keys=['ダート近5走3着内率','ダート近5走着順相対値','ダート近5走安定性','ダート最高相対値','ダート近3走相対値','ダート近5走平均着差']
-    for key in keys:
-        values=f[key] if key!='ダート近5走平均着差' else -f[key]
-        f[key+'_順位尺度']=values.groupby(f['レースID']).rank(pct=True,method='average')
-    # These are heuristics, NOT calibrated probabilities; weights need time-split training data.
-    f['堅実性指数']=100*(.30*f['ダート近5走3着内率_順位尺度']+.30*f['ダート近5走着順相対値_順位尺度']+
-                     .20*f['ダート近5走安定性_順位尺度']+.20*f['ダート近5走平均着差_順位尺度'])
-    f['激走余地']= (f['ダート最高相対値']-f['ダート近3走相対値']).clip(lower=0)
-    f['激走余地_順位尺度']=f.groupby('レースID')['激走余地'].rank(pct=True,method='average')
-    f['激走指数']=100*(.45*f['ダート最高相対値_順位尺度']+.35*f['激走余地_順位尺度']+
-                    .20*f['ダート近3走相対値_順位尺度'])
-    f.loc[f['ダート走数']<2,['堅実性指数','激走指数']]=np.nan
-    f['能力総合']=.70*f['堅実性指数']+.30*f['激走指数']
-    f['能力順位']=f.groupby('レースID')['能力総合'].rank(ascending=False,method='min')
-    f['人気_n']=v15_num(f['人気'])
-    f['人気乖離']=f['人気_n']-f['能力順位']
-    f['候補分類']=np.select([f['能力総合'].isna(),(f['堅実性指数']>=65)&(f['能力順位']<=5),
-                              (f['激走指数']>=65)&(f['人気乖離']>=3)],
-                             ['未評価','堅実候補','人気薄激走候補'],default='比較候補')
-    return f
-
-
-def v15_tickets(frame, max_horses=5):
-    results=[]
-    for rid, group in frame.groupby('レースID',sort=False):
-        valid=group.dropna(subset=['能力総合']).sort_values('能力総合',ascending=False)
-        if len(valid)<4:
-            continue
-        # Anchor: high stability. Value challenger only if evidence supports it.
-        core=valid.sort_values(['堅実性指数','能力総合'],ascending=False).head(3)
-        other=valid[~valid['馬ID'].isin(core['馬ID'])]
-        challenger=other.sort_values(['能力総合','激走指数'],ascending=False).head(max_horses-3)
-        chosen=pd.concat([core,challenger]).drop_duplicates('馬ID').head(max_horses)
-        if len(chosen)<3:continue
-        for combo in itertools.combinations(chosen.to_dict('records'),3):
-            nums=sorted(int(x['馬番']) for x in combo)
-            ability=float(np.mean([x['能力総合'] for x in combo]))
-            value=float(np.mean([max(0,x['人気乖離']) for x in combo if pd.notna(x['人気乖離'])])) if any(pd.notna(x['人気乖離']) for x in combo) else np.nan
-            finishes=[x['今回着順_検証専用'] for x in combo]
-            hit=bool(all(pd.notna(x) for x in finishes) and set(int(x) for x in finishes)=={1,2,3})
-            results.append({'レースID':rid,'3連複組合せ':'-'.join(map(str,nums)),'能力平均_参考':round(ability,1),
-              '人気乖離平均_参考':round(value,2) if pd.notna(value) else np.nan,
-              '事後的中判定_検証専用':hit,'3連複払戻100円':np.nan})
-    return pd.DataFrame(results)
-
-
-st.divider()
-st.header('🧪 Ver15 新AI：堅実性 × 激走余地 × 3連複価値')
-st.caption('検証用の独立機能です。従来の旧AI・新AIやGitHub保存履歴は変更しません。指数は予測確率ではありません。')
-# Google Drive CSV: shared-link / file-ID supported. Private files require a
-# separately authorized API integration; do not mistake an HTML login page for CSV.
-def v15_drive_id(value):
-    value = (value or '').strip()
-    if not value:
-        return ''
-    m = re.search(r'/file/d/([A-Za-z0-9_-]+)', value)
-    if not m:
-        m = re.search(r'[?&]id=([A-Za-z0-9_-]+)', value)
-    if m:
-        return m.group(1)
-    if re.fullmatch(r'[A-Za-z0-9_-]{15,}', value):
-        return value
-    raise ValueError('Google DriveのCSVファイルIDまたは共有URLを指定してください')
-
-
-@st.cache_data(ttl=300, show_spinner=False)
-def v15_download_drive_csv(file_id):
-    urls = [
-        'https://drive.google.com/uc?export=download&id=' + urllib.parse.quote(file_id),
-        'https://drive.usercontent.google.com/download?id=' + urllib.parse.quote(file_id) + '&export=download&confirm=t',
-    ]
-    failures = []
-    for url in urls:
-        try:
-            req = urllib.request.Request(url, headers={'User-Agent':'Mozilla/5.0','Accept':'text/csv,*/*'})
-            with urllib.request.urlopen(req, timeout=35) as response:
-                data = response.read(25 * 1024 * 1024 + 1)
-                content_type = response.headers.get('Content-Type', '')
-            if len(data) > 25 * 1024 * 1024:
-                raise ValueError('CSVが25MBを超えています')
-            if not data:
-                raise ValueError('空ファイルが返されました')
-            preview = data[:512].lstrip().lower()
-            if b'<html' in preview or b'<!doctype html' in preview or 'text/html' in content_type.lower():
-                raise ValueError('CSVではなくHTMLが返されました（共有権限またはGoogleの確認画面）')
-            if data[:2] == b'PK':
-                raise ValueError('CSVではなくZIP/Excelです')
-            df = v15_read_csv(data)
-            if df.empty:
-                raise ValueError('CSVの行がありません')
-            return data
-        except Exception as exc:
-            failures.append(type(exc).__name__ + ': ' + str(exc)[:160])
-    raise RuntimeError(' / '.join(failures))
-
-
-def v15_secret(key):
-    try:
-        return str(st.secrets.get(key, '') or '')
-    except Exception:
-        return ''
-
-
-# 固定のGoogle Drive CSV。ファイルの並び順が逆でも列構造で判定する。
-V15_DRIVE_FILES = (
-    '1z8iQTy4XaKYeJgF4CZaRADlncFDwaVld',
-    '1xhvpu6Qtk_VPCk2p4epC_8S_JruGSzxL',
-)
-
-
-def v15_csv_role(data):
-    frame = v15_read_csv(data)
-    cols = set(frame.columns)
-    if {'開催日', 'レースID', '馬ID', '馬番', '馬名'}.issubset(cols):
-        return '出走表'
-    if {'馬ID', '日付', '距離', '着順', '頭数'}.issubset(cols):
-        return '過去成績'
-    return '不明'
-
-
-with st.expander('📡 Ver15 Google Drive自動取得（固定リンク登録済み）', expanded=True):
-    st.caption('登録済みの2ファイルを自動取得し、CSVの列名から出走表と過去成績を識別します。ファイルの登録順は問いません。')
-    v15_auto = st.checkbox('Google DriveのCSVを自動取得', value=True, key='v15_drive_auto')
-    if st.button('🔄 Ver15のCSVを再取得', key='v15_drive_reload'):
-        v15_download_drive_csv.clear()
-        st.rerun()
-    st.caption('Google Driveの共有権限は「リンクを知っている全員・閲覧者」が必要です。ファイルを削除して再アップロードするとIDが変わるため、同じファイルを更新してください。')
-
-with st.expander('📂 Ver15 CSV手動アップロード（予備）', expanded=False):
-    v15_a = st.file_uploader('出走表CSV', type=['csv'], key='v15_entry')
-    v15_b = st.file_uploader('過去成績CSV', type=['csv'], key='v15_history')
-
-v15_entry_bytes = v15_a.getvalue() if v15_a is not None else None
-v15_history_bytes = v15_b.getvalue() if v15_b is not None else None
-v15_entry_source = '手動アップロード' if v15_entry_bytes is not None else ''
-v15_history_source = '手動アップロード' if v15_history_bytes is not None else ''
-if v15_auto and (v15_entry_bytes is None or v15_history_bytes is None):
-    for file_id in V15_DRIVE_FILES:
-        try:
-            downloaded = v15_download_drive_csv(file_id)
-            role = v15_csv_role(downloaded)
-            if role == '出走表' and v15_entry_bytes is None:
-                v15_entry_bytes, v15_entry_source = downloaded, 'Google Drive'
-            elif role == '過去成績' and v15_history_bytes is None:
-                v15_history_bytes, v15_history_source = downloaded, 'Google Drive'
-            elif role == '不明':
-                st.error('Google DriveファイルID ' + file_id + ' のCSV列名を認識できません。出走表/過去成績の元CSVか確認してください。')
-            else:
-                st.warning('Google DriveファイルID ' + file_id + ' は ' + role + ' と判定されましたが、同じ種類が既に登録されています。')
-        except Exception as err:
-            st.error('Ver15 Google Drive取得失敗（ID: ' + file_id + '）: ' + str(err))
-
-if v15_entry_bytes is None or v15_history_bytes is None:
-    st.info('Ver15の分析には出走表CSVと過去成績CSVの両方が必要です。Google Driveの各ファイルIDを登録するか、手動アップロードしてください。')
-else:
-    try:
-        v15_f = v15_feature_table(v15_read_csv(v15_entry_bytes), v15_read_csv(v15_history_bytes))
-        v15_t = v15_tickets(v15_f)
-        st.success(f'Ver15データ取得成功：出走表={v15_entry_source} / 過去成績={v15_history_source}')
-        st.metric('出走馬', len(v15_f))
-        st.metric('能力評価可能馬', int(v15_f['能力総合'].notna().sum()))
-        st.metric('予想用ダート履歴ゼロ', int(v15_f['ダート走数'].eq(0).sum()))
-        st.warning('この1開催日の成績だけでは的中率向上は実証できません。以下は研究用の暫定指数です。')
-        v15_cols = ['レースID','馬番','馬名','過去走数','ダート走数','堅実性指数','激走指数','能力総合','能力順位','人気','人気乖離','候補分類']
-        # 取得CSVに当日結果が存在する場合だけ、事後検証用に着順を表示・着色。
-        # 当日結果は能力指数・予想候補の選択には一切使わない。
-        v15_result_rows = v15_f[v15_f['今回着順_検証専用'].between(1, 3)]
-        v15_placed_by_race = {
-            str(rid): set(pd.to_numeric(group['馬番'], errors='coerce').dropna().astype(int))
-            for rid, group in v15_result_rows.groupby('レースID')
-        }
-        v15_display = v15_f[v15_cols].copy()
-        v15_display['結果（検証用）'] = v15_f['今回着順_検証専用'].apply(
-            lambda x: f'{int(x)}着（入着）' if pd.notna(x) and 1 <= x <= 3 else
-                      (f'{int(x)}着' if pd.notna(x) else '未登録'))
-        def v15_paint(row):
-            placed = v15_placed_by_race.get(str(row['レースID']), set())
-            try:
-                matched = int(row['馬番']) in placed
-            except (ValueError, TypeError):
-                matched = False
-            return ['background-color: #174a32; color: #b8f7cb; font-weight: bold' if matched else '' for _ in row]
-        st.dataframe(v15_display.style.apply(v15_paint, axis=1),hide_index=True,use_container_width=True)
-        if v15_placed_by_race:
-            st.caption('緑色＝CSVで当日結果が確認できた3着以内馬（事後検証表示）。予想指数には当日結果を使用していません。')
-        else:
-            st.caption('当日結果がCSVに未登録のため、入着馬の緑色表示は行いません。')
-        st.download_button('馬別Ver15分析CSV',v15_f.to_csv(index=False).encode('utf-8-sig'),'Ver15_馬別分析.csv','text/csv',key='v15_download_horse')
-        if not v15_t.empty:
-            st.subheader('3連複組合せ（研究用）')
-            st.caption('組合せは候補を列挙したもので、配当期待値の高い順ではありません。実際の3連複払戻は別途必要です。')
-            def v15_ticket_paint(row):
-                placed = v15_placed_by_race.get(str(row['レースID']), set())
-                try:
-                    nums = {int(x) for x in str(row['3連複組合せ']).split('-')}
-                    matched = len(placed) == 3 and nums == placed
-                except (ValueError, TypeError):
-                    matched = False
-                return ['background-color: #174a32; color: #b8f7cb; font-weight: bold' if matched else '' for _ in row]
-            st.dataframe(v15_t.style.apply(v15_ticket_paint, axis=1),hide_index=True,use_container_width=True)
-            if v15_placed_by_race:
-                st.caption('緑色＝CSVの確定着順と一致した3連複組合せ。結果未登録のレースは判定しません。')
-            st.download_button('3連複検証CSV',v15_t.to_csv(index=False).encode('utf-8-sig'),'Ver15_3連複検証.csv','text/csv',key='v15_download_trio')
-    except Exception as v15_err:
-        st.error('Ver15の解析を停止しました: ' + str(v15_err))
