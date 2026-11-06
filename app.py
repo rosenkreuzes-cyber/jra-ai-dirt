@@ -740,22 +740,99 @@ def mobile_parse_shutuba(soup, rid, target_date):
 
 
 def mobile_horse_histories(soup, horse_id, target_date, limit=None):
-    """過去走を列名ベースで抽出。取得不能と0走を区別して診断する。"""
+    """競走成績専用ページを解析。列位置が変わっても検証して誤データを除外する。"""
+    tables = soup.select("table.db_h_race_results, table[class*='db_h_race_results']")
+    if not tables:
+        title = mobile_visible_text(soup.title)[:60] if soup.title else "タイトルなし"
+        raise RuntimeError(f"競走成績テーブルなし（専用URLの応答内容を確認：{title}）")
+
     aliases = {
         "日付": {"日付", "年月日"}, "開催": {"開催", "場所"},
-        "レース名": {"レース名", "競走名", "レース"}, "頭数": {"頭数", "出走頭数"},
-        "着順": {"着順", "着"}, "タイム": {"タイム", "走破タイム"},
-        "着差": {"着差"}, "上り": {"上り", "上がり", "上り3F", "上がり3F", "上3F"},
+        "頭数": {"頭数", "出走頭数"}, "着順": {"着順", "着"},
+        "タイム": {"タイム", "走破タイム"}, "着差": {"着差"},
+        "上り": {"上り", "上がり", "上り3F", "上がり3F", "上3F"},
         "距離": {"距離"}, "馬場": {"馬場", "馬場状態"},
-        "馬番": {"馬番", "馬番号"}, "人気": {"人気"}, "通過": {"通過", "コーナー通過順"},
-        "ペース": {"ペース"},
+        "レース名": {"レース名", "競走名"}, "馬番": {"馬番"},
+        "人気": {"人気"}, "通過": {"通過"}, "ペース": {"ペース"},
     }
-    norm = lambda x: re.sub(r"\s+", "", unicodedata.normalize("NFKC", str(x)))
-    keymap = {norm(alias): key for key, variants in aliases.items() for alias in variants}
-    tables = soup.select("table.db_h_race_results, table[class*='race_results'], table[class*='RaceResults']")
-    if not tables:
-        raise RuntimeError("過去成績テーブルなし（馬ページのアクセス制限またはHTML変更）")
-    data, excluded_today, excluded_undated, parsed_rows = [], 0, 0, 0
+    def norm(value):
+        return re.sub(r"\s+", "", unicodedata.normalize("NFKC", str(value)))
+    keymap = {norm(a): key for key, alt in aliases.items() for a in alt}
+    date_re = re.compile(r"(20\d{2})[./年-](\d{1,2})[./月-](\d{1,2})")
+    dist_re = re.compile(r"^(?:ダート|ダ|芝|障害|障)\s*\d{3,4}\s*m?$", re.I)
+    time_re = re.compile(r"^\d{1,2}:\d{2}\.\d$")
+    final_re = re.compile(r"^\d{2}\.\d$")
+    going_set = {"良", "稍重", "重", "不良"}
+
+    def looks_like(value, key):
+        v = norm(value)
+        if key == "日付":
+            return bool(date_re.search(v))
+        if key == "距離":
+            return bool(dist_re.fullmatch(v))
+        if key == "タイム":
+            return bool(time_re.fullmatch(v))
+        if key == "馬場":
+            return v in going_set
+        if key == "着順":
+            return bool(re.fullmatch(r"(?:[1-9]|1[0-8])", v))
+        if key == "頭数":
+            return bool(re.fullmatch(r"(?:[2-9]|1[0-8])", v))
+        if key == "上り":
+            return bool(final_re.fullmatch(v) and 28.0 <= float(v) <= 55.0)
+        return True
+
+    def by_verified_headers(headers, vals):
+        # 列数一致だけでは安全ではない。対象の値も型検証して採用する。
+        if len(headers) != len(vals):
+            return None
+        result = {k: v for k, v in zip(headers, vals) if k}
+        required = ("日付", "距離", "頭数", "着順", "タイム")
+        if not all(result.get(k) and looks_like(result[k], k) for k in required):
+            return None
+        if result.get("上り") and not looks_like(result["上り"], "上り"):
+            result.pop("上り", None)
+        if result.get("馬場") and not looks_like(result["馬場"], "馬場"):
+            result.pop("馬場", None)
+        return result
+
+    def verified_fallback(vals):
+        # netkeibaの有料指標列がHTML上で欠ける場合、ヘッダー位置がずれる。
+        # その場合は日付・距離・着順・頭数・走破タイムの各値で必ず検証する。
+        if len(vals) < 18 or not date_re.search(norm(vals[0])):
+            return None
+        distance_idxs = [i for i in range(10, min(len(vals), 20)) if looks_like(vals[i], "距離")]
+        if len(distance_idxs) != 1:
+            return None
+        di = distance_idxs[0]
+        # 距離列の直前に着順（-3列）、頭数（-8列）がある標準レイアウト。
+        if di < 8 or not looks_like(vals[di-3], "着順") or not looks_like(vals[di-8], "頭数"):
+            return None
+        time_idxs = [i for i in range(di+1, min(len(vals), di+9)) if looks_like(vals[i], "タイム")]
+        if len(time_idxs) != 1:
+            return None
+        ti = time_idxs[0]
+        going_values = [norm(v) for v in vals[di+1:ti] if norm(v) in going_set]
+        result = {
+            "日付": vals[0], "開催": vals[1], "頭数": vals[di-8],
+            "着順": vals[di-3], "距離": vals[di], "タイム": vals[ti],
+            "馬場": going_values[0] if len(going_values) == 1 else "",
+            "レース名": vals[4] if len(vals) > 4 else "",
+        }
+        if ti + 1 < len(vals) and re.fullmatch(r"[+-]?\d+(?:\.\d+)?", norm(vals[ti+1])):
+            result["着差"] = norm(vals[ti+1])
+        # 通過→ペース→上り は連続する。上り候補を別の指数と取り違えない。
+        # 後半の最初のペース列の直後にある値が実際に28~55秒なら採用。
+        pace_re = re.compile(r"^\d{2}\.\d\s*-\s*\d{2}\.\d$")
+        paces = [i for i in range(ti+2, len(vals)) if pace_re.fullmatch(norm(vals[i]))]
+        if len(paces) == 1 and paces[0] + 1 < len(vals):
+            next_value = norm(vals[paces[0]+1])
+            if looks_like(next_value, "上り"):
+                result["上り"] = next_value
+        return result
+
+    data = []
+    excluded_today, excluded_undated, rows_seen, rejected = 0, 0, 0, 0
     for table in tables:
         headers = None
         for tr in table.select("tr"):
@@ -767,32 +844,41 @@ def mobile_horse_histories(soup, horse_id, target_date, limit=None):
             if "日付" in keys and "距離" in keys:
                 headers = keys
                 continue
-            if headers is None or len(vals) != len(headers):
+            if not tr.find("td", recursive=False):
                 continue
-            r = {key: value for key, value in zip(headers, vals) if key}
-            parsed_rows += 1
-            raw_date = unicodedata.normalize("NFKC", r.get("日付", ""))
-            dm = re.search(r"(20\d{2})\s*[./年-]\s*(\d{1,2})\s*[./月-]\s*(\d{1,2})", raw_date)
+            rows_seen += 1
+            # まず厳密なヘッダー照合。それが失敗したら値ベースで安全に解析。
+            row = by_verified_headers(headers, vals) if headers else None
+            if row is None:
+                row = verified_fallback(vals)
+            if row is None:
+                rejected += 1
+                continue
+            dm = date_re.search(norm(row["日付"]))
             if not dm:
                 excluded_undated += 1
                 continue
             try:
-                run_date = datetime.date(*(int(v) for v in dm.groups()))
+                run_date = datetime.date(*map(int, dm.groups()))
             except ValueError:
                 excluded_undated += 1
                 continue
             if run_date >= target_date:
                 excluded_today += 1
                 continue
-            r["馬ID"] = horse_id
-            r["日付"] = run_date.isoformat()
-            data.append(r)
+            row["日付"] = run_date.isoformat()
+            row["馬ID"] = horse_id
+            data.append(row)
             if limit and len(data) >= limit:
                 break
         if data:
             break
-    if not data and parsed_rows == 0:
-        raise RuntimeError("過去成績テーブルは存在するが、日付・距離の列見出しを認識できません")
+    if not data and rows_seen and rejected == rows_seen:
+        raise RuntimeError(f"競走成績表の列を安全に解析できません（行{rows_seen}件、解析不一致{rejected}件）")
+    # 0件でも「新馬で本当に過去走なし」と「解析不能」を混同させない。
+    if rows_seen == 0:
+        # 出走前の新馬は履歴ゼロで正常。
+        return [], 0, 0
     data.sort(key=lambda r: r["日付"], reverse=True)
     return data, excluded_today, excluded_undated
 
@@ -908,7 +994,7 @@ def mobile_fetch_date(target_date, min_race=6, max_race=12):
     def fetch_horse(one):
         hid, entry = one
         try:
-            horse_soup = mobile_get_soup(f"https://db.netkeiba.com/horse/{hid}/", tries=2)
+            horse_soup = mobile_get_soup(f"https://db.netkeiba.com/horse/result/{hid}/", tries=2)
             run_list, excluded_today, excluded_unknown = mobile_horse_histories(horse_soup, hid, target_date)
             for run in run_list:
                 run["馬名"] = entry["馬名"]
@@ -960,6 +1046,7 @@ def mobile_fetch_date(target_date, min_race=6, max_race=12):
             "horses":len(entries), "past_runs":len(all_history),
             "excluded_today_or_later":excluded_same_day, "excluded_unknown_date":excluded_no_date,
             "history_errors":len(horse_errors), "history_zero_rows":sum(not v for v in histories.values()),
+            "history_fetch_url":"https://db.netkeiba.com/horse/result/{馬ID}/",
             "fetched_at":datetime.datetime.now(TRIO_JST).isoformat(timespec="seconds")}
     return race_records, entries, all_history, diagnostics, meta
 
@@ -1063,7 +1150,7 @@ def calculate_ai_indices(horses_data):
 
 
 # --- GitHub Private repository persistence ---
-APP_VERSION = "dual-model-4.1-race-discovery-fallback"
+APP_VERSION = "dual-model-4.2-horse-result-verified"
 
 def score_old_model(horses):
     data = []
@@ -1969,9 +2056,9 @@ if st.button("📲 出走表＋過去成績＋3連複人気を一括取得", key
             except Exception as save_exc:
                 st.session_state["trio_market_github_save"] = "GitHub自動保存不可: " + str(save_exc)
         st.session_state["mobile_fetch_message"] = (
-            f"直接取得成功：ダート{len(races)}レース・{len(entries)}頭・"
+            f"出走表取得：ダート{len(races)}レース・{len(entries)}頭・"
             f"発走前履歴{len(histories)}件・3連複{meta['trio_combinations']}組。"
-            f"取得エラーの内訳は診断CSVをご確認ください。"
+            f"履歴取得失敗{meta.get('history_errors', 0)}頭。"
         )
         st.rerun()
     except Exception as exc:
@@ -1985,6 +2072,10 @@ if st.session_state.get("mobile_fetch_message"):
     st.caption(f"取得日時：{meta.get('fetched_at','不明')} JST / "
                f"当日以降の履歴除外 {meta.get('excluded_today_or_later',0)}件 / "
                f"履歴取得失敗 {meta.get('history_errors',0)}頭")
+    if meta.get("history_errors", 0) and not meta.get("past_runs", 0):
+        st.error("過去成績が全頭取得できていません。履歴からの予想は行わず、診断ZIPをご確認ください。")
+    elif meta.get("history_errors", 0):
+        st.warning(f"過去成績の取得に失敗した馬が{meta['history_errors']}頭います。欠損は予想に使っていません。")
     if meta.get("trio_races", 0) == 0:
         st.warning("3連複市場データは取得できませんでした。出走表と履歴は保存されています。")
     mobile_zip = mobile_export_zip(
