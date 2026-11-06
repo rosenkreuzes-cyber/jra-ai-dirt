@@ -545,23 +545,66 @@ def mobile_get_soup(url, session=None, tries=3):
 
 
 def mobile_race_list(soup, target_date, min_race=6, max_race=12):
-    ids = []
-    for element in soup.select('a[href*="race_id="]'):
-        href = element.get("href", "")
-        ids += re.findall(r"race_id=(\d{12})", href)
-    if not ids:
-        ids = re.findall(r"race_id=(\d{12})", str(soup))
-    year = str(target_date.year)
+    """リンクだけでなく、ページ内JSON・埋込データのレースIDも検索。"""
+    source = str(soup)
+    ids = re.findall(r"(?:race_id(?:=|[\\\"': ]+)|[\\\"'])(20\d{10})(?:[\\\"'&]|$)", source)
+    ids += re.findall(r"race_id(?:=|%3[Dd])(20\d{10})", source)
     valid = []
     for rid in dict.fromkeys(ids):
-        if not rid.startswith(year):
-            continue
-        if not (rid[4:6] in TRIO_VENUE_CODES.values()):
-            continue
-        n = int(rid[-2:])
-        if min_race <= n <= max_race:
+        if (rid.startswith(str(target_date.year))
+                and rid[4:6] in TRIO_VENUE_CODES.values()
+                and min_race <= int(rid[-2:]) <= max_race):
             valid.append(rid)
     return sorted(valid)
+
+
+def mobile_discover_race_ids(target_date, session, min_race=6, max_race=12):
+    """複数の公開一覧を確認。候補IDは必ず出走表側で検証する。"""
+    urls = [
+        f"https://race.netkeiba.com/top/race_list.html?kaisai_date={target_date:%Y%m%d}",
+        f"https://race.netkeiba.com/top/race_list.html?kaisai_date={target_date:%Y%m%d}&kaisai_id=",
+        f"https://race.netkeiba.com/top/race_list.html?date={target_date:%Y%m%d}",
+        f"https://race.netkeiba.com/top/race_list.html",
+    ]
+    ids, log = set(), []
+    for url in urls:
+        try:
+            soup = mobile_get_soup(url, session=session, tries=2)
+            found = mobile_race_list(soup, target_date, min_race, max_race)
+            ids.update(found)
+            log.append(f"{url}: 候補{len(found)}件")
+        except Exception as exc:
+            log.append(f"{url}: {str(exc)[:160]}")
+        if ids:
+            break
+    # 開催情報が確認できている日のみ、レースID候補を生成する。
+    # 候補は後段で出走表の日付・開催場・回次を照合しなければ採用しない。
+    known = {datetime.date(2026, 11, 7): [("東京", 5, 1), ("京都", 5, 1), ("福島", 3, 1)]}
+    if not ids and target_date in known:
+        for venue, kai, day in known[target_date]:
+            for race_no in range(min_race, max_race + 1):
+                ids.add(f"{target_date.year:04d}{TRIO_VENUE_CODES[venue]}{kai:02d}{day:02d}{race_no:02d}")
+        log.append("開催日程に基づく候補IDを作成（出走表の照合が必要）")
+    return sorted(ids), log
+
+
+def mobile_validate_race_page(soup, rid, target_date):
+    """別日への転送や無関係なレースを除外。日付の検証ができない場合は採用しない。"""
+    metadata = " ".join(x.get_text(" ", strip=True) for x in soup.select(
+        ".RaceData01, .RaceData02, .RaceData03, .RaceList_DateList, .RaceName, .RaceData"))
+    raw = str(soup)
+    expected = target_date.strftime("%Y%m%d")
+    date_tokens = [expected, target_date.strftime("%Y/%m/%d"), target_date.strftime("%Y-%m-%d"),
+                   f"{target_date.year}年{target_date.month}月{target_date.day}日"]
+    if not any(token in raw or token in metadata for token in date_tokens):
+        raise RuntimeError("ページ内で対象開催日を検証できません（別日・HTML変更の可能性）")
+    # ページに別レースIDが明記されている場合は誤取得を防ぐ。
+    canonical = soup.select_one('link[rel="canonical"]')
+    if canonical:
+        match = re.search(r"race_id=(20\d{10})", canonical.get("href", ""))
+        if match and match.group(1) != rid:
+            raise RuntimeError(f"別レースへの転送: {match.group(1)}")
+    return True
 
 
 def mobile_race_surface(soup):
@@ -813,22 +856,22 @@ def mobile_fetch_date(target_date, min_race=6, max_race=12):
     """レース一覧・出走表・過去成績を取得して、アプリ既存形式に変換。"""
     import concurrent.futures
     session = mobile_browser_session()
-    page = mobile_get_soup(
-        f"https://race.netkeiba.com/top/race_list.html?kaisai_date={target_date:%Y%m%d}",
-        session=session, tries=3)
-    race_ids = mobile_race_list(page, target_date, min_race, max_race)
+    race_ids, discovery_log = mobile_discover_race_ids(target_date, session, min_race, max_race)
     if not race_ids:
-        raise RuntimeError("指定日のJRAレースIDを取得できません。開催日・アクセス制限をご確認ください")
+        raise RuntimeError("指定日のレースID候補を取得できません。取得診断: " + " / ".join(discovery_log))
     progress = st.progress(0.0, text="出走表を取得中")
     race_records = []
     entries = []
-    diagnostics = []
+    diagnostics = [{"レースID":"", "処理結果":"レースID探索", "取得頭数":0,
+                    "理由": msg, "取得日時JST":datetime.datetime.now(TRIO_JST).isoformat(timespec="seconds")}
+                   for msg in discovery_log]
     for i, rid in enumerate(race_ids, 1):
         stamp = datetime.datetime.now(TRIO_JST).isoformat(timespec="seconds")
         try:
             race_soup = mobile_get_soup(
                 f"https://race.netkeiba.com/race/shutuba.html?race_id={rid}",
                 session=session, tries=3)
+            mobile_validate_race_page(race_soup, rid, target_date)
             race, horses, message = mobile_parse_shutuba(race_soup, rid, target_date)
             if race["is_dirt_race"]:
                 if horses:
@@ -1009,7 +1052,7 @@ def calculate_ai_indices(horses_data):
 
 
 # --- GitHub Private repository persistence ---
-APP_VERSION = "dual-model-4.0-five-factor-85"
+APP_VERSION = "dual-model-4.1-race-discovery-fallback"
 
 def score_old_model(horses):
     data = []
