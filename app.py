@@ -740,53 +740,59 @@ def mobile_parse_shutuba(soup, rid, target_date):
 
 
 def mobile_horse_histories(soup, horse_id, target_date, limit=None):
-    table = soup.select_one("table.db_h_race_results")
-    if table is None:
-        raise RuntimeError("過去成績テーブルがありません")
+    """過去走を列名ベースで抽出。取得不能と0走を区別して診断する。"""
     aliases = {
         "日付": {"日付", "年月日"}, "開催": {"開催", "場所"},
-        "レース名": {"レース名", "競走名"}, "頭数": {"頭数", "出走頭数"},
+        "レース名": {"レース名", "競走名", "レース"}, "頭数": {"頭数", "出走頭数"},
         "着順": {"着順", "着"}, "タイム": {"タイム", "走破タイム"},
-        "着差": {"着差"}, "上り": {"上り", "上がり", "上り3F", "上がり3F"},
+        "着差": {"着差"}, "上り": {"上り", "上がり", "上り3F", "上がり3F", "上3F"},
         "距離": {"距離"}, "馬場": {"馬場", "馬場状態"},
         "馬番": {"馬番", "馬番号"}, "人気": {"人気"}, "通過": {"通過", "コーナー通過順"},
         "ペース": {"ペース"},
     }
-    keymap = {unicodedata.normalize("NFKC", alias).replace(" ", ""): key
-              for key, variants in aliases.items() for alias in variants}
-    headers = None
-    data = []
-    excluded_today = 0
-    excluded_undated = 0
-    for tr in table.select("tr"):
-        cells = tr.find_all(["th", "td"], recursive=False)
-        if not cells:
-            continue
-        vals = [mobile_visible_text(cell) for cell in cells]
-        normalized = [unicodedata.normalize("NFKC", str(v)).replace(" ", "") for v in vals]
-        if "日付" in normalized and ("レース名" in normalized or "競走名" in normalized):
-            headers = [keymap.get(v, "") for v in normalized]
-            continue
-        if headers is None or len(vals) != len(headers):
-            continue
-        r = {key: value for key, value in zip(headers, vals) if key}
-        dm = re.search(r"(20\d{2})[./年-](\d{1,2})[./月-](\d{1,2})", r.get("日付", ""))
-        if not dm:
-            excluded_undated += 1
-            continue
-        try:
-            run_date = datetime.date(*(int(s) for s in dm.groups()))
-        except ValueError:
-            excluded_undated += 1
-            continue
-        if run_date >= target_date:
-            excluded_today += 1
-            continue
-        r["馬ID"] = horse_id
-        r["日付"] = run_date.isoformat()
-        data.append(r)
-        if limit and len(data) >= limit:
+    norm = lambda x: re.sub(r"\s+", "", unicodedata.normalize("NFKC", str(x)))
+    keymap = {norm(alias): key for key, variants in aliases.items() for alias in variants}
+    tables = soup.select("table.db_h_race_results, table[class*='race_results'], table[class*='RaceResults']")
+    if not tables:
+        raise RuntimeError("過去成績テーブルなし（馬ページのアクセス制限またはHTML変更）")
+    data, excluded_today, excluded_undated, parsed_rows = [], 0, 0, 0
+    for table in tables:
+        headers = None
+        for tr in table.select("tr"):
+            cells = tr.find_all(["th", "td"], recursive=False)
+            if not cells:
+                continue
+            vals = [mobile_visible_text(cell) for cell in cells]
+            keys = [keymap.get(norm(v), "") for v in vals]
+            if "日付" in keys and "距離" in keys:
+                headers = keys
+                continue
+            if headers is None or len(vals) != len(headers):
+                continue
+            r = {key: value for key, value in zip(headers, vals) if key}
+            parsed_rows += 1
+            raw_date = unicodedata.normalize("NFKC", r.get("日付", ""))
+            dm = re.search(r"(20\d{2})\s*[./年-]\s*(\d{1,2})\s*[./月-]\s*(\d{1,2})", raw_date)
+            if not dm:
+                excluded_undated += 1
+                continue
+            try:
+                run_date = datetime.date(*(int(v) for v in dm.groups()))
+            except ValueError:
+                excluded_undated += 1
+                continue
+            if run_date >= target_date:
+                excluded_today += 1
+                continue
+            r["馬ID"] = horse_id
+            r["日付"] = run_date.isoformat()
+            data.append(r)
+            if limit and len(data) >= limit:
+                break
+        if data:
             break
+    if not data and parsed_rows == 0:
+        raise RuntimeError("過去成績テーブルは存在するが、日付・距離の列見出しを認識できません")
     data.sort(key=lambda r: r["日付"], reverse=True)
     return data, excluded_today, excluded_undated
 
@@ -922,6 +928,11 @@ def mobile_fetch_date(target_date, min_race=6, max_race=12):
             progress.progress(.3 + .7 * i/max(len(futures), 1),
                               text=f"各馬の過去成績 {i}/{len(futures)}頭")
     progress.empty()
+    if not any(histories.values()):
+        reasons = list(dict.fromkeys(horse_errors.values()))[:5]
+        diagnostics.append({"レースID":"", "処理結果":"過去走全件取得失敗", "取得頭数":0,
+                            "理由":" / ".join(reasons) if reasons else "全馬で有効な過去走0件（HTML解析・日付を要確認）",
+                            "取得日時JST":datetime.datetime.now(TRIO_JST).isoformat(timespec="seconds")})
     for race in race_records:
         this_entries = [e for e in entries if e["レースID"] == race["netkeiba_race_id"]]
         race["horses"] = [mobile_horse_from_runs(e, histories.get(e["馬ID"], []), target_date)
@@ -948,7 +959,7 @@ def mobile_fetch_date(target_date, min_race=6, max_race=12):
     meta = {"date":target_date.isoformat(), "race_ids":len(race_ids), "dirt_races":len(race_records),
             "horses":len(entries), "past_runs":len(all_history),
             "excluded_today_or_later":excluded_same_day, "excluded_unknown_date":excluded_no_date,
-            "history_errors":len(horse_errors),
+            "history_errors":len(horse_errors), "history_zero_rows":sum(not v for v in histories.values()),
             "fetched_at":datetime.datetime.now(TRIO_JST).isoformat(timespec="seconds")}
     return race_records, entries, all_history, diagnostics, meta
 
