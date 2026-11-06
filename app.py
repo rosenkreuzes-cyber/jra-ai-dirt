@@ -986,11 +986,32 @@ def mobile_fetch_date(target_date, min_race=6, max_race=12):
         progress.empty()
         raise RuntimeError("ダート出走表を取得できませんでした。" + str(diagnostics[-5:]))
     entries_by_horse = {e["馬ID"]:e for e in entries}
-    histories = {}
+    # 新馬戦の出走馬には、指数用の過去走が原則ありません。
+    # netkeibaの競走成績表がないことを「通信エラー」と誤カウントしない。
+    # ただし、非新馬の通信失敗・解析失敗は従来どおり欠損として記録する。
+    debut_race_ids = {
+        r["netkeiba_race_id"] for r in race_records
+        if "新馬" in str(r.get("race_title", ""))
+    }
+    debut_ids = {
+        e["馬ID"] for e in entries if e["レースID"] in debut_race_ids
+    }
+    eligible_horses = [one for one in entries_by_horse.items() if one[0] not in debut_ids]
+    histories = {hid: [] for hid in debut_ids}
     horse_errors = {}
     excluded_same_day = 0
     excluded_no_date = 0
-    skips_by_horse = {}
+    skips_by_horse = {hid: (0, 0) for hid in debut_ids}
+    for race in race_records:
+        if race["netkeiba_race_id"] in debut_race_ids:
+            n = sum(e["レースID"] == race["netkeiba_race_id"] for e in entries)
+            diagnostics.append({
+                "レースID": race["netkeiba_race_id"],
+                "処理結果": "新馬戦・過去走取得対象外",
+                "取得頭数": n,
+                "理由": "新馬戦は過去走0件が正常。履歴取得失敗には含めない（指数対象外）。",
+                "取得日時JST": datetime.datetime.now(TRIO_JST).isoformat(timespec="seconds"),
+            })
     def fetch_horse(one):
         hid, entry = one
         try:
@@ -1002,7 +1023,7 @@ def mobile_fetch_date(target_date, min_race=6, max_race=12):
         except Exception as exc:
             return hid, [], 0, 0, str(exc)[:250]
     with concurrent.futures.ThreadPoolExecutor(max_workers=3) as pool:
-        futures = [pool.submit(fetch_horse, one) for one in entries_by_horse.items()]
+        futures = [pool.submit(fetch_horse, one) for one in eligible_horses]
         for i, future in enumerate(concurrent.futures.as_completed(futures), 1):
             hid, rows, skip_day, skip_unknown, error = future.result()
             histories[hid] = rows
@@ -1014,10 +1035,11 @@ def mobile_fetch_date(target_date, min_race=6, max_race=12):
             progress.progress(.3 + .7 * i/max(len(futures), 1),
                               text=f"各馬の過去成績 {i}/{len(futures)}頭")
     progress.empty()
-    if not any(histories.values()):
+    # 新馬のみの開催では、過去走0件は正常。履歴対象馬がいる場合だけ診断する。
+    if eligible_horses and not any(histories.get(hid) for hid, _ in eligible_horses):
         reasons = list(dict.fromkeys(horse_errors.values()))[:5]
-        diagnostics.append({"レースID":"", "処理結果":"過去走全件取得失敗", "取得頭数":0,
-                            "理由":" / ".join(reasons) if reasons else "全馬で有効な過去走0件（HTML解析・日付を要確認）",
+        diagnostics.append({"レースID":"", "処理結果":"非新馬の過去走0件", "取得頭数":0,
+                            "理由":" / ".join(reasons) if reasons else "非新馬の全対象馬で履歴0件（日付・HTML解析を確認）",
                             "取得日時JST":datetime.datetime.now(TRIO_JST).isoformat(timespec="seconds")})
     for race in race_records:
         this_entries = [e for e in entries if e["レースID"] == race["netkeiba_race_id"]]
@@ -1042,8 +1064,11 @@ def mobile_fetch_date(target_date, min_race=6, max_race=12):
                  "日曜日開催" if target_date.weekday() == 6 else "指定日開催")
     for race in race_records:
         race["day_label"] = day_label
+    empty_eligible = sum(not histories.get(hid) for hid, _ in eligible_horses)
     meta = {"date":target_date.isoformat(), "race_ids":len(race_ids), "dirt_races":len(race_records),
             "horses":len(entries), "past_runs":len(all_history),
+            "debut_horses":len(debut_ids), "history_eligible_horses":len(eligible_horses),
+            "history_zero_non_debut":empty_eligible,
             "excluded_today_or_later":excluded_same_day, "excluded_unknown_date":excluded_no_date,
             "history_errors":len(horse_errors), "history_zero_rows":sum(not v for v in histories.values()),
             "history_fetch_url":"https://db.netkeiba.com/horse/result/{馬ID}/",
@@ -1150,7 +1175,7 @@ def calculate_ai_indices(horses_data):
 
 
 # --- GitHub Private repository persistence ---
-APP_VERSION = "dual-model-4.2-horse-result-verified"
+APP_VERSION = "dual-model-4.2-horse-result-verified-debut-20261107"
 
 def score_old_model(horses):
     data = []
@@ -2058,6 +2083,7 @@ if st.button("📲 出走表＋過去成績＋3連複人気を一括取得", key
         st.session_state["mobile_fetch_message"] = (
             f"出走表取得：ダート{len(races)}レース・{len(entries)}頭・"
             f"発走前履歴{len(histories)}件・3連複{meta['trio_combinations']}組。"
+            f"新馬（履歴対象外）{meta.get('debut_horses', 0)}頭・"
             f"履歴取得失敗{meta.get('history_errors', 0)}頭。"
         )
         st.rerun()
@@ -2071,11 +2097,18 @@ if st.session_state.get("mobile_fetch_message"):
     meta = st.session_state.get("mobile_scrape_meta", {})
     st.caption(f"取得日時：{meta.get('fetched_at','不明')} JST / "
                f"当日以降の履歴除外 {meta.get('excluded_today_or_later',0)}件 / "
-               f"履歴取得失敗 {meta.get('history_errors',0)}頭")
+               f"新馬（履歴対象外） {meta.get('debut_horses',0)}頭 / "
+               f"非新馬の履歴取得失敗 {meta.get('history_errors',0)}頭")
+    if meta.get("debut_horses", 0):
+        st.info(f"新馬戦の{meta['debut_horses']}頭は過去走の取得対象から除外しました。"
+                "過去走保有率を上げるための架空データは作らず、新馬戦の指数予想は引き続き対象外です。")
     if meta.get("history_errors", 0) and not meta.get("past_runs", 0):
         st.error("過去成績が全頭取得できていません。履歴からの予想は行わず、診断ZIPをご確認ください。")
     elif meta.get("history_errors", 0):
-        st.warning(f"過去成績の取得に失敗した馬が{meta['history_errors']}頭います。欠損は予想に使っていません。")
+        st.warning(f"新馬戦以外で過去成績の取得に失敗した馬が{meta['history_errors']}頭います。欠損は予想に使っていません。")
+    if meta.get("history_zero_non_debut", 0):
+        st.info(f"新馬戦以外で過去走0件の馬が{meta['history_zero_non_debut']}頭います。"
+                "本当に出走経験がない場合と、取得できなかった場合を診断CSVで確認できます。")
     if meta.get("trio_races", 0) == 0:
         st.warning("3連複市場データは取得できませんでした。出走表と履歴は保存されています。")
     mobile_zip = mobile_export_zip(
