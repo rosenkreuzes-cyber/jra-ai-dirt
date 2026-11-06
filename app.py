@@ -43,24 +43,24 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-st.title("🏇 JRA 黄金パターン AI ダッシュボード【3連複人気取得対応】")
+st.title("🏇 JRA 黄金パターン AI ダッシュボード【単勝・3連複人気取得対応】")
 
 # --- サイドバー ---
 with st.sidebar:
     st.header("⚙️ 設定")
     min_coverage = st.slider("最低過去走データ保有率 (%)", 50, 100, 75, 5)
     min_gap = st.slider("上位4頭と5位の最低指数差（※旧AIのみ適用）", 0.0, 20.0, 3.0, 0.5)
-    min_confidence = st.slider("推奨最低評価点（的中確率ではありません）", 40, 95, 85, 5)
+    min_confidence = st.slider("推奨最低評価点（的中確率ではありません）", 40, 95, 90, 5)
     max_recommendations = st.slider("1日あたりの指数候補表示上限（購入数ではありません）", 1, 5, 5)
-    min_top_history = st.slider("上位4頭の最低過去走数", 1, 4, 2)
-    min_top_dirt = st.slider("上位4頭の最低ダート経験馬数", 2, 4, 3)
+    min_top_history = st.slider("上位4頭の最低過去走数", 1, 4, 4)
+    min_top_dirt = st.slider("上位4頭の最低ダート経験馬数", 2, 4, 4)
     bet_unit = st.number_input("1点あたりの金額 (円)", min_value=100, max_value=10000, value=100, step=100, key="box_unit")
-    if st.button("🔄 Google Driveから最新データを再取得"):
-        st.session_state.pop("mobile_scraped_races", None)
-        st.session_state.pop("mobile_scrape_meta", None)
-        st.session_state["trio_refresh_pending"] = True
-        st.session_state.pop("trio_market_snapshots", None)
+    if st.button("🔄 Google Driveデータを更新（直接取得は保持）"):
+        # 過去走と3連複の直接取得済みデータは消さない。
+        # 条件変更・Driveの更新は取得済みスナップショットを上書きしない。
+        # ボタンは関数定義より先に描画されるので全キャッシュを安全に消す。
         st.cache_data.clear()
+        st.session_state["drive_refresh_notice"] = "Driveの再読み込みを実施しました。スマホ直接取得データは維持しています。"
         st.rerun()
 
 # タイム・上り3F解析
@@ -1076,7 +1076,7 @@ def mobile_fetch_date(target_date, min_race=6, max_race=12):
     return race_records, entries, all_history, diagnostics, meta
 
 
-def mobile_export_zip(entries, histories, diagnostics, trio_snaps, meta):
+def mobile_export_zip(entries, histories, diagnostics, trio_snaps, meta, win_snaps=None, win_diagnostics=None):
     payload = io.BytesIO()
     prefix = meta.get("date", "mobile").replace("-", "")
     with zipfile.ZipFile(payload, "w", compression=zipfile.ZIP_DEFLATED) as archive:
@@ -1085,46 +1085,13 @@ def mobile_export_zip(entries, histories, diagnostics, trio_snaps, meta):
             f"{prefix}_過去成績_当日以降除外.csv":pd.DataFrame(histories),
             f"{prefix}_取得診断.csv":pd.DataFrame(diagnostics),
             f"{prefix}_3連複オッズ人気.csv":trio_allmarket_csv(trio_snaps),
+            f"{prefix}_単勝オッズ人気.csv":win_allmarket_csv(win_snaps or {}),
+            f"{prefix}_単勝取得診断.csv":pd.DataFrame(win_diagnostics or []),
         }
         for filename, frame in datasets.items():
             archive.writestr(filename, frame.to_csv(index=False).encode("utf-8-sig"))
         archive.writestr(f"{prefix}_取得情報.json", json.dumps(meta, ensure_ascii=False, indent=2).encode("utf-8"))
     return payload.getvalue()
-
-
-all_loaded_races, load_errors, load_diagnostics = load_races_from_google_drive()
-
-# スマホ直接取得したレースは、同じ開催曜日のDriveシートに優先させる。
-# 通信が失敗しても前回取得済みのデータは消さない。
-mobile_saved = st.session_state.get("mobile_scraped_races", [])
-if mobile_saved:
-    mobile_days = {r.get("day_label") for r in mobile_saved}
-    all_loaded_races = [r for r in all_loaded_races if r.get("day_label") not in mobile_days] + mobile_saved
-    load_diagnostics.append(f"スマホ直接取得：{len(mobile_saved)}ダートレース / "
-                            f"{st.session_state.get('mobile_scrape_meta',{}).get('fetched_at','')} JST")
-
-with st.sidebar.expander("📡 データ取得診断", expanded=bool(load_errors)):
-    excluded_summary = summarize_history_exclusions(all_loaded_races)
-    st.info(f"予想から除外済み：当日以降 {excluded_summary['当日以降']}走 / 日付不明 {excluded_summary['日付不明']}走")
-    for msg in load_diagnostics:
-        st.success(msg)
-    for msg in load_errors:
-        st.error(msg)
-
-with st.sidebar.expander("📂 Excelファイルから読み込む（代替）"):
-    uploaded_sat = st.file_uploader("土曜日のExcel", type=["xlsx"], key="sat_xlsx")
-    uploaded_sun = st.file_uploader("日曜日のExcel", type=["xlsx"], key="sun_xlsx")
-    for upload, day in ((uploaded_sat, "土曜日開催"), (uploaded_sun, "日曜日開催")):
-        if upload is not None:
-            try:
-                replacement = parse_workbook_bytes(upload.getvalue(), day)
-                if not replacement:
-                    st.error(f"{day}: レースが見つかりませんでした")
-                else:
-                    all_loaded_races = [r for r in all_loaded_races if r["day_label"] != day] + replacement
-                    st.success(f"{day}: {len(replacement)} レースを読み込みました")
-            except Exception as exc:
-                st.error(f"{day}: ファイル解析エラー: {exc}")
 
 
 # 結果が確認できた入着馬のみを緑色で表示する（予想指数には影響させない）。
@@ -1175,7 +1142,7 @@ def calculate_ai_indices(horses_data):
 
 
 # --- GitHub Private repository persistence ---
-APP_VERSION = "dual-model-4.2-horse-result-verified-debut-20261107"
+APP_VERSION = "dual-model-4.5-combined-market-default90-history4-dirt4"
 
 def score_old_model(horses):
     data = []
@@ -1580,6 +1547,223 @@ def outcome(pred, result):
     return hit, stake, payout
 
 
+# ============================================================
+# スマホ直接取得データの永続保存・復元 (GitHub Private repository)
+# 
+# 以前はブラウザのsession_stateにしか保存しておらず、画面更新・新しい
+# セッション・Drive再取得で古い予想に戻っていた。取得済みデータを
+# 日付別にGitHubへ圧縮保存し、起動時に最新版を自動復元する。
+# ============================================================
+MOBILE_ARCHIVE_SCHEMA = 1
+MOBILE_ARCHIVE_LATEST = "mobile_data/latest.json"
+
+
+def _mobile_state_pack(state):
+    """日付・3連複tupleキーを安全にJSON化し、サイズを圧縮する。"""
+    import zlib
+
+    def encode_any(value):
+        if isinstance(value, (datetime.datetime, datetime.date)):
+            return value.isoformat()
+        if isinstance(value, np.generic):
+            return value.item()
+        if isinstance(value, set):
+            return sorted(value)
+        raise TypeError("復元対象にJSON非対応の型があります: " + type(value).__name__)
+
+    payload = dict(state)
+    market_snapshots = {}
+    for rid, snapshot in (state.get("trio_market_snapshots") or {}).items():
+        clone = dict(snapshot)
+        clone["market"] = {
+            "-".join(map(str, combo)) if isinstance(combo, (tuple, list)) else str(combo): record
+            for combo, record in (snapshot.get("market") or {}).items()
+        }
+        market_snapshots[str(rid)] = clone
+    payload["trio_market_snapshots"] = market_snapshots
+    raw = json.dumps(payload, ensure_ascii=False, allow_nan=False, default=encode_any, separators=(",", ":")).encode("utf-8")
+    packed = base64.b64encode(zlib.compress(raw, level=9)).decode("ascii")
+    return {"schema": MOBILE_ARCHIVE_SCHEMA, "date": str(state["mobile_scrape_meta"]["date"]),
+            "fetched_at": str(state["mobile_scrape_meta"].get("fetched_at", "")),
+            "format": "zlib+base64+json", "payload": packed}
+
+
+def _mobile_state_unpack(record):
+    import zlib
+    if not isinstance(record, dict) or record.get("schema") != MOBILE_ARCHIVE_SCHEMA or record.get("format") != "zlib+base64+json":
+        raise ValueError("データ形式が未対応のため、復元を停止しました")
+    packed = record.get("payload", "")
+    if not isinstance(packed, str) or len(packed) > 15_000_000:
+        raise ValueError("保存データが大きすぎるか不正です")
+    raw = zlib.decompress(base64.b64decode(packed, validate=True))
+    if len(raw) > 30_000_000:
+        raise ValueError("展開サイズが上限を超えています")
+    state = json.loads(raw.decode("utf-8"))
+    meta = state.get("mobile_scrape_meta") or {}
+    date_string = str(meta.get("date", ""))
+    snapshot_date = datetime.date.fromisoformat(date_string)
+    if record.get("date") != date_string:
+        raise ValueError("保存レコードの日付が一致しません")
+    races = state.get("mobile_scraped_races")
+    if not isinstance(races, list) or not races:
+        raise ValueError("復元対象に出走表がありません")
+    for race in races:
+        race_date = datetime.date.fromisoformat(race["race_date"])
+        if race_date != snapshot_date:
+            raise ValueError("復元対象に別開催日のレースが混入しています")
+        race["race_date"] = race_date
+        if not isinstance(race.get("horses"), list):
+            raise ValueError("出走馬データが不正です")
+    state["trio_market_snapshots"] = {
+        str(rid): {**snapshot, "market": {
+            tuple(int(number) for number in key.split("-")): rec
+            for key, rec in (snapshot.get("market") or {}).items()
+        }} for rid, snapshot in (state.get("trio_market_snapshots") or {}).items()
+    }
+    # 以前の保存データは win_market_snapshots を含まないため空として互換復元。
+    state["win_market_snapshots"] = {
+        str(rid): {**snapshot, "market": {
+            int(number): rec for number, rec in (snapshot.get("market") or {}).items()
+            if re.fullmatch(r"\d{1,2}", str(number))
+        }} for rid, snapshot in (state.get("win_market_snapshots") or {}).items()
+    }
+    return state
+
+
+def mobile_state_from_session():
+    keys = ("mobile_scraped_races", "mobile_entries", "mobile_histories", "mobile_diagnostics",
+            "mobile_scrape_meta", "trio_market_snapshots", "trio_market_errors", "trio_market_diagnostics",
+            "win_market_snapshots", "win_market_errors", "win_market_diagnostics")
+    empty_lists = ("mobile_entries", "mobile_histories", "mobile_diagnostics", "trio_market_errors",
+                   "trio_market_diagnostics", "win_market_errors", "win_market_diagnostics")
+    return {key: st.session_state.get(key, [] if key in empty_lists else {}) for key in keys}
+
+
+def mobile_save_github():
+    """直接取得の全データを日付別に保存。市場データだけではない。"""
+    state = mobile_state_from_session()
+    meta = state.get("mobile_scrape_meta") or {}
+    date = datetime.date.fromisoformat(str(meta["date"]))
+    if not state.get("mobile_scraped_races"):
+        raise RuntimeError("レースデータがないため保存できません")
+    record = _mobile_state_pack(state)
+    path = f"mobile_data/{date:%Y-%m-%d}.json"
+    old_record, _ = get_record(path)
+    if old_record and str(old_record.get("fetched_at", "")) > str(record.get("fetched_at", "")):
+        # 別の端末で新しく取得した同開催日の情報を、古いセッションで上書きしない。
+        raise RuntimeError("GitHubにはこの日付の新しい取得データがあります。先にGitHubから復元してください")
+    put_record(path, record, overwrite=True)
+    # "最新"は取得日時で判定。過去の日付を手動復元しても最新ポインタを巻き戻さない。
+    pointer = {"schema": MOBILE_ARCHIVE_SCHEMA, "date": date.isoformat(),
+               "path": path, "fetched_at": meta.get("fetched_at", "")}
+    current_pointer, _ = get_record(MOBILE_ARCHIVE_LATEST)
+    if not current_pointer or str(pointer["fetched_at"]) >= str(current_pointer.get("fetched_at", "")):
+        put_record(MOBILE_ARCHIVE_LATEST, pointer, overwrite=True)
+    return path
+
+
+def mobile_read_github(target_date=None):
+    if target_date is None:
+        pointer, _ = get_record(MOBILE_ARCHIVE_LATEST)
+        if pointer is None:
+            return None
+        path = str(pointer.get("path", ""))
+        if not re.fullmatch(r"mobile_data/\d{4}-\d{2}-\d{2}\.json", path):
+            raise ValueError("保存先の指定が不正です")
+    else:
+        date = target_date if isinstance(target_date, datetime.date) else datetime.date.fromisoformat(str(target_date))
+        path = f"mobile_data/{date:%Y-%m-%d}.json"
+    record, _ = get_record(path)
+    return _mobile_state_unpack(record) if record is not None else None
+
+
+def mobile_apply_restored_state(state):
+    for key, val in state.items():
+        if key in ("mobile_scraped_races", "mobile_entries", "mobile_histories", "mobile_diagnostics",
+                   "mobile_scrape_meta", "trio_market_snapshots", "trio_market_errors", "trio_market_diagnostics",
+                   "win_market_snapshots", "win_market_errors", "win_market_diagnostics"):
+            st.session_state[key] = val
+    # GitHubの保存形式が旧版でも、単勝のキーを補正して復元する。
+    st.session_state.setdefault("win_market_snapshots", {})
+    st.session_state.setdefault("win_market_errors", [])
+    st.session_state.setdefault("win_market_diagnostics", [])
+    win_apply_snapshots_to_races(st.session_state.get("win_market_snapshots", {}),
+                                 st.session_state.get("mobile_scraped_races", []),
+                                 st.session_state.get("mobile_entries", []))
+    meta = state["mobile_scrape_meta"]
+    st.session_state["mobile_fetch_message"] = (
+        f"GitHub保存分を復元：{meta.get('date', '日付不明')} / "
+        f"ダート{len(state.get('mobile_scraped_races', []))}レース・"
+        f"過去走{len(state.get('mobile_histories', []))}件。"
+    )
+    st.session_state["mobile_persist_status"] = "GitHub保存済みの直接取得データを復元しました。"
+
+
+def mobile_try_autorestore():
+    if st.session_state.get("mobile_scraped_races"):
+        return
+    if st.session_state.get("mobile_auto_restore_tried"):
+        return
+    st.session_state["mobile_auto_restore_tried"] = True
+    try:
+        saved = mobile_read_github()
+        if saved:
+            mobile_apply_restored_state(saved)
+    except Exception as exc:
+        st.session_state["mobile_restore_error"] = (
+            f"GitHubの直接取得データを復元できませんでした: {type(exc).__name__}: {exc}。"
+            "Google Driveの旧データへ切り替わる可能性があります。"
+        )
+
+
+# 予想計算に使うデータは、常に「最新の直接取得」をDriveより優先する。
+mobile_try_autorestore()
+all_loaded_races, load_errors, load_diagnostics = load_races_from_google_drive()
+
+# 同一曜日のDrive旧データより、直接取得データを必ず優先する。
+# 条件変更・画面再実行でもsession_stateを保持し、新セッションはGitHubから復元する。
+mobile_saved = st.session_state.get("mobile_scraped_races", [])
+if mobile_saved:
+    mobile_days = {r.get("day_label") for r in mobile_saved}
+    all_loaded_races = [r for r in all_loaded_races if r.get("day_label") not in mobile_days] + mobile_saved
+    load_diagnostics.append(f"スマホ直接取得：{len(mobile_saved)}ダートレース / "
+                            f"{st.session_state.get('mobile_scrape_meta',{}).get('fetched_at','')} JST")
+
+with st.sidebar.expander("📡 データ取得診断", expanded=bool(load_errors)):
+    excluded_summary = summarize_history_exclusions(all_loaded_races)
+    st.info(f"予想から除外済み：当日以降 {excluded_summary['当日以降']}走 / 日付不明 {excluded_summary['日付不明']}走")
+    for msg in load_diagnostics:
+        st.success(msg)
+    for msg in load_errors:
+        st.error(msg)
+
+with st.sidebar.expander("📂 Excelファイルから読み込む（代替）"):
+    uploaded_sat = st.file_uploader("土曜日のExcel", type=["xlsx"], key="sat_xlsx")
+    uploaded_sun = st.file_uploader("日曜日のExcel", type=["xlsx"], key="sun_xlsx")
+    for upload, day in ((uploaded_sat, "土曜日開催"), (uploaded_sun, "日曜日開催")):
+        if upload is not None:
+            try:
+                replacement = parse_workbook_bytes(upload.getvalue(), day)
+                if not replacement:
+                    st.error(f"{day}: レースが見つかりませんでした")
+                else:
+                    all_loaded_races = [r for r in all_loaded_races if r["day_label"] != day] + replacement
+                    st.success(f"{day}: {len(replacement)} レースを読み込みました")
+            except Exception as exc:
+                st.error(f"{day}: ファイル解析エラー: {exc}")
+
+
+if st.session_state.get("drive_refresh_notice"):
+    st.info(st.session_state.pop("drive_refresh_notice"))
+if st.session_state.get("mobile_restore_error"):
+    st.warning(st.session_state["mobile_restore_error"])
+if st.session_state.get("mobile_scraped_races"):
+    saved_meta = st.session_state.get("mobile_scrape_meta", {})
+    st.info(f"📌 予想の使用データ：直接取得 {saved_meta.get('date','日付不明')} "
+            f"（{len(st.session_state['mobile_scraped_races'])}ダートレース / "
+            f"過去走{len(st.session_state.get('mobile_histories', []))}件）。"
+            "条件変更・Drive更新でも保持します。")
+
 settings = {"min_coverage": min_coverage, "min_gap": min_gap,
     "min_confidence": min_confidence, "max_recommendations": max_recommendations,
     "min_top_history": min_top_history, "min_top_dirt": min_top_dirt}
@@ -1723,7 +1907,15 @@ def render_races(day, date):
                 else:
                     st.markdown("3連複4点： " + green_combo_html(list(itertools.combinations(top, 3)), placed_set), unsafe_allow_html=True)
                 cols = [c for c in ["horse_no", "name", "odds", "pop_rank", "ai_score", "margin_score", "distance_score", "going_score", "evidence_coverage", "time_score", "last3f_score", "idx_rank"] if c in df.columns]
-                st.dataframe(green_placed_rows(df[cols], placed_set), hide_index=True, use_container_width=True)
+                score_columns = [c for c in ("ai_score", "margin_score", "distance_score", "going_score",
+                                            "evidence_coverage", "time_score", "last3f_score") if c in cols]
+                styled = green_placed_rows(df[cols], placed_set)
+                if "odds" in cols:
+                    styled = styled.format({"odds": "{:.1f}"}, na_rep="—")
+                if score_columns:
+                    styled = styled.format({c: "{:.2f}" for c in score_columns}, na_rep="—")
+                st.caption("odds＝単勝オッズ、pop_rank＝単勝人気。ai_scoreなどの指数は小数点以下2桁表示。")
+                st.dataframe(styled, hide_index=True, use_container_width=True)
                 if placed_set:
                     st.caption("緑色＝結果登録済みの3着以内馬。的中した3連複組合せも緑色で表示します。")
         detected_date = race.get("race_date")
@@ -1898,6 +2090,188 @@ def trio_fetch_race(rid):
     return trio_parse_payload(payload)
 
 
+# ============================================================
+# 単勝オッズ・人気（netkeiba API type=1）
+# 出走表HTMLの単勝欄はJavaScript更新されることがあり、HTMLだけでは
+# オッズが空欄になる。type=1 の「1」グループを馬番で照合する。
+# 不発売・データ欠損の場合は推測や3連複人気で代用しない。
+# ============================================================
+
+def win_parse_payload(payload):
+    """単勝API JSON -> {馬番: {odds, popularity}}, 更新時刻。
+
+    データが部分的でも有効な馬番のみ取得し、頭数の整合性は呼出元で記録する。
+    """
+    if not isinstance(payload, dict):
+        raise ValueError("単勝APIからJSONオブジェクトが返されません")
+    if str(payload.get("status", "")).lower() in ("ng", "error", "fail"):
+        raise ValueError("単勝APIが取得失敗を返しました")
+    block = payload.get("data")
+    if not isinstance(block, dict):
+        raise ValueError("単勝APIのデータ領域がありません")
+    groups = block.get("odds")
+    group = groups.get("1", groups.get(1)) if isinstance(groups, dict) else None
+    if not isinstance(group, dict) or not group:
+        raise ValueError("単勝オッズ未提供（発売前・提供停止の可能性）")
+    out = {}
+    for raw_num, row in group.items():
+        if not re.fullmatch(r"\d{1,2}", str(raw_num)):
+            continue
+        number = int(raw_num)
+        if not 1 <= number <= 18 or not isinstance(row, (tuple, list)) or not row:
+            continue
+        try:
+            val = float(str(row[0]).replace(",", ""))
+        except (TypeError, ValueError):
+            continue
+        if not np.isfinite(val) or not 0 < val <= 100000:
+            continue
+        popular = None
+        if len(row) >= 3 and re.fullmatch(r"\d{1,2}", str(row[2]).strip()):
+            n = int(str(row[2]).strip())
+            if 1 <= n <= 18:
+                popular = n
+        out[number] = {"odds": val, "popularity": popular}
+    if not out:
+        raise ValueError("単勝オッズが有効な数値でありません（発売前の可能性）")
+    return out, str(block.get("official_datetime", ""))
+
+
+def win_fetch_race(rid):
+    """発売済みの単勝オッズ。init が空の場合のみ update を確認。"""
+    if not re.fullmatch(r"20\d{10}", str(rid)):
+        raise ValueError("レースIDが不正です")
+    errors = []
+    for action in ("init", "update"):
+        params = urllib.parse.urlencode({
+            "pid": "api_get_jra_odds", "race_id": rid,
+            "type": "1", "action": action, "sort": "odds", "compress": "0", "output": "json"
+        })
+        url = "https://race.netkeiba.com/api/api_get_jra_odds.html?" + params
+        req = urllib.request.Request(url, headers={
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124.0 Safari/537.36",
+            "Accept": "application/json, text/javascript, */*",
+            "Referer": f"https://race.netkeiba.com/odds/index.html?race_id={rid}&type=b1",
+        })
+        try:
+            with urllib.request.urlopen(req, timeout=12) as response:
+                raw = response.read(1024 * 1024 + 1)
+            if len(raw) > 1024 * 1024:
+                raise ValueError("単勝APIの応答が大きすぎます")
+            content = raw.decode("utf-8-sig", errors="replace").strip()
+            if not content.startswith("{"):
+                match = re.fullmatch(r"[a-zA-Z_$][\w$]*\((.*)\)\s*;?", content, re.S)
+                if match:
+                    content = match.group(1)
+            payload = json.loads(content)
+            return win_parse_payload(payload)
+        except Exception as exc:
+            errors.append(f"{action}: {type(exc).__name__}: {str(exc)[:120]}")
+    raise RuntimeError(" / ".join(errors))
+
+
+def win_collect_for_loaded_races(races):
+    """取得成功レースだけを返す。既存の単勝情報は呼出元で維持する。"""
+    snapshots, errors, diagnostics = {}, [], []
+    candidates = {}
+    for race in races:
+        if not race.get("is_dirt_race"):
+            continue
+        rid = trio_race_id(race)
+        if rid:
+            candidates[rid] = race
+        else:
+            errors.append(f"{race.get('race_name', '')}: レースID未確定")
+    if not candidates:
+        return snapshots, errors, diagnostics
+    progress = st.progress(0.0, text="単勝オッズ・人気を取得中")
+    try:
+        for i, (rid, race) in enumerate(candidates.items(), start=1):
+            stamp = datetime.datetime.now(TRIO_JST)
+            valid_numbers = {int(h["horse_no"]) for h in race.get("horses", [])
+                             if h.get("horse_no_verified") and h.get("horse_no") is not None}
+            try:
+                fetched, official_time = win_fetch_race(rid)
+                # 別レースのデータを誤採用しないよう、有効馬番と照合。
+                filtered = {number: rec for number, rec in fetched.items()
+                            if not valid_numbers or number in valid_numbers}
+                if not filtered:
+                    raise ValueError("出走表の馬番と単勝APIの馬番が一致しません")
+                snapshots[rid] = {
+                    "market": filtered, "race_name": str(race.get("race_name", "")),
+                    "race_date": race["race_date"].isoformat(),
+                    "fetched_at": stamp.isoformat(timespec="seconds"),
+                    "official_datetime": official_time,
+                    "timing": trio_snapshot_kind(race, stamp),
+                    "source": "netkeiba単勝API(type=1)",
+                }
+                n = len(filtered)
+                count_known = len(valid_numbers)
+                diagnostics.append({"レース名": race.get("race_name", ""), "レースID": rid,
+                                    "結果": "取得成功" if n == count_known else "一部取得",
+                                    "取得頭数": n, "出走頭数": count_known,
+                                    "単勝人気あり": sum(rec["popularity"] is not None for rec in filtered.values()),
+                                    "理由": "" if n == count_known else "取得できた馬番のみ反映（欠損は補完しない）",
+                                    "取得日時JST": stamp.isoformat(timespec="seconds")})
+            except Exception as exc:
+                message = f"{race.get('race_name', '')} ({rid}): {exc}"
+                errors.append(message)
+                diagnostics.append({"レース名": race.get("race_name", ""), "レースID": rid,
+                                    "結果": "取得失敗・未発売", "取得頭数": 0,
+                                    "出走頭数": len(valid_numbers), "単勝人気あり": 0,
+                                    "理由": str(exc)[:350], "取得日時JST": stamp.isoformat(timespec="seconds")})
+            progress.progress(i / len(candidates), text=f"単勝オッズ {i}/{len(candidates)}レース")
+    finally:
+        progress.empty()
+    return snapshots, errors, diagnostics
+
+
+def win_apply_snapshots_to_races(snapshots, races, entries):
+    """馬番をキーとして単勝APIデータを出走表・予想・保存用CSVに反映。
+
+    予想指数そのものと過去走は変更しない。以前のオッズはAPI失敗時に保持する。
+    """
+    updated = 0
+    by_key = {}
+    for rid, snapshot in (snapshots or {}).items():
+        for n, value in snapshot.get("market", {}).items():
+            if not isinstance(value, dict) or value.get("odds") is None:
+                continue
+            by_key[(str(rid), int(n))] = value
+    for race in races or []:
+        rid = str(race.get("netkeiba_race_id") or "")
+        for horse in race.get("horses", []):
+            key = (rid, int(horse.get("horse_no", 0)))
+            rec = by_key.get(key)
+            if rec and horse.get("horse_no_verified"):
+                horse["odds"] = rec["odds"]
+                horse["pop_rank"] = rec.get("popularity")
+                horse["win_odds_source"] = "単勝API"
+                updated += 1
+    for entry in entries or []:
+        key = (str(entry.get("レースID")), int(entry.get("馬番", 0)))
+        rec = by_key.get(key)
+        if rec:
+            entry["オッズ"] = rec["odds"]
+            entry["人気"] = rec.get("popularity")
+            entry["単勝オッズ取得元"] = "単勝API"
+    return updated
+
+
+def win_allmarket_csv(snapshots):
+    rows = []
+    for rid, snapshot in (snapshots or {}).items():
+        for n, rec in sorted(snapshot.get("market", {}).items(), key=lambda x: int(x[0])):
+            rows.append({"レースID": rid, "開催日": snapshot.get("race_date"),
+                         "レース名": snapshot.get("race_name"), "馬番": int(n),
+                         "単勝オッズ": rec.get("odds"), "単勝人気": rec.get("popularity"),
+                         "取得日時JST": snapshot.get("fetched_at"),
+                         "データ区分": snapshot.get("timing"),
+                         "提供元更新時刻": snapshot.get("official_datetime")})
+    return pd.DataFrame(rows, columns=["レースID", "開催日", "レース名", "馬番", "単勝オッズ",
+                                       "単勝人気", "取得日時JST", "データ区分", "提供元更新時刻"])
+
+
 def trio_snapshot_kind(race, fetched_at):
     """発走前取得かどうか。不明・発走後は事前データとして利用しない。"""
     d = race.get("race_date")
@@ -2047,25 +2421,41 @@ def trio_store_snapshot_github(snapshots, diagnostics):
 # スマホからの日付指定→出走表→過去成績→3連複オッズ人気のワンタップ取得
 # 端末にはPython/Colab不要。処理はStreamlitサーバー側で実行される。
 # ============================================================
-st.subheader("📱 スマホで出走表・過去成績・3連複人気を取得")
-st.caption("日付を選んで押すだけ。6〜12Rのダートだけ対象に、netkeibaから直接取得します。Colab不要。")
+st.subheader("📱 スマホで出走表・過去成績・単勝・3連複人気を取得")
+st.caption("日付を選んで押すだけ。6〜12Rのダートだけ対象に直接取得します。単勝オッズは未発売時には空欄になります。")
+default_mobile_date = datetime.datetime.now(TRIO_JST).date()
+if st.session_state.get("mobile_scrape_meta", {}).get("date"):
+    try:
+        default_mobile_date = datetime.date.fromisoformat(st.session_state["mobile_scrape_meta"]["date"])
+    except ValueError:
+        pass
 mobile_selected_date = st.date_input(
-    "取得する開催日", value=datetime.datetime.now(TRIO_JST).date(),
+    "取得する開催日", value=default_mobile_date,
     key="mobile_target_date"
 )
-if st.button("📲 出走表＋過去成績＋3連複人気を一括取得", key="mobile_fetch_all",
+if st.button("📲 出走表＋過去成績＋単勝＋3連複人気を一括取得", key="mobile_fetch_all",
              type="primary", use_container_width=True):
+    st.session_state["win_market_message"] = ""
     st.session_state["mobile_fetch_message"] = ""
     try:
         with st.spinner("対象日のダートレースと過去成績を取得中..."):
             races, entries, histories, diagnostics, meta = mobile_fetch_date(mobile_selected_date)
-        # 3連複は個別エラーでも、出走表・過去成績を保持する。
+        # 市場データの発売前・通信失敗で出走表や過去走を消さない。
+        with st.spinner("単勝オッズ・人気を取得中..."):
+            wins, win_errors, win_diag = win_collect_for_loaded_races(races)
+        win_apply_snapshots_to_races(wins, races, entries)
         with st.spinner("3連複の組合せ別オッズ・人気を取得中..."):
             markets, errs, market_diag = trio_collect_for_loaded_races(races)
         st.session_state["mobile_scraped_races"] = races
         st.session_state["mobile_entries"] = entries
         st.session_state["mobile_histories"] = histories
-        st.session_state["mobile_diagnostics"] = diagnostics + market_diag
+        st.session_state["mobile_diagnostics"] = diagnostics + market_diag + win_diag
+        meta["win_races"] = len(wins)
+        meta["win_horses"] = sum(len(v.get("market", {})) for v in wins.values())
+        meta["win_errors"] = len(win_errors)
+        st.session_state["win_market_snapshots"] = wins
+        st.session_state["win_market_errors"] = win_errors
+        st.session_state["win_market_diagnostics"] = win_diag
         meta["trio_races"] = len(markets)
         meta["trio_combinations"] = sum(len(v.get("market",{})) for v in markets.values())
         meta["trio_errors"] = len(errs)
@@ -2080,9 +2470,18 @@ if st.button("📲 出走表＋過去成績＋3連複人気を一括取得", key
                 st.session_state["trio_market_github_save"] = "取得日時付きでGitHubへ保存: " + saved_path
             except Exception as save_exc:
                 st.session_state["trio_market_github_save"] = "GitHub自動保存不可: " + str(save_exc)
+        # 取得結果は今までセッションだけだったが、全レース・全履歴もGitHubに永続化する。
+        try:
+            persistent_path = mobile_save_github()
+            st.session_state["mobile_persist_status"] = "全レース・過去走・単勝・3連複をGitHubに保存しました: " + persistent_path
+        except Exception as save_exc:
+            st.session_state["mobile_persist_status"] = (
+                "⚠️ GitHubへの全データ保存に失敗。現セッションでは保持しますが、"
+                "ブラウザを閉じると復元できない可能性があります: " + str(save_exc)
+            )
         st.session_state["mobile_fetch_message"] = (
             f"出走表取得：ダート{len(races)}レース・{len(entries)}頭・"
-            f"発走前履歴{len(histories)}件・3連複{meta['trio_combinations']}組。"
+            f"発走前履歴{len(histories)}件・単勝{meta['win_horses']}頭・3連複{meta['trio_combinations']}組。"
             f"新馬（履歴対象外）{meta.get('debut_horses', 0)}頭・"
             f"履歴取得失敗{meta.get('history_errors', 0)}頭。"
         )
@@ -2091,6 +2490,33 @@ if st.button("📲 出走表＋過去成績＋3連複人気を一括取得", key
         st.error(f"直接取得に失敗しました：{type(exc).__name__}: {exc}")
         st.info("netkeibaのアクセス制限・HTML変更・ネットワーク障害の可能性があります。" 
                 "既存のDrive読み込みは引き続き利用できます。")
+
+if st.session_state.get("mobile_persist_status"):
+    message = st.session_state["mobile_persist_status"]
+    (st.warning if message.startswith("⚠️") else st.success)(message)
+
+with st.expander("📥 手元に保存した完全データJSONから復元"):
+    backup_upload = st.file_uploader("予想復元データ.json を選択", type=["json"], key="mobile_upload_backup")
+    if backup_upload is not None and st.button("このバックアップを復元", key="mobile_restore_local"):
+        try:
+            restored = _mobile_state_unpack(json.loads(backup_upload.getvalue().decode("utf-8")))
+            mobile_apply_restored_state(restored)
+            st.rerun()
+        except Exception as exc:
+            st.error(f"バックアップの解析に失敗: {type(exc).__name__}: {exc}")
+
+with st.expander("📂 過去に直接取得した日付をGitHubから復元"):
+    manual_restore_date = st.date_input("復元する開催日", value=mobile_selected_date, key="mobile_restore_date")
+    if st.button("この日付の直接取得データを復元", key="restore_mobile_by_date"):
+        try:
+            restored = mobile_read_github(manual_restore_date)
+            if restored is None:
+                st.warning("この開催日の保存データはGitHubにありません。")
+            else:
+                mobile_apply_restored_state(restored)
+                st.rerun()
+        except Exception as exc:
+            st.error(f"復元できませんでした: {type(exc).__name__}: {exc}")
 
 if st.session_state.get("mobile_fetch_message"):
     st.success(st.session_state["mobile_fetch_message"])
@@ -2111,11 +2537,24 @@ if st.session_state.get("mobile_fetch_message"):
                 "本当に出走経験がない場合と、取得できなかった場合を診断CSVで確認できます。")
     if meta.get("trio_races", 0) == 0:
         st.warning("3連複市場データは取得できませんでした。出走表と履歴は保存されています。")
+    # GitHubの保存権限がない場合でも、同じ形式を手元に保存できる。
+    try:
+        import gzip
+        data_for_restore = _mobile_state_pack(mobile_state_from_session())
+        restore_data = json.dumps(data_for_restore, ensure_ascii=False).encode("utf-8")
+        st.download_button("💾 次回復元用の完全データJSONを保存", data=restore_data,
+                           file_name=f"{meta.get('date','JRA')}_予想復元データ.json",
+                           mime="application/json", key="mobile_full_backup_download",
+                           use_container_width=True)
+    except Exception as archive_exc:
+        st.warning("完全バックアップ作成不可: " + str(archive_exc))
     mobile_zip = mobile_export_zip(
         st.session_state.get("mobile_entries", []),
         st.session_state.get("mobile_histories", []),
         st.session_state.get("mobile_diagnostics", []),
-        st.session_state.get("trio_market_snapshots", {}), meta)
+        st.session_state.get("trio_market_snapshots", {}), meta,
+        st.session_state.get("win_market_snapshots", {}),
+        st.session_state.get("win_market_diagnostics", []))
     st.download_button("📦 スマホで取得した全データと診断をZIP保存", data=mobile_zip,
                        file_name=f"{meta.get('date','JRA')}_スマホ直接取得.zip",
                        mime="application/zip", use_container_width=True,
@@ -2126,43 +2565,158 @@ if st.session_state.get("mobile_fetch_message"):
                          hide_index=True, use_container_width=True)
 
 st.divider()
-st.caption("既存のGoogle Driveシートを使いたい場合は、こちらで3連複オッズ・人気だけ更新できます。")
-if "trio_market_snapshots" not in st.session_state:
-    st.session_state["trio_market_snapshots"] = {}
-if "trio_market_errors" not in st.session_state:
-    st.session_state["trio_market_errors"] = []
-if "trio_market_diagnostics" not in st.session_state:
-    st.session_state["trio_market_diagnostics"] = []
+st.subheader("🏇 単勝・3連複オッズ／人気を一括取得・更新")
+st.caption("現在表示中のレースを対象に単勝・3連複を同時更新します。"
+           "出走表と過去走は再取得せず保持し、更新に失敗した市場データも前回分を消しません。"
+           "指数には単勝人気・オッズを使いません。")
+for market_key, default in (
+    ("win_market_snapshots", {}), ("win_market_errors", []), ("win_market_diagnostics", []),
+    ("trio_market_snapshots", {}), ("trio_market_errors", []), ("trio_market_diagnostics", []),
+):
+    if market_key not in st.session_state:
+        st.session_state[market_key] = default
 
-if st.button("🔄 Driveシート＋3連複人気だけ再取得", key="mobile_fetch_trio", use_container_width=True):
-    st.session_state.pop("mobile_scraped_races", None)
-    st.session_state.pop("mobile_fetch_message", None)
-    st.session_state["trio_refresh_pending"] = True
-    load_races_from_google_drive.clear()
+if st.button("🔄 単勝＋3連複のオッズ・人気を一括取得／更新（過去走は保持）",
+             key="mobile_fetch_market", use_container_width=True):
+    st.session_state["market_refresh_pending"] = True
     st.rerun()
-if st.session_state.pop("trio_refresh_pending", False):
-    with st.spinner("netkeibaから3連複人気を取得中..."):
-        # 古い値を成功結果として表示しない（失敗時にも取得済み扱いしない）
-        st.session_state["trio_market_snapshots"] = {}
-        st.session_state["trio_market_diagnostics"] = []
-        st.session_state["trio_market_errors"] = []
-        st.session_state["trio_market_github_save"] = ""
-        data, errs, diagnostics = trio_collect_for_loaded_races(all_loaded_races)
-        st.session_state["trio_market_snapshots"] = data
-        st.session_state["trio_market_errors"] = errs
-        st.session_state["trio_market_diagnostics"] = diagnostics
-        st.session_state["trio_market_github_save"] = ""
-        if data:
-            try:
-                saved_path = trio_store_snapshot_github(data, diagnostics)
-                st.session_state["trio_market_github_save"] = "取得日時付きでGitHubへ保存: " + saved_path
-            except Exception as save_exc:
-                # 外部ストレージが使えなくても取得結果を失わずZIP保存できる。
-                st.session_state["trio_market_github_save"] = "GitHubへの自動保存不可: " + str(save_exc)
-    if data:
-        st.success(f"取得成功：{len(data)}レース。各4頭BOXの4点に人気順位を表示します。")
+
+if st.session_state.pop("market_refresh_pending", False):
+    # 3連複・単勝とも「現在の直接取得日」だけを扱い、古いDriveの開催日を混ぜない。
+    active_date = (st.session_state.get("mobile_scrape_meta") or {}).get("date")
+    source_races = st.session_state.get("mobile_scraped_races") or all_loaded_races
+    refresh_races = [
+        race for race in source_races
+        if race.get("is_dirt_race")
+        and (not active_date or (
+            race.get("race_date").isoformat()[:10] == active_date
+            if isinstance(race.get("race_date"), (datetime.date, datetime.datetime))
+            else str(race.get("race_date", ""))[:10] == active_date
+        ))
+    ]
+    if not refresh_races:
+        st.session_state["market_refresh_message"] = "更新対象のダートレースがありません。先に出走表を取得してください。"
+        st.session_state["market_refresh_success"] = False
     else:
-        st.warning("3連複の人気を取得できませんでした。発売前・アクセス制限・回次不明などが考えられます。")
+        # 単勝と3連複は独立して取得し、一方の失敗が他方を止めない。
+        with st.spinner("単勝・3連複オッズと人気をまとめて取得しています..."):
+            try:
+                wins, win_errors, win_diag = win_collect_for_loaded_races(refresh_races)
+            except Exception as exc:
+                wins, win_errors, win_diag = {}, [f"単勝の一括取得例外: {type(exc).__name__}: {exc}"], []
+            try:
+                trios, trio_errors, trio_diag = trio_collect_for_loaded_races(refresh_races)
+            except Exception as exc:
+                trios, trio_errors, trio_diag = {}, [f"3連複の一括取得例外: {type(exc).__name__}: {exc}"], []
+
+        # 成功したレースだけ新しい市場を上書き。未発売・通信失敗では過去の値を保持。
+        st.session_state["win_market_snapshots"] = {
+            **st.session_state.get("win_market_snapshots", {}), **wins
+        }
+        st.session_state["trio_market_snapshots"] = {
+            **st.session_state.get("trio_market_snapshots", {}), **trios
+        }
+        st.session_state["win_market_errors"] = win_errors
+        st.session_state["win_market_diagnostics"] = win_diag
+        st.session_state["trio_market_errors"] = trio_errors
+        st.session_state["trio_market_diagnostics"] = trio_diag
+
+        if wins:
+            # 馬番照合で単勝オッズ・人気を予想表示、CSV、永続保存データに反映。
+            win_apply_snapshots_to_races(
+                wins,
+                st.session_state.get("mobile_scraped_races") or all_loaded_races,
+                st.session_state.get("mobile_entries", []),
+            )
+
+        meta = st.session_state.get("mobile_scrape_meta") or {}
+        if meta:
+            meta["win_races"] = len(st.session_state["win_market_snapshots"])
+            meta["win_horses"] = sum(len(v.get("market", {})) for v in
+                                     st.session_state["win_market_snapshots"].values())
+            meta["win_errors"] = len(win_errors)
+            meta["trio_races"] = len(st.session_state["trio_market_snapshots"])
+            meta["trio_combinations"] = sum(len(v.get("market", {})) for v in
+                                            st.session_state["trio_market_snapshots"].values())
+            meta["trio_errors"] = len(trio_errors)
+            st.session_state["mobile_scrape_meta"] = meta
+
+        st.session_state["trio_market_github_save"] = ""
+        if (wins or trios) and st.session_state.get("mobile_scraped_races"):
+            try:
+                saved_path = mobile_save_github()
+                st.session_state["mobile_persist_status"] = (
+                    "単勝・3連複の最新市場データもGitHubへ永続保存しました: " + saved_path
+                )
+            except Exception as exc:
+                st.session_state["mobile_persist_status"] = (
+                    "⚠️ 市場データのGitHub保存失敗（現在の画面では保持）: " + str(exc)
+                )
+        if trios:
+            try:
+                saved_path = trio_store_snapshot_github(trios, trio_diag)
+                st.session_state["trio_market_github_save"] = "取得日時付きでGitHubへ保存: " + saved_path
+            except Exception as exc:
+                st.session_state["trio_market_github_save"] = "GitHubへの自動保存不可: " + str(exc)
+
+        win_n = sum(len(x.get("market", {})) for x in wins.values())
+        trio_n = sum(len(x.get("market", {})) for x in trios.values())
+        st.session_state["market_refresh_message"] = (
+            f"一括更新結果：単勝 {len(wins)}レース・{win_n}頭、"
+            f"3連複 {len(trios)}レース・{trio_n}組。"
+            "出走表・過去走と、取得失敗した市場の前回データは保持しました。"
+        )
+        st.session_state["market_refresh_success"] = bool(wins or trios)
+    # 上部の予想・単勝表示も同じ更新済みデータを描画し直す。
+    st.rerun()
+
+if st.session_state.get("market_refresh_message"):
+    renderer = st.success if st.session_state.get("market_refresh_success") else st.warning
+    renderer(st.session_state["market_refresh_message"])
+
+st.subheader("🏇 単勝オッズ・人気")
+st.caption("単勝オッズはnetkeiba APIから馬番で照合。未発売・取得不可なら推測しません。"
+           "取得・更新は上の単勝＋3連複一括ボタンで行います。")
+win_snaps = st.session_state.get("win_market_snapshots", {})
+if win_snaps:
+    win_frame = win_allmarket_csv(win_snaps)
+    st.caption(f"APIで単勝を取得済み：{len(win_snaps)}レース・{len(win_frame)}頭。オッズは取得時点の値です。")
+    st.download_button("📥 単勝オッズ・人気CSVを保存", data=win_frame.to_csv(index=False).encode("utf-8-sig"),
+                       file_name="JRA_単勝オッズ人気_取得結果.csv", mime="text/csv",
+                       key="win_odds_csv", use_container_width=True)
+with st.expander("単勝オッズ一覧（未取得馬を含む）"):
+    visible = []
+    visible_races = st.session_state.get("mobile_scraped_races") or all_loaded_races
+    for r in visible_races:
+        if not r.get("is_dirt_race"):
+            continue
+        rid = trio_race_id(r)
+        snapshot = win_snaps.get(rid, {})
+        market = snapshot.get("market", {})
+        for horse in r.get("horses", []):
+            rec = market.get(int(horse["horse_no"])) if rid else None
+            visible.append({"レース": r.get("race_name", ""), "馬番": horse["horse_no"],
+                            "馬名": horse.get("name", ""),
+                            "単勝オッズ": rec.get("odds") if rec else horse.get("odds"),
+                            "単勝人気": rec.get("popularity") if rec else horse.get("pop_rank"),
+                            "取得元": "単勝API" if rec else ("出走表" if horse.get("odds") is not None else "未取得")})
+    if visible:
+        st.dataframe(pd.DataFrame(visible), hide_index=True, use_container_width=True,
+                     column_config={"単勝オッズ": st.column_config.NumberColumn("単勝オッズ", format="%.1f")})
+    else:
+        st.info("現在表示中の出走表にダート出走馬がありません。")
+if st.session_state.get("win_market_diagnostics"):
+    with st.expander("単勝APIの取得診断"):
+        st.dataframe(pd.DataFrame(st.session_state["win_market_diagnostics"]),
+                     hide_index=True, use_container_width=True)
+if st.session_state.get("win_market_errors"):
+    with st.expander(f"単勝未取得レース・理由（{len(st.session_state['win_market_errors'])}件）"):
+        for message in st.session_state["win_market_errors"]:
+            st.write(message)
+
+st.divider()
+st.subheader("📊 3連複オッズ・人気")
+st.caption("単勝と同じ一括更新ボタンで取得した3連複の組合せ別オッズ・人気です。")
 
 if st.session_state.get("trio_market_github_save"):
     message = st.session_state["trio_market_github_save"]
@@ -2189,9 +2743,11 @@ if st.session_state["trio_market_diagnostics"]:
     bundle = io.BytesIO()
     with zipfile.ZipFile(bundle, "w", zipfile.ZIP_DEFLATED) as zf:
         zf.writestr("3連複オッズ人気.csv", trio_allmarket_csv(st.session_state["trio_market_snapshots"]).to_csv(index=False).encode("utf-8-sig"))
+        zf.writestr("単勝オッズ人気.csv", win_allmarket_csv(st.session_state.get("win_market_snapshots", {})).to_csv(index=False).encode("utf-8-sig"))
         zf.writestr("取得診断.csv", diag_df.to_csv(index=False).encode("utf-8-sig"))
-    st.download_button("📦 取得結果＋診断をZIP保存", data=bundle.getvalue(),
-                       file_name="JRA_3連複取得結果_診断一式.zip", mime="application/zip", key="trio_bundle_download", use_container_width=True)
+        zf.writestr("単勝取得診断.csv", pd.DataFrame(st.session_state.get("win_market_diagnostics", [])).to_csv(index=False).encode("utf-8-sig"))
+    st.download_button("📦 単勝＋3連複の取得結果・診断をZIP保存", data=bundle.getvalue(),
+                       file_name="JRA_単勝3連複取得結果_診断一式.zip", mime="application/zip", key="trio_bundle_download", use_container_width=True)
 
 if st.session_state["trio_market_errors"]:
     with st.expander(f"取得できなかったレース・理由（{len(st.session_state['trio_market_errors'])}件）"):
