@@ -10717,7 +10717,8 @@ def render_races(day, date):
                 four = [int(n) for n in ev["df"].head(4)["horse_no"]]
                 market_rows.extend(trio_ticket_rows(label, four, snapshot))
             if market_rows:
-                st.dataframe(pd.DataFrame(market_rows), hide_index=True, use_container_width=True)
+                st.dataframe(pd.DataFrame(market_rows), hide_index=True, use_container_width=True,
+                             column_config={"3連複オッズ": st.column_config.NumberColumn("3連複オッズ", format="%.1f")})
                 if any(row["取得状態"] != "取得" or pd.isna(row["3連複人気"]) for row in market_rows):
                     st.warning("一部の組合せのオッズ・人気が未取得です。人気を推測で補完しません。")
             else:
@@ -11933,7 +11934,8 @@ def bs_show_ui():
         st.caption("取得 " + latest["captured_at_jst"] + " / " + latest["timing_note"])
         lines = [{"3連複4点": k, "取得時オッズ": v, "100円あたり参考払戻": round(float(v)*100)}
                  for k, v in latest["trio_odds4"].items()]
-        st.dataframe(pd.DataFrame(lines), hide_index=True, use_container_width=True)
+        st.dataframe(pd.DataFrame(lines), hide_index=True, use_container_width=True,
+                     column_config={"取得時オッズ": st.column_config.NumberColumn("取得時オッズ", format="%.1f")})
         st.caption(f"4頭BOX投資額400円 / 4組中最低オッズ{min(latest['trio_odds4'].values()):.1f}倍。"
                    "市場価格は変動するため実際の払戻は結果登録時に確定します。")
         st.download_button("📥 このレースの最新判定JSON", data=json.dumps(latest, ensure_ascii=False, indent=2),
