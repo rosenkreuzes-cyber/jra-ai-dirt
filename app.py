@@ -558,34 +558,101 @@ def mobile_race_list(soup, target_date, min_race=6, max_race=12):
     return sorted(valid)
 
 
+def mobile_schedule_venues(target_date, session):
+    """JRA公式の開催日別番組表から (競馬場, 開催回, 開催日) を取得する。
+
+    予定番組表は変更され得るため、得られたIDは後段で出走表と照合する。
+    """
+    url = (f"https://jra.jp/keiba/calendar{target_date.year}/"
+           f"{target_date.year}/{target_date:%m}/{target_date:%m%d}.html")
+    soup = mobile_get_soup(url, session=session, tries=2)
+    # タグ間の空白・全角表記差を許容する。
+    text = unicodedata.normalize("NFKC", soup.get_text(" ", strip=True))
+    compact = re.sub(r"\s+", "", text)
+    date_token = f"{target_date.year}年{target_date.month}月{target_date.day}日"
+    if date_token not in compact:
+        raise RuntimeError("JRA番組表の開催日を確認できません")
+    venues_pattern = "|".join(COURSES)
+    result = []
+    for kai_s, venue, day_s in re.findall(
+        rf"(?<!\d)(\d{{1,2}})回({venues_pattern})(\d{{1,2}})日", compact
+    ):
+        kai, day = int(kai_s), int(day_s)
+        if venue in TRIO_VENUE_CODES and 1 <= kai <= 9 and 1 <= day <= 12:
+            item = (venue, kai, day)
+            if item not in result:
+                result.append(item)
+    if not result:
+        raise RuntimeError("JRA番組表から開催場・回次・日次を認識できません")
+    # 通常の中央競馬開催は最大3場。想定外の場合は自動生成しない。
+    if len(result) > 3:
+        raise RuntimeError(f"開催情報が多すぎます（{len(result)}場）")
+    return result, url
+
+
+# 取得エンジンの稼働版を画面・診断・バックアップへ表示する。
+# 旧版か新版か区別できない状態での調査を防ぐ。
+MOBILE_FETCH_BUILD = "2026-11-08-verified-id-v3"
+
+# この2開催日はJRA公式の開催情報および実在する出走表IDを照合済み。
+# 対象日以外に適用しない。候補生成後も個別出走表側の開催日を検証する。
+MOBILE_CONFIRMED_SESSIONS = {
+    datetime.date(2026, 11, 7): (("東京", 5, 1), ("京都", 5, 1), ("福島", 3, 1)),
+    datetime.date(2026, 11, 8): (("東京", 5, 2), ("京都", 5, 2), ("福島", 3, 2)),
+}
+
+
 def mobile_discover_race_ids(target_date, session, min_race=6, max_race=12):
-    """複数の公開一覧を確認。候補IDは必ず出走表側で検証する。"""
+    """取得一覧が空でも、確認済み開催日のID探索を妨げない。
+
+    重要: 2026/11/08の確定開催IDはnetkeiba一覧ページより先に生成する。
+    旧版は一覧が空で候補0件のまま停止したため、通信結果への依存をなくす。
+    未確認日には公式番組表から開催場/回次/日次を取得し、個別ページで再検証。
+    """
+    log = [f"取得エンジン={MOBILE_FETCH_BUILD}"]
+    sessions = MOBILE_CONFIRMED_SESSIONS.get(target_date)
+
+    # この分岐はネットワーク通信が失敗しても必ず候補21件（3場 x 7R）を返す。
+    if sessions:
+        result = []
+        for venue, kai, day in sessions:
+            for n in range(min_race, max_race + 1):
+                result.append(f"{target_date.year:04d}{TRIO_VENUE_CODES[venue]}{kai:02d}{day:02d}{n:02d}")
+        log.append(f"公式開催日程確認済み：{target_date:%Y-%m-%d}、{len(sessions)}場、候補{len(result)}件")
+        log.append("候補IDは出走表ページの開催日・レースID照合後に採用")
+        return sorted(result), log
+
+    # その他の日もできる限り公式の当日番組表からIDを生成する。
+    # スケジュールページが利用できない場合にのみnetkeiba一覧へフォールバックする。
+    try:
+        sessions, schedule_url = mobile_schedule_venues(target_date, session)
+        result = [
+            f"{target_date.year:04d}{TRIO_VENUE_CODES[venue]}{kai:02d}{day:02d}{n:02d}"
+            for venue, kai, day in sessions
+            for n in range(min_race, max_race + 1)
+        ]
+        log.append(f"JRA公式開催日程: {schedule_url}、{len(sessions)}場、候補{len(result)}件")
+        return sorted(set(result)), log
+    except Exception as exc:
+        log.append(f"JRA公式日程から取得できず: {type(exc).__name__}: {str(exc)[:160]}")
+
     urls = [
         f"https://race.netkeiba.com/top/race_list.html?kaisai_date={target_date:%Y%m%d}",
-        f"https://race.netkeiba.com/top/race_list.html?kaisai_date={target_date:%Y%m%d}&kaisai_id=",
         f"https://race.netkeiba.com/top/race_list.html?date={target_date:%Y%m%d}",
-        f"https://race.netkeiba.com/top/race_list.html",
+        f"https://race.netkeiba.com/top/race_list.html?kaisai_date={target_date:%Y%m%d}&kaisai_id=",
     ]
-    ids, log = set(), []
+    found_ids = set()
     for url in urls:
         try:
             soup = mobile_get_soup(url, session=session, tries=2)
             found = mobile_race_list(soup, target_date, min_race, max_race)
-            ids.update(found)
-            log.append(f"{url}: 候補{len(found)}件")
+            found_ids.update(found)
+            log.append(f"{url} 候補{len(found)}件")
         except Exception as exc:
-            log.append(f"{url}: {str(exc)[:160]}")
-        if ids:
+            log.append(f"{url} {type(exc).__name__}: {str(exc)[:120]}")
+        if found_ids:
             break
-    # 開催情報が確認できている日のみ、レースID候補を生成する。
-    # 候補は後段で出走表の日付・開催場・回次を照合しなければ採用しない。
-    known = {datetime.date(2026, 11, 7): [("東京", 5, 1), ("京都", 5, 1), ("福島", 3, 1)]}
-    if not ids and target_date in known:
-        for venue, kai, day in known[target_date]:
-            for race_no in range(min_race, max_race + 1):
-                ids.add(f"{target_date.year:04d}{TRIO_VENUE_CODES[venue]}{kai:02d}{day:02d}{race_no:02d}")
-        log.append("開催日程に基づく候補IDを作成（出走表の照合が必要）")
-    return sorted(ids), log
+    return sorted(found_ids), log
 
 
 def mobile_validate_race_page(soup, rid, target_date):
@@ -950,7 +1017,7 @@ def mobile_fetch_date(target_date, min_race=6, max_race=12):
     session = mobile_browser_session()
     race_ids, discovery_log = mobile_discover_race_ids(target_date, session, min_race, max_race)
     if not race_ids:
-        raise RuntimeError("指定日のレースID候補を取得できません。取得診断: " + " / ".join(discovery_log))
+        raise RuntimeError("レースID候補が0件（取得版:" + MOBILE_FETCH_BUILD + "）。取得診断: " + " / ".join(discovery_log))
     progress = st.progress(0.0, text="出走表を取得中")
     race_records = []
     entries = []
@@ -1065,7 +1132,7 @@ def mobile_fetch_date(target_date, min_race=6, max_race=12):
     for race in race_records:
         race["day_label"] = day_label
     empty_eligible = sum(not histories.get(hid) for hid, _ in eligible_horses)
-    meta = {"date":target_date.isoformat(), "race_ids":len(race_ids), "dirt_races":len(race_records),
+    meta = {"fetch_build": MOBILE_FETCH_BUILD, "date":target_date.isoformat(), "race_ids":len(race_ids), "dirt_races":len(race_records),
             "horses":len(entries), "past_runs":len(all_history),
             "debut_horses":len(debut_ids), "history_eligible_horses":len(eligible_horses),
             "history_zero_non_debut":empty_eligible,
@@ -2422,6 +2489,7 @@ def trio_store_snapshot_github(snapshots, diagnostics):
 # 端末にはPython/Colab不要。処理はStreamlitサーバー側で実行される。
 # ============================================================
 st.subheader("📱 スマホで出走表・過去成績・単勝・3連複人気を取得")
+st.caption(f"🔧 取得エンジン: {MOBILE_FETCH_BUILD} ｜ 11月8日のID直接補完：有効")
 st.caption("日付を選んで押すだけ。6〜12Rのダートだけ対象に直接取得します。単勝オッズは未発売時には空欄になります。")
 default_mobile_date = datetime.datetime.now(TRIO_JST).date()
 if st.session_state.get("mobile_scrape_meta", {}).get("date"):
