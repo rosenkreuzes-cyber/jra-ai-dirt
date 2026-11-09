@@ -148,6 +148,15 @@ def parse_dirt_run(raw):
     corner_m = re.search(r"([1-9]\d*)[角コーナー]", t)
     if corner_m:
         corner_pos = int(corner_m.group(1))
+    # 「通過:1-2-3-4」は最後の数字だけを4角の位置として利用。
+    if corner_pos is None:
+        passage = re.search(r"(?:通過|通過順)\s*[:：]\s*([0-9\s-]{1,20})", t)
+        if passage:
+            positions = [int(x) for x in re.findall(r"\d+", passage.group(1))]
+            if positions:
+                corner_pos = positions[-1]
+    jockey_m = re.search(r"(?:^|\n)\s*(?:騎手|Jockey)\s*[:：]\s*([^\n]+)",t,re.I)
+    past_jockey = jockey_m.group(1).strip() if jockey_m else None
 
     margin_m = re.search(r"[（(]\s*([+-]?\d+(?:\.\d+)?)\s*[）)]", t)
     return {
@@ -159,6 +168,7 @@ def parse_dirt_run(raw):
         "going": going_m.group(1) if going_m else None,
         "rank": rank, "field": field,
         "corner_pos": corner_pos,
+        "jockey": past_jockey,
         "date": parse_prior_history_date(t),
         "race_id": (re.search(r"(?<!\d)(20\d{10})(?!\d)",t).group(1)
                     if re.search(r"(?<!\d)(20\d{10})(?!\d)",t) else None),
@@ -8901,10 +8911,13 @@ def yc_evaluate_run(run,name,target_date):
             'year_clock_score':round(score,2),'scale_class_n':count},None
 
 
-# 新AIの5要素: 走破タイム・上がり3F・着差・距離適性・馬場状態。
-# 枠順は一律の加点に使わない。実測データが揃うまで表示専用。
-NEW_WEIGHTS = {"time": .25, "last3f": .20, "margin": .20,
-               "distance": .20, "going": .15}
+# 従来5要素の比較値だけ残す（2026/11/08版との比較）。
+LEGACY_NEW_WEIGHTS = {"time": .25, "last3f": .20, "margin": .20,
+                      "distance": .20, "going": .15}
+# 新AI: 年次補正時計55%、距離15%、馬場10%、騎手相性20%。
+# 上がり3F・着差は独立した加点を廃止。時計と重複させない。
+NEW_WEIGHTS = {"time": .55, "distance": .15, "going": .10, "jockey": .20}
+NEW_AI_VERSION = "YEARCLOCK55_DISTANCE15_GOING10_JOCKEY20_20261109v1"
 
 def dirt_model_before_yearclock(horses, target_distance=None, target_going=None):
     runs_all = [r for h in horses for r in h.get("dirt_histories", [])]
@@ -8920,7 +8933,7 @@ def dirt_model_before_yearclock(horses, target_distance=None, target_going=None)
     scales = {key: robust_scale(vals) for key, vals in reference.items()}
 
     for h in horses:
-        components = {k: [] for k in NEW_WEIGHTS}
+        components = {k: [] for k in LEGACY_NEW_WEIGHTS}
         for r in h.get("dirt_histories", []):
             dist = r["distance"]
             t = normalized_time(r)
@@ -8946,29 +8959,132 @@ def dirt_model_before_yearclock(horses, target_distance=None, target_going=None)
                 components["going"].append(float(np.clip(100*(r["field"]-r["rank"])/(r["field"]-1), 0, 100)))
         values = {k: round(float(np.mean(v)),2) if v else None for k,v in components.items()}
         present = [k for k,v in values.items() if v is not None]
-        total = sum(NEW_WEIGHTS[k] for k in present)
+        total = sum(LEGACY_NEW_WEIGHTS[k] for k in present)
         # 欠損項目の重みを無条件に再配分しない。タイム/上がりの片方と着差が必要。
         required = values["margin"] is not None and (values["time"] is not None or values["last3f"] is not None)
-        h["ai_score"] = round(sum(NEW_WEIGHTS[k]*values[k] for k in present)/total, 2) if required and total >= .45 else None
-        h.update({f"{k}_score": values[k] for k in NEW_WEIGHTS})
+        h["ai_score"] = round(sum(LEGACY_NEW_WEIGHTS[k]*values[k] for k in present)/total, 2) if required and total >= .45 else None
+        h.update({f"{k}_score": values[k] for k in LEGACY_NEW_WEIGHTS})
         h["evidence_coverage"] = round(100*total, 1)
     return horses
 
 
 
+
+def _jm_name(value):
+    """空欄や欠損を名前として扱わず、表記の空白だけ正規化。"""
+    if value is None:return ""
+    v=unicodedata.normalize("NFKC",str(value)).strip()
+    if v.lower() in ("none","nan","null","-","—"):return ""
+    return re.sub(r"\s+","",v)
+
+
+def _jm_before(run,target_date):
+    dt=run.get("date")
+    if isinstance(dt,datetime.datetime):dt=dt.date()
+    return isinstance(dt,datetime.date) and isinstance(target_date,datetime.date) and dt < target_date
+
+
+def _jm_style_database(horses,target_date):
+    """開催前に分かるレース当日出走馬の過去騎乗だけから騎手の4角位置傾向を計測。
+    同一の過去走が複数レースから入っても1件にする。騎手名と4角位置は必須。
+    """
+    pool=list(horses)
+    for race in globals().get('all_loaded_races',[]) or []:
+        if race.get('race_date')==target_date:
+            pool.extend(race.get('horses') or [])
+    by_rider={};seen=set()
+    for h in pool:
+        ident=str(h.get('horse_id') or h.get('name') or '')
+        for r in h.get('dirt_histories',[]) or []:
+            if not _jm_before(r,target_date):continue
+            jockey=_jm_name(r.get('jockey'))
+            field=r.get('field'); corner=r.get('corner_pos')
+            if not jockey or not isinstance(field,(int,float)) or not isinstance(corner,(int,float)) or field < 3 or not (1<=corner<=field):continue
+            ride_key=(ident,str(r.get('date')),str(r.get('race_id') or ''),r.get('course'),r.get('distance'))
+            if ride_key in seen:continue
+            seen.add(ride_key)
+            norm=(corner-1)/(field-1)  # 0=4角先頭 1=最後方
+            by_rider.setdefault(jockey,[]).append((norm,ident))
+    result={}
+    for name,vals in by_rider.items():
+        if len(vals)<5 or len({h for _,h in vals})<3:
+            continue  # 騎乗実例が少ない騎手の「タイプ」は作らない
+        mean=float(np.mean([p for p,_ in vals]))
+        typ='先行傾向' if mean<.38 else ('中団傾向' if mean<.67 else '後方傾向')
+        result[name]={'position':mean,'type':typ,'rides':len(vals),'horses':len({h for _,h in vals})}
+    return result
+
+
+def _jm_jockey_score(horse,target_date,style_db):
+    """同騎手の実績を優先し、乗り替わりは『過去好走騎手との統計的な位置傾向』だけ比較。
+    判定不可ならNone。推測で有名騎手のタイプ等を割り当てない。
+    """
+    now=_jm_name(horse.get('jockey'))
+    details={'jockey_now':now or None,'jockey_type':style_db.get(now,{}).get('type'),
+             'jockey_style_rides':style_db.get(now,{}).get('rides',0),
+             'jockey_similarity':None,'jockey_scoring_method':'騎手名未取得',
+             'jockey_good_rider':None,'jockey_evidence_runs':0}
+    if not now:return None,details
+    runs=[r for r in horse.get('dirt_histories',[]) or [] if _jm_before(r,target_date)]
+    same=[]
+    for r in runs:
+        if _jm_name(r.get('jockey'))!=now:continue
+        rank=r.get('rank'); field=r.get('field')
+        if isinstance(rank,(int,float)) and isinstance(field,(int,float)) and field>1 and 1<=rank<=field:
+            same.append(float(100*(field-rank)/(field-1)))
+    if same:
+        # 事例1走だけの極端な高評価を抑えるため、50点3走の事前値に縮約。
+        score=(150+sum(same))/(3+len(same))
+        details.update(jockey_scoring_method='今回騎手との過去ダート実績',jockey_evidence_runs=len(same),
+                       jockey_good_rider=now if any(v>=75 for v in same) else None)
+        return round(float(np.clip(score,0,100)),2),details
+    # 乗り替わり：過去の好走で騎乗した騎手の統計的な脚質傾向と比較。
+    if now not in style_db:
+        details['jockey_scoring_method']='乗り替わり・新騎手の4角傾向データ不足'
+        return None,details
+    good=[]
+    for r in runs:
+        rank=r.get('rank');past=_jm_name(r.get('jockey'))
+        if not past or not isinstance(rank,(int,float)) or rank>3 or rank<1 or past==now:continue
+        if past not in style_db:continue
+        good.append((past,style_db[past]['position'],max(1,4-int(rank))))
+    if not good:
+        details['jockey_scoring_method']='乗り替わり・好走時騎手の比較データ不足'
+        return None,details
+    target_pos=style_db[now]['position']
+    similarities=[max(0.,1.-abs(target_pos-pos)/.55) for _,pos,_ in good]
+    weights=[w for _,_,w in good]
+    similarity=float(np.average(similarities,weights=weights))
+    score=50+60*(similarity-.5)  # 20〜80点・タイプ近似度が高いほど加点
+    details.update(jockey_scoring_method='乗り替わり・好走騎手との4角傾向類似',
+                   jockey_similarity=round(similarity,3),jockey_evidence_runs=len(good),
+                   jockey_good_rider=','.join(dict.fromkeys(p for p,_,_ in good)))
+    return round(float(np.clip(score,0,100)),2),details
+
+
 def dirt_model(horses, target_distance=None, target_going=None, target_date=None):
-    """新AIの25%時計要素を年次補正時計に置換。元の4項目は維持。"""
-    # 従来版の指数も別列に残し、改修前後の選択理由を後から説明可能にする。
+    """新AI: 年次補正時計55 / 距離15 / 馬場10 / 騎手相性20。
+    上がりと着差の単独加点は廃止し、比較用の旧指数は保持する。
+    """
     dirt_model_before_yearclock(horses,target_distance,target_going)
+    style_db=_jm_style_database(horses,target_date)
     for horse in horses:
         horse['ai_score_before_yearclock']=horse.get('ai_score')
         horse['time_score_before_yearclock']=horse.get('time_score')
-        evaluations=[]; reasons=[]
+        evaluations=[];reasons=[]
         for past_run in horse.get('dirt_histories',[]):
             item,reason=yc_evaluate_run(past_run,horse.get('name',''),target_date)
             if item:evaluations.append(item)
             elif reason:reasons.append(reason)
         time_value=round(float(np.mean([z['year_clock_score'] for z in evaluations])),2) if evaluations else None
+        # 旧・年次補正25%版も変更前比較用の別欄に保持（購入モデルへは不使用）。
+        old_values={k:(time_value if k=='time' else horse.get(k+'_score')) for k in LEGACY_NEW_WEIGHTS}
+        old_present=[k for k,val in old_values.items() if val is not None and np.isfinite(val)]
+        old_total=sum(LEGACY_NEW_WEIGHTS[k] for k in old_present)
+        old_ready=(old_values.get('margin') is not None and
+                   (old_values.get('time') is not None or old_values.get('last3f') is not None))
+        horse['ai_score_yearclock25_before']=(round(sum(LEGACY_NEW_WEIGHTS[k]*old_values[k] for k in old_present)/old_total,2)
+                                             if old_ready and old_total>=.45 else None)
         horse['time_score']=time_value
         horse['year_clock_time_score']=time_value
         horse['year_clock_evidence']=evaluations
@@ -8976,16 +9092,28 @@ def dirt_model(horses, target_distance=None, target_going=None, target_date=None
         horse['year_clock_adv_sec1000_mean']=(round(float(np.mean([z['adv_sec1000'] for z in evaluations])),3) if evaluations else None)
         horse['year_clock_adv_sec1000_best']=(round(float(max(z['adv_sec1000'] for z in evaluations)),3) if evaluations else None)
         horse['year_clock_unmatched_reasons']=list(dict.fromkeys(reasons))
+        jockey_val,j_details=_jm_jockey_score(horse,target_date,style_db)
+        horse.update(j_details)
+        horse['jockey_score']=jockey_val
+        # 直近4走の距離・馬場適性は元の採点方法を維持。
         values={k:horse.get(k+'_score') for k in NEW_WEIGHTS}
         present=[k for k,val in values.items() if val is not None and np.isfinite(val)]
-        total=sum(NEW_WEIGHTS[k] for k in present)
-        required=(values.get('margin') is not None and
-                  (values.get('time') is not None or values.get('last3f') is not None))
-        horse['ai_score']=(round(sum(NEW_WEIGHTS[k]*float(values[k]) for k in present)/total,2)
-                           if required and total>=.45 else None)
-        horse['evidence_coverage']=round(100*total,1)
+        coverage=sum(NEW_WEIGHTS[k] for k in present)
+        horse['evidence_coverage']=round(100*coverage,1)
+        horse['jockey_score_used_neutral']=jockey_val is None
+        # 時計55%は必須。分からない時計を他の要素の高得点で補完しない。
+        if time_value is None:
+            horse['ai_score']=None
+            horse['new_ai_missing_reason']='年次補正時計の根拠不足'
+        else:
+            # 不明な適性・騎手には中立50点を使用。20%を他項目に再配分しない。
+            horse['ai_score']=round(sum(NEW_WEIGHTS[k]*float(values[k] if k in present else 50.0)
+                                         for k in NEW_WEIGHTS),2)
+            horse['new_ai_missing_reason']='' if coverage==1.0 else '一部要素は中立50点で暫定評価'
         horse['year_clock_model_version']=YC_VERSION
+        horse['new_ai_model_version']=NEW_AI_VERSION
     return horses
+
 
 def heading_date(raw):
     # Some exported JRA headings lose the leading "2" in "2026年".
@@ -9093,6 +9221,7 @@ def parse_sheet_rows(rows, day_label, sheet_name=""):
                 "name": next(i for i, c in enumerate(cells) if "馬名" in c),
                 "previous": [i for i, c in enumerate(cells) if re.search(r"前走|前々走|[34]走前", c)],
                 "odds": next((i for i,c in enumerate(cells) if c == "単勝" or c.startswith("単勝オッズ")), None),
+                "jockey": next((i for i,c in enumerate(cells) if c in ("騎手","ジョッキー") or c.startswith("騎手名")), None),
             }
             continue
         if current is not None and columns is None:
@@ -9129,6 +9258,8 @@ def parse_sheet_rows(rows, day_label, sheet_name=""):
             continue
         odds_match = ODDS_PATTERN.search(field)
         odds_idx = columns.get("odds")
+        jockey_idx = columns.get("jockey")
+        current_jockey = clean_text(cells[jockey_idx]) if jockey_idx is not None and jockey_idx < len(cells) else ""
         odds = numeric_odds(cells[odds_idx]) if odds_idx is not None and odds_idx < len(cells) else (float(odds_match.group(1)) if odds_match else None)
         popularity = int(odds_match.group(2)) if odds_match else None
 
@@ -9165,6 +9296,7 @@ def parse_sheet_rows(rows, day_label, sheet_name=""):
         dirt_score = sum(dirt_results) / len(dirt_results) if dirt_results else None
         current["horses"].append({
             "horse_no": horse_no, "name": name,
+            "jockey": _jm_name(current_jockey),
             "horse_no_verified": not inferred_number,
             "pop_rank": popularity, "odds": odds,
             "time_index": time_score, "last3f_index": last3f_score,
@@ -9489,6 +9621,7 @@ def mobile_parse_shutuba(soup, rid, target_date):
     heading = (f"{target_date.year}年{target_date.month}月{target_date.day}日 "
                f"第{int(rid[6:8])}回{venue}第{int(rid[8:10])}日 {start_text} "
                f"{race_num}R {surface}{distance if distance else ''}m")
+    condition_going_m = re.search(r"(?:ダート(?:馬場)?|馬場状態)\s*[:：]?\s*(稍重|不良|良|重)(?![一-龥])", text)
     race = {
         "course": venue, "race_no": race_num, "race_title": race_title,
         "race_name": f"{venue} {race_num}R {race_title}",
@@ -9497,7 +9630,8 @@ def mobile_parse_shutuba(soup, rid, target_date):
         "identified": True, "netkeiba_race_id": rid, "horses": [],
         "is_dirt_race": surface == "ダート", "surface_conflict": surface == "不明",
         "surface_diagnostic": race_metadata[:240], "target_distance": distance,
-        "target_going": None, "horse_numbers_unverified": False,
+        "target_going": condition_going_m.group(1) if condition_going_m else None,
+        "horse_numbers_unverified": False,
         "除外した当日以降の履歴": 0, "除外した日付不明履歴": 0,
     }
     if surface != "ダート":
@@ -9541,9 +9675,12 @@ def mobile_parse_shutuba(soup, rid, target_date):
                 if m:
                     popularity = mobile_number(m.group(1))
                     break
+        j_link = tr.select_one('a[href*="/jockey/"]')
+        jockey_now = mobile_visible_text(j_link) if j_link else ""
         entrants.append({
             "レースID":rid, "開催日":target_date.isoformat(), "馬番":horse_number,
             "馬名":name, "馬ID":horse_id, "オッズ":odds, "人気":popularity,
+            "騎手":_jm_name(jockey_now),
         })
     if not entrants:
         raise RuntimeError("出走表から有効な馬番・馬名・馬IDを取得できません")
@@ -9573,6 +9710,7 @@ def mobile_horse_histories(soup, horse_id, target_date, limit=None):
         "距離": {"距離"}, "馬場": {"馬場", "馬場状態"},
         "レース名": {"レース名", "競走名"}, "馬番": {"馬番"},
         "人気": {"人気"}, "通過": {"通過"}, "ペース": {"ペース"},
+        "騎手": {"騎手", "ジョッキー"},
     }
     def norm(value):
         return re.sub(r"\s+", "", unicodedata.normalize("NFKC", str(value)))
@@ -9687,6 +9825,13 @@ def mobile_horse_histories(soup, horse_id, target_date, limit=None):
                 continue
             row["日付"] = run_date.isoformat()
             row["馬ID"] = horse_id
+            # テーブル位置が変わっても騎手リンクで補完可能。騎手名を推測しない。
+            jockey_link = tr.select_one('a[href*="/jockey/"]')
+            if not _jm_name(row.get("騎手")) and jockey_link:
+                row["騎手"] = _jm_name(mobile_visible_text(jockey_link))
+            if not row.get("通過"):
+                candidates = [norm(x) for x in vals if re.fullmatch(r"\d{1,2}(?:-\d{1,2}){1,3}",norm(x))]
+                if len(candidates)==1:row["通過"]=candidates[0]
             # クラスの曖昧な重複を避けるため、結果表のレースリンクを正確に保存する。
             for hist_link in tr.select('a[href]'):
                 link_rid = re.search(r"(?<!\d)(20\d{10})(?!\d)", hist_link.get('href',''))
@@ -9734,7 +9879,9 @@ def mobile_history_run_string(r):
                       surface_text + " " + going, r.get("タイム", ""),
                       "3F" + last3f if re.fullmatch(r"\d{2}\.\d", last3f) else "",
                       margin_text, "過去レースID:"+str(r.get("過去レースID", "")),
-                      "レース名:"+str(r.get("レース名", ""))])
+                      "レース名:"+str(r.get("レース名", "")),
+                      "騎手:"+_jm_name(r.get("騎手")),
+                      "通過:"+str(r.get("通過", ""))])
 
 
 def mobile_horse_from_runs(entry, runs, target_date):
@@ -9760,6 +9907,7 @@ def mobile_horse_from_runs(entry, runs, target_date):
     dirt_scores = [value for value,dirt in scores if dirt]
     return {
         "horse_no":int(entry["馬番"]), "name":entry["馬名"],
+        "jockey":_jm_name(entry.get("騎手")),
         "horse_no_verified":True, "horse_id":entry["馬ID"],
         "pop_rank":entry.get("人気"), "odds":entry.get("オッズ"),
         "time_index":time_score, "last3f_index":last3f_score,
@@ -9873,7 +10021,7 @@ def mobile_fetch_date(target_date, min_race=6, max_race=12):
                            for e in this_entries]
         race["除外した当日以降の履歴"] = sum(skips_by_horse.get(e["馬ID"], (0, 0))[0] for e in this_entries)
         race["除外した日付不明履歴"] = sum(skips_by_horse.get(e["馬ID"], (0, 0))[1] for e in this_entries)
-        dirt_model(race["horses"], race.get("target_distance"), race.get("target_going"))
+        dirt_model(race["horses"], race.get("target_distance"), race.get("target_going"), race.get("race_date"))
         if horse_errors:
             miss = sum(e["馬ID"] in horse_errors for e in this_entries)
             if miss:
@@ -9968,7 +10116,7 @@ def calculate_ai_indices(horses_data):
 
 
 # --- GitHub Private repository persistence ---
-APP_VERSION = "dual-model-4.6-year-clock-integrated-20261108"
+APP_VERSION = "dual-model-4.7-yearclock55-jockey20-20261109"
 
 def score_old_model(horses):
     data = []
@@ -10679,7 +10827,7 @@ def render_races(day, date):
             with col:
                 st.markdown("**" + label + "**")
                 if label == "新AI":
-                    st.caption("Ver4.6：条件別・年次補正タイム25%／過去走のクラス不明は欠損／確率ではない")
+                    st.caption("Ver4.7：年次補正時計55%／距離15%／馬場10%／騎手相性20%。上がり・着差の単独加点なし。確率ではない")
                 
                 if ev["metrics"]:
                     score_val = ev["metrics"].get("score", 0)
@@ -10735,17 +10883,32 @@ def render_races(day, date):
                     st.write("馬番未確認：買い目は表示しません。指数は参考値です。")
                 else:
                     st.markdown("3連複4点： " + green_combo_html(list(itertools.combinations(top, 3)), placed_set), unsafe_allow_html=True)
-                cols = [c for c in ["horse_no", "name", "odds", "pop_rank", "ai_score", "ai_score_before_yearclock", "margin_score", "distance_score", "going_score", "evidence_coverage", "time_score", "time_score_before_yearclock", "year_clock_run_count", "year_clock_adv_sec1000_mean", "last3f_score", "idx_rank"] if c in df.columns]
-                score_columns = [c for c in ("ai_score", "margin_score", "distance_score", "going_score",
-                                            "evidence_coverage", "time_score", "last3f_score", "ai_score_before_yearclock", "time_score_before_yearclock", "year_clock_adv_sec1000_mean") if c in cols]
+                cols = [c for c in ["horse_no", "name", "odds", "pop_rank", "ai_score", "ai_score_before_yearclock", "ai_score_yearclock25_before", "distance_score", "going_score", "jockey", "jockey_score", "jockey_type", "jockey_scoring_method", "jockey_similarity", "jockey_evidence_runs", "evidence_coverage", "time_score", "time_score_before_yearclock", "year_clock_run_count", "year_clock_adv_sec1000_mean", "idx_rank"] if c in df.columns]
+                score_columns = [c for c in ("ai_score", "distance_score", "going_score", "jockey_score", "jockey_similarity",
+                                            "evidence_coverage", "time_score", "ai_score_before_yearclock", "ai_score_yearclock25_before", "time_score_before_yearclock", "year_clock_adv_sec1000_mean") if c in cols]
                 styled = green_placed_rows(df[cols], placed_set)
                 if "odds" in cols:
                     styled = styled.format({"odds": "{:.1f}"}, na_rep="—")
                 if score_columns:
                     styled = styled.format({c: "{:.2f}" for c in score_columns}, na_rep="—")
-                st.caption("odds＝単勝オッズ、pop_rank＝単勝人気。新AIは走破タイム25%を年次補正時計に置換。"
-                           "ai_score_before_yearclockは改修前指数。年次基準照合がない場合は時計を欠損扱いにします。")
+                st.caption("odds＝単勝オッズ、pop_rank＝単勝人気。新AIは年次補正時計55%、距離15%、馬場10%、騎手相性20%。"
+                           "上がり3F・着差の独立加点は廃止。騎手相性不明なら中立50点（評価根拠充足率を減算）、"
+                           "年次時計が不明なら指数は欠損。ai_score_yearclock25_beforeは前版の年次時計25%方式です。")
                 if label == "新AI":
+                    with st.expander("🏇 騎手相性の根拠・乗り替わりタイプ比較"):
+                        jockey_rows=[]
+                        for _,hr in df.iterrows():
+                            jockey_rows.append({"馬番":int(hr['horse_no']),"馬名":hr.get('name'),
+                                "今回騎手":hr.get('jockey'),"騎手評価":hr.get('jockey_score'),
+                                "現在の騎手傾向":hr.get('jockey_type'),
+                                "比較できた騎乗数":hr.get('jockey_style_rides'),
+                                "好走時の騎手":hr.get('jockey_good_rider'),
+                                "タイプ類似度":hr.get('jockey_similarity'),
+                                "評価に使った実例":hr.get('jockey_evidence_runs'),
+                                "根拠・不足理由":hr.get('jockey_scoring_method')})
+                        st.dataframe(pd.DataFrame(jockey_rows),hide_index=True,use_container_width=True)
+                        st.caption("騎手タイプは過去走で確認できた4角位置を頭数で正規化して推定。騎手別5騎乗・異なる馬3頭以上が必要。"
+                                   "不足時はタイプを作らず、20%枠に中立50点を仮置きします。")
                     with st.expander("⏱️ 年次補正時計の根拠（各馬の過去走）"):
                         evidence_rows = []
                         for _,hr in df.iterrows():
@@ -11611,11 +11774,10 @@ st.caption("人気順位とオッズだけで回収率100%を保証すること�
 # ====================================================================
 # 統合追加: 3連複4頭BOX 発走前購入/見送り研究 (v1.0)
 # 既存の指数・取得・GitHub復元関数を改変しない。
-# 重要: 2026/11時点の既存新AIは、年次補正タイム指数を完全統合した
-#       確率校正済みモデルではない。ここでは現行新AIの相対指数で候補を固定。
+# 新AIは年次時計55%と騎手相性20%を反映。4頭BOX期待回収率は未校正である。
 # ====================================================================
 BS_BASE_APP_SHA256 = "708e1baeb1469d6682a6ea30fe705ef20c0217daaf4606b4b7959966ac2bf7c8"
-BS_RULE_VERSION = "top7_newai_YEARCLOCK_lowpayout_min13_v2_20261108"
+BS_RULE_VERSION = "top7_newai_YEARCLOCK55_JOCKEY20_lowpayout_min13_v3_20261109"
 BS_MIN_ODDS = 13.0    # 研究上の仮説。的中確率が32%なら損益分岐約12.5倍、利益保証はない
 BS_MIN_LEAD_MINUTES = 5
 BS_MAX_MARKET_AGE_MINUTES = 20
@@ -11680,7 +11842,7 @@ def bs_clock_audit(start, capture, win_source, trio_source):
 
 
 def bs_choose_four(race, win_market):
-    """固定ルール：単勝1～7番人気の中から、既存の新AI指数上位4頭。"""
+    """固定ルール：単勝1～7番人気の中から、新AI（年次時計55/騎手20）上位4頭。"""
     if race.get("horse_numbers_unverified") or not race.get("is_dirt_race"):
         raise ValueError("ダート条件または馬番を確認できないレースです")
     horses = race.get("horses") or []
@@ -11760,7 +11922,7 @@ def bs_record_capture(race):
         if not verified:
             raise ValueError("初回4頭固定には時刻検証済みの単勝・3連複オッズが必要: " + audit)
         four, _, ranks = bs_choose_four(race, wins)
-        model_version = APP_VERSION + ":newAI_YEARCLOCK_top7"
+        model_version = APP_VERSION + ":newAI_YEARCLOCK55_JOCKEY20_top7"
     combinations = list(itertools.combinations(four, 3))
     if any(c not in trios for c in combinations):
         raise ValueError("3連複BOX4組のオッズが揃っていません")
@@ -11780,6 +11942,7 @@ def bs_record_capture(race):
                     "model_version": model_version, "selection_rule": BS_RULE_VERSION,
                     "base_app_sha256": BS_BASE_APP_SHA256,
                     "year_clock_model": YC_VERSION,
+                    "new_ai_model": NEW_AI_VERSION,
                     "year_clock_reference_cutoff": YC_SOURCE_MAX_DATE,
                     "year_clock_matched_runs_at_lock": {str(n):clock_coverage.get(n,0) for n in four},
                     "popularity_at_lock": {str(n): int(ranks[n]) for n in four}}
@@ -11893,9 +12056,10 @@ def bs_show_ui():
     st.subheader("🎯 3連複4頭BOX｜購入・見送り研究（統合版）")
     st.caption("同じ4頭を固定し、発走前の3連複4組のオッズから低配当除外を検証。"
                "推奨レース数は0件で正常。現段階の『購入候補』は未実証の研究ラベルであり、利益を保証しません。")
-    st.info("今回の新AIは『走破タイム25%』を年次補正タイム指数に正式置換しました。"
-            "クラスや同条件の参照時計が確認できない過去走は時計評価から除外します。"
-            "人気1～7位から新AI指数で4頭を固定し、従来の購入・見送り研究記録とモデル版を分けます。")
+    st.info("新AIの配分は年次補正タイム55%・距離15%・馬場10%・騎手相性20%。"
+            "乗り替わりのタイプ類似は過去の騎乗4角位置の実績が揃う場合だけ算出。"
+            "データ不足なら中立扱いとし、根拠充足率を表示します。"
+            "人気1～7位から4頭を固定し、旧版の購入・見送り記録とモデル版を区別します。")
     st.warning("年次補正タイム指数も、4頭BOXの組み合わせ確率も、購入優位性が未実証です。"
                "13倍未満の除外基準はあくまで研究用で、利益を保証しません。")
     st.caption("固定の暫定ルール：4組の3連複オッズがすべて13.0倍以上なら研究候補、"
