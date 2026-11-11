@@ -10884,16 +10884,67 @@ def render_races(day, date):
                 else:
                     st.markdown("3連複4点： " + green_combo_html(list(itertools.combinations(top, 3)), placed_set), unsafe_allow_html=True)
                 cols = [c for c in ["horse_no", "name", "odds", "pop_rank", "ai_score", "ai_score_before_yearclock", "ai_score_yearclock25_before", "distance_score", "going_score", "jockey", "jockey_score", "jockey_type", "jockey_scoring_method", "jockey_similarity", "jockey_evidence_runs", "evidence_coverage", "time_score", "time_score_before_yearclock", "year_clock_run_count", "year_clock_adv_sec1000_mean", "idx_rank"] if c in df.columns]
-                score_columns = [c for c in ("ai_score", "distance_score", "going_score", "jockey_score", "jockey_similarity",
-                                            "evidence_coverage", "time_score", "ai_score_before_yearclock", "ai_score_yearclock25_before", "time_score_before_yearclock", "year_clock_adv_sec1000_mean") if c in cols]
-                styled = green_placed_rows(df[cols], placed_set)
-                if "odds" in cols:
-                    styled = styled.format({"odds": "{:.1f}"}, na_rep="—")
-                if score_columns:
-                    styled = styled.format({c: "{:.2f}" for c in score_columns}, na_rep="—")
-                st.caption("odds＝単勝オッズ、pop_rank＝単勝人気。新AIは年次補正時計55%、距離15%、馬場10%、騎手相性20%。"
-                           "上がり3F・着差の独立加点は廃止。騎手相性不明なら中立50点（評価根拠充足率を減算）、"
-                           "年次時計が不明なら指数は欠損。ai_score_yearclock25_beforeは前版の年次時計25%方式です。")
+                display_df = df[cols].copy()
+                jp_col_map = {
+                    "horse_no": "馬番",
+                    "name": "馬名",
+                    "odds": "単勝オッズ",
+                    "pop_rank": "単勝人気",
+                    "ai_score": "新AI指数",
+                    "ai_score_before_yearclock": "旧AI指数",
+                    "ai_score_yearclock25_before": "旧年次時計25%指数",
+                    "distance_score": "距離適性",
+                    "going_score": "馬場適性",
+                    "jockey": "騎手",
+                    "jockey_score": "騎手相性",
+                    "jockey_type": "騎手タイプ",
+                    "jockey_scoring_method": "騎手評価の根拠",
+                    "jockey_similarity": "タイプ類似度",
+                    "jockey_evidence_runs": "騎手根拠走数",
+                    "evidence_coverage": "評価根拠充足率",
+                    "time_score": "年次補正走破タイム",
+                    "time_score_before_yearclock": "旧走破タイム",
+                    "year_clock_run_count": "時計根拠走数",
+                    "year_clock_adv_sec1000_mean": "平均時計差秒/1000m",
+                    "idx_rank": "指数順位",
+                }
+                one_decimal_columns = [c for c in ["odds"] if c in display_df.columns]
+                two_decimal_columns = [c for c in ["ai_score", "ai_score_before_yearclock", "ai_score_yearclock25_before", "distance_score",
+                                                   "going_score", "jockey_score", "jockey_similarity", "evidence_coverage",
+                                                   "time_score", "time_score_before_yearclock"] if c in display_df.columns]
+                three_decimal_columns = [c for c in ["year_clock_adv_sec1000_mean"] if c in display_df.columns]
+                integer_columns = [c for c in ["horse_no", "pop_rank", "jockey_evidence_runs", "year_clock_run_count", "idx_rank"] if c in display_df.columns]
+
+                def _fmt_num(v, digits):
+                    if pd.isna(v):
+                        return "—"
+                    try:
+                        return f"{float(v):.{digits}f}"
+                    except (TypeError, ValueError):
+                        return str(v)
+
+                def _fmt_int(v):
+                    if pd.isna(v):
+                        return "—"
+                    try:
+                        return str(int(float(v)))
+                    except (TypeError, ValueError):
+                        return str(v)
+
+                for c in one_decimal_columns:
+                    display_df[c] = display_df[c].map(lambda v: _fmt_num(v, 1))
+                for c in two_decimal_columns:
+                    display_df[c] = display_df[c].map(lambda v: _fmt_num(v, 2))
+                for c in three_decimal_columns:
+                    display_df[c] = display_df[c].map(lambda v: _fmt_num(v, 3))
+                for c in integer_columns:
+                    display_df[c] = display_df[c].map(_fmt_int)
+                display_df = display_df.rename(columns=jp_col_map)
+                styled = green_placed_rows(display_df, placed_set, number_col='馬番')
+                st.caption("表の項目名は日本語表示です。単勝オッズは小数点1位まで表示。"
+                           "新AIは年次補正走破タイム55%、距離適性15%、馬場適性10%、騎手相性20%で評価します。"
+                           "上がり3F・着差の独立加点は廃止。騎手相性が不明な場合は中立50点、"
+                           "旧年次時計25%指数は比較用に残しています。")
                 if label == "新AI":
                     with st.expander("🏇 騎手相性の根拠・乗り替わりタイプ比較"):
                         jockey_rows=[]
