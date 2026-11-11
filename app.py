@@ -8917,7 +8917,7 @@ LEGACY_NEW_WEIGHTS = {"time": .25, "last3f": .20, "margin": .20,
 # 新AI: 年次補正時計55%、距離15%、馬場10%、騎手相性20%。
 # 上がり3F・着差は独立した加点を廃止。時計と重複させない。
 NEW_WEIGHTS = {"time": .55, "distance": .15, "going": .10, "jockey": .20}
-NEW_AI_VERSION = "YEARCLOCK55_DISTANCE15_GOING10_JOCKEY20_20261109v1"
+NEW_AI_VERSION = "YEARCLOCK55_DISTANCE15_GOING10_JOCKEY20_FULLHISTORY_20261111v2"
 
 def dirt_model_before_yearclock(horses, target_distance=None, target_going=None):
     runs_all = [r for h in horses for r in h.get("dirt_histories", [])]
@@ -8975,27 +8975,42 @@ def _jm_name(value):
     if value is None:return ""
     v=unicodedata.normalize("NFKC",str(value)).strip()
     if v.lower() in ("none","nan","null","-","—"):return ""
+    # 出走表では減量記号や「乗替」の装飾がつく場合があるため、名前からのみ除去する。
+    v = re.sub(r"^(?:騎手[:：]|乗替[:：]|乗り替わり[:：])", "", v)
+    v = re.sub(r"^[☆▲△◇★◎○]+", "", v)
+    v = re.sub(r"[（(](?:替|乗替|減量)[）)]$", "", v)
     return re.sub(r"\s+","",v)
+
+
+def _jm_histories(horse):
+    """能力指数は直近4走のまま。騎手評価に限り別保存の全過去走を参照する。"""
+    full = horse.get('jockey_full_dirt_histories')
+    return full if isinstance(full, list) else (horse.get('dirt_histories') or [])
 
 
 def _jm_before(run,target_date):
     dt=run.get("date")
     if isinstance(dt,datetime.datetime):dt=dt.date()
+    if isinstance(dt,str):
+        try:dt=datetime.date.fromisoformat(dt[:10])
+        except ValueError:return False
     return isinstance(dt,datetime.date) and isinstance(target_date,datetime.date) and dt < target_date
 
 
-def _jm_style_database(horses,target_date):
+def _jm_style_database(horses,target_date,reference_horses=None):
     """開催前に分かるレース当日出走馬の過去騎乗だけから騎手の4角位置傾向を計測。
     同一の過去走が複数レースから入っても1件にする。騎手名と4角位置は必須。
     """
     pool=list(horses)
+    if reference_horses is not None:
+        pool.extend(reference_horses)
     for race in globals().get('all_loaded_races',[]) or []:
         if race.get('race_date')==target_date:
             pool.extend(race.get('horses') or [])
     by_rider={};seen=set()
     for h in pool:
         ident=str(h.get('horse_id') or h.get('name') or '')
-        for r in h.get('dirt_histories',[]) or []:
+        for r in _jm_histories(h):
             if not _jm_before(r,target_date):continue
             jockey=_jm_name(r.get('jockey'))
             field=r.get('field'); corner=r.get('corner_pos')
@@ -9012,6 +9027,34 @@ def _jm_style_database(horses,target_date):
         mean=float(np.mean([p for p,_ in vals]))
         typ='先行傾向' if mean<.38 else ('中団傾向' if mean<.67 else '後方傾向')
         result[name]={'position':mean,'type':typ,'rides':len(vals),'horses':len({h for _,h in vals})}
+    # 外部騎乗履歴は対象レースの日付より前のレースだけを集計。公開ページの
+    # 「2026年通算成績」を過去日付の予測に混ぜることはしない。
+    try:
+        ext_state = st.session_state.get("jm_external_profiles", {})
+        ext_day = ext_state.get(target_date.isoformat(), {}) if isinstance(target_date, datetime.date) else {}
+        for name, profile in ext_day.items():
+            vals = []
+            for r in profile.get("rides", []):
+                if not _jm_before(r, target_date):
+                    continue
+                field, corner = r.get("field"), r.get("corner_pos")
+                if not isinstance(field, (int, float)) or not isinstance(corner, (int, float)):
+                    continue
+                if field < 3 or not (1 <= corner <= field):
+                    continue
+                horse_name = _jm_name(r.get("horse_name"))
+                if horse_name:
+                    vals.append(((corner - 1)/(field - 1), horse_name))
+            different = len({h for _, h in vals})
+            if len(vals) >= 5 and different >= 3:
+                m = float(np.mean([v for v, _ in vals]))
+                t = '先行傾向' if m < .38 else ('中団傾向' if m < .67 else '後方傾向')
+                # 同数以上の独立騎乗例が揃う場合にだけ公開履歴の評価を優先する。
+                if name not in result or len(vals) >= result[name]['rides']:
+                    result[name] = {'position': m, 'type': t, 'rides': len(vals),
+                                    'horses': different, 'source': 'ウマピア騎手別履歴（芝ダ混合・開催前のみ）'}
+    except (ValueError, TypeError, AttributeError, KeyError):
+        pass
     return result
 
 
@@ -9025,7 +9068,10 @@ def _jm_jockey_score(horse,target_date,style_db):
              'jockey_similarity':None,'jockey_scoring_method':'騎手名未取得',
              'jockey_good_rider':None,'jockey_evidence_runs':0}
     if not now:return None,details
-    runs=[r for r in horse.get('dirt_histories',[]) or [] if _jm_before(r,target_date)]
+    runs=[r for r in _jm_histories(horse) if _jm_before(r,target_date)]
+    if not any(_jm_name(r.get('jockey')) for r in runs):
+        details['jockey_scoring_method']='過去走の騎手名が未取得（タイプ比較不可）'
+        return None,details
     same=[]
     for r in runs:
         if _jm_name(r.get('jockey'))!=now:continue
@@ -9062,12 +9108,12 @@ def _jm_jockey_score(horse,target_date,style_db):
     return round(float(np.clip(score,0,100)),2),details
 
 
-def dirt_model(horses, target_distance=None, target_going=None, target_date=None):
+def dirt_model(horses, target_distance=None, target_going=None, target_date=None, jockey_reference_horses=None):
     """新AI: 年次補正時計55 / 距離15 / 馬場10 / 騎手相性20。
     上がりと着差の単独加点は廃止し、比較用の旧指数は保持する。
     """
     dirt_model_before_yearclock(horses,target_distance,target_going)
-    style_db=_jm_style_database(horses,target_date)
+    style_db=_jm_style_database(horses,target_date,reference_horses=jockey_reference_horses)
     for horse in horses:
         horse['ai_score_before_yearclock']=horse.get('ai_score')
         horse['time_score_before_yearclock']=horse.get('time_score')
@@ -9095,6 +9141,8 @@ def dirt_model(horses, target_distance=None, target_going=None, target_date=None
         jockey_val,j_details=_jm_jockey_score(horse,target_date,style_db)
         horse.update(j_details)
         horse['jockey_score']=jockey_val
+        horse['jockey_score_applied']=50.0 if jockey_val is None else jockey_val
+        # 騎手名・根拠が無い場合も指数内では50点とするが、推測した実測値とは区別する。
         # 直近4走の距離・馬場適性は元の採点方法を維持。
         values={k:horse.get(k+'_score') for k in NEW_WEIGHTS}
         present=[k for k,val in values.items() if val is not None and np.isfinite(val)]
@@ -9428,6 +9476,201 @@ def mobile_get_soup(url, session=None, tries=3):
     raise RuntimeError(" / ".join(failures))
 
 
+# ====================================================================
+# 騎手情報の公開補助資料：ウマピア（騎乗履歴）と競馬ラボ（成績照合）
+# ※公開ページの取得失敗時は既存騎手履歴へフォールバック。アクセス制限は回避しない。
+# ※当年累計成績は発走前の過去時点を再現できないため能力点に使用しない。
+# ※騎手タイプは4角位置からの傾向であり手腕や因果効果ではない。
+# ====================================================================
+JM_PUBLIC_VERSION = "umapia-rides-keibalab-optional-20261111-v1"
+JM_PUBLIC_MAX_RIDERS = 24
+
+
+def jm_public_umapia_index(soup):
+    """公開騎手一覧の各リンクから氏名と内部IDを取得（年のURLで固定IDを推測しない）。"""
+    found = {}
+    for a in soup.find_all('a', href=True):
+        m = re.search(r'/search/jockeys/(\d+)(?:/?(?:\?|$))', a['href'])
+        if not m:
+            continue
+        nm = _jm_name(a.get_text(' ', strip=True))
+        if not nm or len(nm)>28:
+            continue
+        found[nm] = m.group(1)
+    if len(found)<5:
+        raise RuntimeError('ウマピアの騎手リンクが見つかりません（ページ変更の可能性）')
+    return found
+
+
+def jm_public_umapia_rides(soup, name):
+    """騎手別競走成績表。元レコードに通過順位、頭数、馬名、日付を要求する。"""
+    rides = []
+    seen = set()
+    for tr in soup.find_all('tr'):
+        tds = tr.find_all('td', recursive=False)
+        if len(tds)<18:
+            continue
+        cells = [td.get_text(' ', strip=True) for td in tds]
+        dm=re.fullmatch(r'(20\d{2})/(\d{1,2})/(\d{1,2})', cells[0])
+        if not dm:
+            continue
+        try:
+            dt=datetime.date(int(dm.group(1)),int(dm.group(2)),int(dm.group(3)))
+            field=int(re.sub(r'[^\d]', '', unicodedata.normalize('NFKC',cells[5])))
+            rank=int(re.sub(r'[^\d]', '', unicodedata.normalize('NFKC',cells[10])))
+            raw_corner=unicodedata.normalize('NFKC',cells[17])
+            positions=[int(x) for x in re.findall(r'\d+', raw_corner)]
+            corner=positions[-1] if positions else None
+            horse_name=_jm_name(cells[11])
+        except (ValueError,TypeError,IndexError):
+            continue
+        if not horse_name or not (3<=field<=18 and 1<=rank<=field):
+            continue
+        # 競馬場表記例: 5京都2 / 3東京4。地方はスタイル混入を防ぐため対象外。
+        venue=unicodedata.normalize('NFKC',cells[1])
+        if not any(course in venue for course in TRIO_VENUE_CODES):
+            continue
+        if corner is None or not (1<=corner<=field):
+            continue
+        key=(dt,venue,cells[3],horse_name)
+        if key in seen:
+            continue
+        seen.add(key)
+        rides.append({'date':dt,'jockey':_jm_name(name),'horse_name':horse_name,
+                      'field':field,'corner_pos':corner,'rank':rank,
+                      'course':venue,'distance':cells[13],
+                      'race_id':f'{dt.isoformat()}:{venue}:{cells[3]}',
+                      'source':'ウマピア'})
+    return rides
+
+
+def jm_public_keibalab_leading(soup):
+    """競馬ラボのリーディング情報（取得できれば診断・照合のみ）。"""
+    result={}
+    for tr in soup.find_all('tr'):
+        cells=[td.get_text(' ',strip=True) for td in tr.find_all(['td','th'], recursive=False)]
+        if len(cells)<9:
+            continue
+        # 順位,騎手名,所属,1着,2着,3着,着外,騎乗回数,勝率,...
+        nm=_jm_name(cells[1])
+        try:
+            n=int(cells[7].replace(',',''))
+            a,b,c=[int(cells[k].replace(',','')) for k in (3,4,5)]
+        except (IndexError, ValueError):
+            continue
+        if nm and n>=a+b+c>=0:
+            result[nm]={'騎乗数':n,'1着':a,'2着':b,'3着':c,'複勝率':round(100*(a+b+c)/n,1) if n else 0.,'出典':'競馬ラボ'}
+    if len(result)<5:
+        raise RuntimeError('競馬ラボ騎手成績テーブル未検出（アクセス制限・仕様変更）')
+    return result
+
+
+def jm_public_get_soup(url):
+    """外部補助サイト用の短時間アクセス。403/429は回避せずエラーとして記録。"""
+    from bs4 import BeautifulSoup
+    import requests
+    session=mobile_browser_session()
+    response=session.get(url,timeout=(4,9),allow_redirects=True)
+    response.raise_for_status()
+    if len(response.content)<200:
+        raise RuntimeError('公開ページ本文が短すぎます')
+    soup=BeautifulSoup(response.content,'html.parser')
+    summary=soup.get_text(' ',strip=True)[:500].lower()
+    if any(w in summary for w in ('captcha','access denied','アクセスが集中')):
+        raise RuntimeError('公開サイト側のアクセス制限')
+    return soup
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def jm_public_index_cached(year):
+    soup=jm_public_get_soup(f'https://umapia.jp/search/jockeys?year={int(year)}')
+    return jm_public_umapia_index(soup)
+
+
+@st.cache_data(ttl=7200, show_spinner=False)
+def jm_public_rides_cached(rider_id, rider_name):
+    if not re.fullmatch(r'\d{1,8}',str(rider_id)):
+        raise ValueError('騎手IDが不正です')
+    soup=jm_public_get_soup(f'https://umapia.jp/search/jockeys/{rider_id}')
+    return jm_public_umapia_rides(soup, rider_name)
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def jm_public_keibalab_cached():
+    soup=jm_public_get_soup('https://www.keibalab.jp/db/leading.html?kind=jockey')
+    return jm_public_keibalab_leading(soup)
+
+
+def jm_public_enrich(races, target_date, selected_rid=None, max_riders=JM_PUBLIC_MAX_RIDERS):
+    """騎手氏名の照合と4角位置の独立サンプルを取得。過去日の通算成績を使わない。"""
+    import concurrent.futures
+    if not isinstance(target_date,datetime.date):
+        raise ValueError('開催日が不明なので外部騎手成績の時点を確定できません')
+    active=[r for r in (races or []) if not selected_rid or str(r.get('netkeiba_race_id'))==str(selected_rid)]
+    requested=[]
+    for race in active:
+        for h in race.get('horses') or []:
+            nm=_jm_name(h.get('jockey'))
+            if nm and nm not in requested:
+                requested.append(nm)
+            # 好走時の騎手とのタイプ比較にも必要。現在の騎手を優先して後ろへ追加。
+    for race in active:
+        for h in race.get('horses') or []:
+            for hist in _jm_histories(h):
+                if not _jm_before(hist,target_date) or not (isinstance(hist.get('rank'),(int,float)) and 1<=hist['rank']<=3):
+                    continue
+                nm=_jm_name(hist.get('jockey'))
+                if nm and nm not in requested:
+                    requested.append(nm)
+    old=st.session_state.get('jm_external_profiles',{}).get(target_date.isoformat(),{})
+    requested=[nm for nm in requested if nm not in old][:max(1,int(max_riders))]
+    errors=[]
+    try:
+        index=jm_public_index_cached(target_date.year)
+    except Exception as exc:
+        index={}
+        errors.append('ウマピア一覧: '+str(exc)[:150])
+    try:
+        leading=jm_public_keibalab_cached()
+    except Exception as exc:
+        leading={}
+        errors.append('競馬ラボ: '+str(exc)[:150])
+    profiles=dict(old)
+    available=[(nm,index[nm]) for nm in requested if nm in index]
+    absent=[nm for nm in requested if nm not in index]
+    if absent:
+        errors.append('騎手ID不明: '+','.join(absent[:14]))
+    def retrieve(item):
+        nm,rid=item
+        try:
+            return nm,jm_public_rides_cached(rid,nm),None
+        except Exception as exc:
+            return nm,[],str(exc)[:140]
+    with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
+        for nm,rides,err in pool.map(retrieve,available):
+            if err:
+                errors.append(nm+': '+err)
+                continue
+            # 同開催日、未来日付のレコードは絶対に能力指数へ加えない。
+            prior=[r for r in rides if _jm_before(r,target_date)]
+            if prior:
+                profiles[nm]={'rides':prior,'jockey_id':index[nm],
+                              'source':'ウマピア騎手詳細','fetched_at':datetime.datetime.now(TRIO_JST).isoformat()}
+    st.session_state.setdefault('jm_external_profiles',{})[target_date.isoformat()]=profiles
+    st.session_state.setdefault('jm_external_stats',{}).update({nm:leading[nm] for nm in requested if nm in leading})
+    st.session_state['jm_external_diagnostics']={
+       'date':target_date.isoformat(),'requested':len(requested),'matched_index':len(available),
+       'prior_ride_jockeys':len(profiles),'prior_rides':sum(len(p['rides']) for p in profiles.values()),
+       'keibalab_stats_count':len(st.session_state['jm_external_stats']), 'errors':errors,
+       'source_note':'ウマピア騎乗履歴は芝ダ混合。競馬ラボの当年累計成績は診断専用で指数加点なし'}
+    pool_horses=[h for r in races for h in (r.get('horses') or [])]
+    for race in races:
+        if race.get('horses') and race.get('race_date')==target_date:
+            dirt_model(race['horses'],race.get('target_distance'),race.get('target_going'),target_date,
+                       jockey_reference_horses=pool_horses)
+    return st.session_state['jm_external_diagnostics']
+
+
 def mobile_race_list(soup, target_date, min_race=6, max_race=12):
     """リンクだけでなく、ページ内JSON・埋込データのレースIDも検索。"""
     source = str(soup)
@@ -9675,8 +9918,15 @@ def mobile_parse_shutuba(soup, rid, target_date):
                 if m:
                     popularity = mobile_number(m.group(1))
                     break
-        j_link = tr.select_one('a[href*="/jockey/"]')
-        jockey_now = mobile_visible_text(j_link) if j_link else ""
+        j_link = tr.select_one('a[href*="/jockey/"], a[href*="jockey_id="]')
+        j_cell = tr.select_one('td.Jockey, td[class*="Jockey"]')
+        jockey_now = _jm_name(mobile_visible_text(j_link)) if j_link else ""
+        if not jockey_now and j_cell:
+            cell_name = _jm_name(mobile_visible_text(j_cell))
+            if re.fullmatch(r"[一-龥々ぁ-んァ-ン・ーA-Za-z]{2,18}", cell_name):
+                jockey_now = cell_name
+        if not jockey_now:
+            problems.append(f"騎手名未取得:{name}")
         entrants.append({
             "レースID":rid, "開催日":target_date.isoformat(), "馬番":horse_number,
             "馬名":name, "馬ID":horse_id, "オッズ":odds, "人気":popularity,
@@ -9690,7 +9940,8 @@ def mobile_parse_shutuba(soup, rid, target_date):
     official_match = re.search(r"(\d{1,2})\s*頭", unicodedata.normalize("NFKC", race_metadata))
     if official_match and len(entrants) != int(official_match.group(1)):
         problems.append(f"頭数不一致:{len(entrants)}/{official_match.group(1)}")
-    if problems:
+    race["jockey_missing_horses"] = [r["馬名"] for r in entrants if not r.get("騎手")]
+    if any(x.startswith(("馬IDなし", "馬番未確定", "馬番重複", "頭数不一致")) for x in problems):
         race["horse_numbers_unverified"] = True
     return race, entrants, "; ".join(problems)
 
@@ -9826,9 +10077,18 @@ def mobile_horse_histories(soup, horse_id, target_date, limit=None):
             row["日付"] = run_date.isoformat()
             row["馬ID"] = horse_id
             # テーブル位置が変わっても騎手リンクで補完可能。騎手名を推測しない。
-            jockey_link = tr.select_one('a[href*="/jockey/"]')
-            if not _jm_name(row.get("騎手")) and jockey_link:
-                row["騎手"] = _jm_name(mobile_visible_text(jockey_link))
+            jockey_link = tr.select_one('a[href*="/jockey/"], a[href*="jockey_id="]')
+            jockey_cell = tr.select_one('td.Jockey, td[class*="Jockey"]')
+            jockey_name = _jm_name(mobile_visible_text(jockey_link)) if jockey_link else ""
+            if not jockey_name and jockey_cell:
+                fallback_name = _jm_name(mobile_visible_text(jockey_cell))
+                if re.fullmatch(r"[一-龥々ぁ-んァ-ン・ーA-Za-z]{2,18}", fallback_name):
+                    jockey_name = fallback_name
+            if not jockey_name:
+                fallback_name = _jm_name(row.get("騎手"))
+                if re.fullmatch(r"[一-龥々ぁ-んァ-ン・ーA-Za-z]{2,18}", fallback_name):
+                    jockey_name = fallback_name
+            row["騎手"] = jockey_name
             if not row.get("通過"):
                 candidates = [norm(x) for x in vals if re.fullmatch(r"\d{1,2}(?:-\d{1,2}){1,3}",norm(x))]
                 if len(candidates)==1:row["通過"]=candidates[0]
@@ -9886,9 +10146,11 @@ def mobile_history_run_string(r):
 
 def mobile_horse_from_runs(entry, runs, target_date):
     all_before = [r for r in runs if isinstance(r.get("日付"), str) and r["日付"] < target_date.isoformat()]
-    # 既存Excelが4走分のため、指数の入力は直近4走に揃える。全履歴はCSVに残す。
-    latest = sorted(all_before, key=lambda r: r["日付"], reverse=True)[:4]
+    ordered = sorted(all_before, key=lambda r: r["日付"], reverse=True)
+    # 能力指数用は直近4走のまま固定。騎手の傾向・乗り替わり評価だけは全過去走を使う。
+    latest = ordered[:4]
     texts = [mobile_history_run_string(r) for r in latest]
+    rider_history = [v for v in (parse_dirt_run(mobile_history_run_string(r)) for r in ordered) if v]
     time_score, last3f_score = parse_horse_history(texts[0] if texts else "")
     scores = []
     dirt_runs = 0
@@ -9915,6 +10177,9 @@ def mobile_horse_from_runs(entry, runs, target_date):
         "relative_score":relative,
         "dirt_score":sum(dirt_scores)/len(dirt_scores) if dirt_scores else None,
         "dirt_histories":[v for v in (parse_dirt_run(txt) for txt in texts) if v],
+        "jockey_full_dirt_histories":rider_history,
+        "jockey_past_rides_found":sum(bool(_jm_name(v.get('jockey'))) for v in rider_history),
+        "jockey_corner_rides_found":sum(bool(_jm_name(v.get('jockey'))) and v.get('corner_pos') is not None for v in rider_history),
     }
 
 
@@ -10015,13 +10280,17 @@ def mobile_fetch_date(target_date, min_race=6, max_race=12):
         diagnostics.append({"レースID":"", "処理結果":"非新馬の過去走0件", "取得頭数":0,
                             "理由":" / ".join(reasons) if reasons else "非新馬の全対象馬で履歴0件（日付・HTML解析を確認）",
                             "取得日時JST":datetime.datetime.now(TRIO_JST).isoformat(timespec="seconds")})
+    # 騎手タイプには同日全ダート出走馬の履歴を使う。個々のレースだけでは標本不足になる。
     for race in race_records:
         this_entries = [e for e in entries if e["レースID"] == race["netkeiba_race_id"]]
         race["horses"] = [mobile_horse_from_runs(e, histories.get(e["馬ID"], []), target_date)
                            for e in this_entries]
         race["除外した当日以降の履歴"] = sum(skips_by_horse.get(e["馬ID"], (0, 0))[0] for e in this_entries)
         race["除外した日付不明履歴"] = sum(skips_by_horse.get(e["馬ID"], (0, 0))[1] for e in this_entries)
-        dirt_model(race["horses"], race.get("target_distance"), race.get("target_going"), race.get("race_date"))
+    riders_pool = [h for race in race_records for h in race["horses"]]
+    for race in race_records:
+        this_entries = [e for e in entries if e["レースID"] == race["netkeiba_race_id"]]
+        dirt_model(race["horses"], race.get("target_distance"), race.get("target_going"), race.get("race_date"), jockey_reference_horses=riders_pool)
         if horse_errors:
             miss = sum(e["馬ID"] in horse_errors for e in this_entries)
             if miss:
@@ -10046,6 +10315,12 @@ def mobile_fetch_date(target_date, min_race=6, max_race=12):
             "excluded_today_or_later":excluded_same_day, "excluded_unknown_date":excluded_no_date,
             "history_errors":len(horse_errors), "history_zero_rows":sum(not v for v in histories.values()),
             "history_fetch_url":"https://db.netkeiba.com/horse/result/{馬ID}/",
+            "jockey_now_present":sum(bool(e.get("騎手")) for e in entries),
+            "jockey_now_total":len(entries),
+            "jockey_past_present":sum(bool(r.get("騎手")) for r in all_history),
+            "jockey_past_total":len(all_history),
+            "jockey_corner_present":sum(bool(r.get("騎手")) and bool(r.get("通過")) for r in all_history),
+            "jockey_style_types":len(_jm_style_database(riders_pool,target_date)),
             "fetched_at":datetime.datetime.now(TRIO_JST).isoformat(timespec="seconds")}
     return race_records, entries, all_history, diagnostics, meta
 
@@ -10116,7 +10391,7 @@ def calculate_ai_indices(horses_data):
 
 
 # --- GitHub Private repository persistence ---
-APP_VERSION = "dual-model-4.7-yearclock55-jockey20-20261109"
+APP_VERSION = "dual-model-4.8-jockey-full-history-20261111"
 
 def score_old_model(horses):
     data = []
@@ -10610,7 +10885,13 @@ def mobile_state_from_session():
             "win_market_snapshots", "win_market_errors", "win_market_diagnostics")
     empty_lists = ("mobile_entries", "mobile_histories", "mobile_diagnostics", "trio_market_errors",
                    "trio_market_diagnostics", "win_market_errors", "win_market_diagnostics")
-    return {key: st.session_state.get(key, [] if key in empty_lists else {}) for key in keys}
+    state={key: st.session_state.get(key, [] if key in empty_lists else {}) for key in keys}
+    # 公開騎手の取得履歴も同開催日の予測根拠として永続化する。
+    date_key=str((state.get('mobile_scrape_meta') or {}).get('date') or '')
+    state['jm_external_profiles']={date_key:st.session_state.get('jm_external_profiles',{}).get(date_key,{})}
+    state['jm_external_stats']=st.session_state.get('jm_external_stats',{})
+    state['jm_external_diagnostics']=st.session_state.get('jm_external_diagnostics',{})
+    return state
 
 
 def mobile_save_github():
@@ -10651,12 +10932,71 @@ def mobile_read_github(target_date=None):
     return _mobile_state_unpack(record) if record is not None else None
 
 
+def mobile_rehydrate_jockey_from_saved(races, entries, histories):
+    """既存GitHub保存分に騎手名・全履歴がある場合は再通信なしで回復。無いものは作らない。"""
+    entry_map = {(str(e.get("レースID")), str(e.get("馬番"))):e for e in (entries or [])}
+    runs_by_id = {}
+    for item in histories or []:
+        hid = str(item.get("馬ID") or "")
+        if hid:
+            runs_by_id.setdefault(hid,[]).append(item)
+    restored = 0
+    for race in races or []:
+        race_date = race.get("race_date")
+        if isinstance(race_date,str):
+            try:race_date=datetime.date.fromisoformat(race_date)
+            except ValueError:continue
+        if not isinstance(race_date,datetime.date):continue
+        for h in race.get("horses") or []:
+            e = entry_map.get((str(race.get("netkeiba_race_id")),str(h.get("horse_no"))),{})
+            new_name = _jm_name(e.get("騎手"))
+            if not _jm_name(h.get("jockey")) and new_name:
+                h["jockey"] = new_name
+                restored += 1
+            hid = str(h.get("horse_id") or e.get("馬ID") or "")
+            saved = runs_by_id.get(hid,[])
+            if saved:
+                before = [r for r in saved if isinstance(r.get("日付"),str) and r["日付"] < race_date.isoformat()]
+                full = [v for v in (parse_dirt_run(mobile_history_run_string(r)) for r in before) if v]
+                if len(full) > len(h.get("jockey_full_dirt_histories") or []):
+                    h["jockey_full_dirt_histories"] = full
+                    h["jockey_past_rides_found"] = sum(bool(_jm_name(v.get('jockey'))) for v in full)
+                    h["jockey_corner_rides_found"] = sum(bool(_jm_name(v.get('jockey'))) and v.get('corner_pos') is not None for v in full)
+    return restored
+
+
 def mobile_apply_restored_state(state):
+    # 公開騎手履歴を先に戻す。アプリ再起動後もタイプ比較を欠損させない。
+    saved_external=state.get('jm_external_profiles') or {}
+    if isinstance(saved_external,dict):
+        existing=st.session_state.setdefault('jm_external_profiles',{})
+        for day,profiles in saved_external.items():
+            if re.fullmatch(r'20\d{2}-\d{2}-\d{2}',str(day)) and isinstance(profiles,dict):
+                existing[day]=profiles
+    for key in ('jm_external_stats','jm_external_diagnostics'):
+        if isinstance(state.get(key),dict):st.session_state[key]=state[key]
+    mobile_rehydrate_jockey_from_saved(state.get('mobile_scraped_races'),state.get('mobile_entries'),state.get('mobile_histories'))
     for key, val in state.items():
         if key in ("mobile_scraped_races", "mobile_entries", "mobile_histories", "mobile_diagnostics",
                    "mobile_scrape_meta", "trio_market_snapshots", "trio_market_errors", "trio_market_diagnostics",
                    "win_market_snapshots", "win_market_errors", "win_market_diagnostics"):
             st.session_state[key] = val
+    restored_races=st.session_state.get('mobile_scraped_races') or []
+    # JSON復元後の過去走日付は文字列。再評価前にdateへ変換しないと年次時計が欠損する。
+    for race in restored_races:
+        for h in (race.get('horses') or []):
+            for key in ('dirt_histories','jockey_full_dirt_histories'):
+                for run in (h.get(key) or []):
+                    d=run.get('date')
+                    if isinstance(d,str):
+                        try:run['date']=datetime.date.fromisoformat(d[:10])
+                        except ValueError:pass
+    reference_horses=[h for r in restored_races for h in (r.get('horses') or [])]
+    for race in restored_races:
+        rd=race.get('race_date')
+        if isinstance(rd,datetime.date) and race.get('horses'):
+            dirt_model(race['horses'],race.get('target_distance'),race.get('target_going'),rd,
+                       jockey_reference_horses=reference_horses)
     # GitHubの保存形式が旧版でも、単勝のキーを補正して復元する。
     st.session_state.setdefault("win_market_snapshots", {})
     st.session_state.setdefault("win_market_errors", [])
@@ -10688,6 +11028,80 @@ def mobile_try_autorestore():
             f"GitHubの直接取得データを復元できませんでした: {type(exc).__name__}: {exc}。"
             "Google Driveの旧データへ切り替わる可能性があります。"
         )
+
+
+def mobile_refresh_jockey_data(races, entries, histories, target_date):
+    """騎手情報の欠損だけ取得し直す。オッズ・選択済み4頭・過去時計基準は変更しない。"""
+    import concurrent.futures
+    race_ids = {str(r.get('netkeiba_race_id')) for r in races or []}
+    if not race_ids or not entries:
+        raise ValueError('騎手更新にはスマホ直接取得済みの出走表が必要です')
+    stamp=datetime.datetime.now(TRIO_JST).isoformat(timespec='seconds')
+    entry_lookup={(str(e.get('レースID')),str(e.get('馬番'))):e for e in entries}
+    past_by_horse={}
+    for h in histories or []:
+        hid=str(h.get('馬ID') or '')
+        if hid:
+            past_by_horse.setdefault(hid,[]).append(h)
+    log=[];updated_now=0;updated_past=0
+    # 出走表は現在の騎手名が空欄の馬がいるレースだけ確認。馬番・馬ID一致を必須とする。
+    for race in races:
+        rid=str(race.get('netkeiba_race_id'))
+        missing=[e for e in entries if str(e.get('レースID'))==rid and not _jm_name(e.get('騎手'))]
+        if not missing:continue
+        try:
+            soup=mobile_get_soup(f'https://race.netkeiba.com/race/shutuba.html?race_id={rid}',tries=2)
+            _,fresh,_=mobile_parse_shutuba(soup,rid,target_date)
+            fresh_map={(str(e['馬番']),str(e['馬ID'])):e for e in fresh}
+            for e in missing:
+                f=fresh_map.get((str(e['馬番']),str(e['馬ID'])))
+                if f and f.get('騎手'):
+                    e['騎手']=f['騎手'];updated_now+=1
+        except Exception as ex:
+            log.append(f'{rid} 出走表騎手取得不可: {type(ex).__name__}: {str(ex)[:85]}')
+    # 過去成績があるが騎手欠損の馬のみ、専用ページから過去走を再取得する。
+    need=[]
+    for hid,rows in past_by_horse.items():
+        if rows and any(not _jm_name(row.get('騎手')) for row in rows):
+            need.append(hid)
+    def fetch_one(hid):
+        try:
+            soup=mobile_get_soup(f'https://db.netkeiba.com/horse/result/{hid}/',tries=2)
+            fresh,_,_=mobile_horse_histories(soup,hid,target_date)
+            return hid,fresh,None
+        except Exception as ex:
+            return hid,[],f'{type(ex).__name__}: {str(ex)[:95]}'
+    with concurrent.futures.ThreadPoolExecutor(max_workers=3) as executor:
+        for hid,fresh,error in executor.map(fetch_one,need):
+            if error:
+                log.append(f'馬ID{hid}: {error}')
+                continue
+            old=past_by_horse.get(hid,[])
+            def run_key(r):
+                surface = unicodedata.normalize('NFKC',str(r.get('距離') or '')).replace('ダート','ダ')
+                surface = re.sub(r'\s+', '', surface)
+                return (r.get('日付'),surface)
+            fresh_key={run_key(r):r for r in fresh}
+            for row in old:
+                if _jm_name(row.get('騎手')):
+                    continue
+                corresponding=fresh_key.get(run_key(row))
+                if corresponding and _jm_name(corresponding.get('騎手')):
+                    row['騎手']=_jm_name(corresponding['騎手'])
+                    if not row.get('通過') and corresponding.get('通過'):
+                        row['通過']=corresponding['通過']
+                    updated_past+=1
+    mobile_rehydrate_jockey_from_saved(races,entries,histories)
+    pool=[h for race in races for h in (race.get('horses') or [])]
+    for race in races:
+        dirt_model(race['horses'],race.get('target_distance'),race.get('target_going'),race.get('race_date'),jockey_reference_horses=pool)
+    # 発走後の取得は実戦当時の根拠と見なさず、監査用に記録する。
+    stats={'今回騎手取得':sum(bool(e.get('騎手')) for e in entries),'出走馬':len(entries),
+           '過去走騎手取得':sum(bool(x.get('騎手')) for x in histories),'過去走':len(histories),
+           'タイプ判定可能な騎手':len(_jm_style_database(pool,target_date)),
+           '今回補完':updated_now,'過去走補完':updated_past,'更新日時JST':stamp,
+           '事後補完':datetime.datetime.now(TRIO_JST).date()>target_date}
+    return stats,log
 
 
 # 予想計算に使うデータは、常に「最新の直接取得」をDriveより優先する。
@@ -10729,8 +11143,7 @@ with st.sidebar.expander("📂 Excelファイルから読み込む（代替）")
 
 if st.session_state.get("drive_refresh_notice"):
     st.info(st.session_state.pop("drive_refresh_notice"))
-if st.session_state.get("mobile_restore_error"):
-    st.warning(st.session_state["mobile_restore_error"])
+# GitHub直接取得データの自動復元エラーは session_state に保存。画面通知は省略。
 if st.session_state.get("mobile_scraped_races"):
     saved_meta = st.session_state.get("mobile_scrape_meta", {})
     st.info(f"📌 予想の使用データ：直接取得 {saved_meta.get('date','日付不明')} "
@@ -10851,29 +11264,8 @@ def render_races(day, date):
 
                 st.caption("選考通過" if ev["metrics"] else "選考対象外：" + str(ev["reason"]))
 
-        # 3連複4頭BOXの4通りに、取得した人気とオッズを対応表示。
-        # 馬番未確定時は組合せを表示しない（出走表順を馬番と誤認しない）。
-        netkeiba_rid = trio_race_id(race)
-        snapshot = st.session_state.get("trio_market_snapshots", {}).get(netkeiba_rid) if netkeiba_rid else None
-        if race.get("horse_numbers_unverified"):
-            st.caption("3連複人気は馬番未確定のため表示しません。")
-        elif snapshot:
-            st.markdown("**📊 3連複・買い目ごとの人気とオッズ**")
-            st.caption(f"{snapshot.get('timing', '時刻不明')} / 取得 {snapshot.get('fetched_at', '')} JST / 人気が欠損した買い目は空欄です")
-            market_rows = []
-            for label, ev in evaluations.items():
-                four = [int(n) for n in ev["df"].head(4)["horse_no"]]
-                market_rows.extend(trio_ticket_rows(label, four, snapshot))
-            if market_rows:
-                st.dataframe(pd.DataFrame(market_rows), hide_index=True, use_container_width=True,
-                             column_config={"3連複オッズ": st.column_config.NumberColumn("3連複オッズ", format="%.1f")})
-                if any(row["取得状態"] != "取得" or pd.isna(row["3連複人気"]) for row in market_rows):
-                    st.warning("一部の組合せのオッズ・人気が未取得です。人気を推測で補完しません。")
-            else:
-                st.caption("4頭BOXの馬番が揃っていません。")
-        else:
-            st.caption("📱 3連複の人気・オッズは未取得です。画面上部の取得ボタンで更新できます。")
-
+        # 単勝・3連複の価格と市場人気は内部の候補選抜／購入判定にのみ使用。
+        # ユーザー指定によりオッズ一覧・3連複人気表は画面表示しない。
         with st.expander("両モデルの全馬指数・買い目"):
             for label, ev in evaluations.items():
                 df = ev["df"]
@@ -10883,20 +11275,19 @@ def render_races(day, date):
                     st.write("馬番未確認：買い目は表示しません。指数は参考値です。")
                 else:
                     st.markdown("3連複4点： " + green_combo_html(list(itertools.combinations(top, 3)), placed_set), unsafe_allow_html=True)
-                cols = [c for c in ["horse_no", "name", "odds", "pop_rank", "ai_score", "ai_score_before_yearclock", "ai_score_yearclock25_before", "distance_score", "going_score", "jockey", "jockey_score", "jockey_type", "jockey_scoring_method", "jockey_similarity", "jockey_evidence_runs", "evidence_coverage", "time_score", "time_score_before_yearclock", "year_clock_run_count", "year_clock_adv_sec1000_mean", "idx_rank"] if c in df.columns]
+                cols = [c for c in ["horse_no", "name", "ai_score", "ai_score_before_yearclock", "ai_score_yearclock25_before", "distance_score", "going_score", "jockey", "jockey_score", "jockey_score_applied", "jockey_type", "jockey_scoring_method", "jockey_similarity", "jockey_evidence_runs", "evidence_coverage", "time_score", "time_score_before_yearclock", "year_clock_run_count", "year_clock_adv_sec1000_mean", "idx_rank"] if c in df.columns]
                 display_df = df[cols].copy()
                 jp_col_map = {
                     "horse_no": "馬番",
                     "name": "馬名",
-                    "odds": "単勝オッズ",
-                    "pop_rank": "単勝人気",
                     "ai_score": "新AI指数",
                     "ai_score_before_yearclock": "旧AI指数",
                     "ai_score_yearclock25_before": "旧年次時計25%指数",
                     "distance_score": "距離適性",
                     "going_score": "馬場適性",
                     "jockey": "騎手",
-                    "jockey_score": "騎手相性",
+                    "jockey_score": "騎手相性（根拠あり）",
+                    "jockey_score_applied": "騎手指数反映値",
                     "jockey_type": "騎手タイプ",
                     "jockey_scoring_method": "騎手評価の根拠",
                     "jockey_similarity": "タイプ類似度",
@@ -10908,12 +11299,12 @@ def render_races(day, date):
                     "year_clock_adv_sec1000_mean": "平均時計差秒/1000m",
                     "idx_rank": "指数順位",
                 }
-                one_decimal_columns = [c for c in ["odds"] if c in display_df.columns]
+                one_decimal_columns = []
                 two_decimal_columns = [c for c in ["ai_score", "ai_score_before_yearclock", "ai_score_yearclock25_before", "distance_score",
-                                                   "going_score", "jockey_score", "jockey_similarity", "evidence_coverage",
+                                                   "going_score", "jockey_score", "jockey_score_applied", "jockey_similarity", "evidence_coverage",
                                                    "time_score", "time_score_before_yearclock"] if c in display_df.columns]
                 three_decimal_columns = [c for c in ["year_clock_adv_sec1000_mean"] if c in display_df.columns]
-                integer_columns = [c for c in ["horse_no", "pop_rank", "jockey_evidence_runs", "year_clock_run_count", "idx_rank"] if c in display_df.columns]
+                integer_columns = [c for c in ["horse_no", "jockey_evidence_runs", "year_clock_run_count", "idx_rank"] if c in display_df.columns]
 
                 def _fmt_num(v, digits):
                     if pd.isna(v):
@@ -10941,7 +11332,7 @@ def render_races(day, date):
                     display_df[c] = display_df[c].map(_fmt_int)
                 display_df = display_df.rename(columns=jp_col_map)
                 styled = green_placed_rows(display_df, placed_set, number_col='馬番')
-                st.caption("表の項目名は日本語表示です。単勝オッズは小数点1位まで表示。"
+                st.caption("表の項目名は日本語表示です。"
                            "新AIは年次補正走破タイム55%、距離適性15%、馬場適性10%、騎手相性20%で評価します。"
                            "上がり3F・着差の独立加点は廃止。騎手相性が不明な場合は中立50点、"
                            "旧年次時計25%指数は比較用に残しています。")
@@ -10951,6 +11342,7 @@ def render_races(day, date):
                         for _,hr in df.iterrows():
                             jockey_rows.append({"馬番":int(hr['horse_no']),"馬名":hr.get('name'),
                                 "今回騎手":hr.get('jockey'),"騎手評価":hr.get('jockey_score'),
+                                "指数への反映値":hr.get('jockey_score_applied'),
                                 "現在の騎手傾向":hr.get('jockey_type'),
                                 "比較できた騎乗数":hr.get('jockey_style_rides'),
                                 "好走時の騎手":hr.get('jockey_good_rider'),
@@ -11487,9 +11879,9 @@ def trio_store_snapshot_github(snapshots, diagnostics):
 # スマホからの日付指定→出走表→過去成績→3連複オッズ人気のワンタップ取得
 # 端末にはPython/Colab不要。処理はStreamlitサーバー側で実行される。
 # ============================================================
-st.subheader("📱 スマホで出走表・過去成績・単勝・3連複人気を取得")
+st.subheader("📱 出走表・過去成績を取得")
 st.caption(f"🔧 取得エンジン: {MOBILE_FETCH_BUILD} ｜ 11月8日のID直接補完：有効")
-st.caption("日付を選んで押すだけ。6〜12Rのダートだけ対象に直接取得します。単勝オッズは未発売時には空欄になります。")
+st.caption("日付を指定してダートレースの出走表・過去走を取得します。市場データは裏側で自動更新します。")
 default_mobile_date = datetime.datetime.now(TRIO_JST).date()
 if st.session_state.get("mobile_scrape_meta", {}).get("date"):
     try:
@@ -11500,7 +11892,7 @@ mobile_selected_date = st.date_input(
     "取得する開催日", value=default_mobile_date,
     key="mobile_target_date"
 )
-if st.button("📲 出走表＋過去成績＋単勝＋3連複人気を一括取得", key="mobile_fetch_all",
+if st.button("📲 出走表＋過去成績を一括取得", key="mobile_fetch_all",
              type="primary", use_container_width=True):
     st.session_state["win_market_message"] = ""
     st.session_state["mobile_fetch_message"] = ""
@@ -11511,6 +11903,12 @@ if st.button("📲 出走表＋過去成績＋単勝＋3連複人気を一括取
         with st.spinner("単勝オッズ・人気を取得中..."):
             wins, win_errors, win_diag = win_collect_for_loaded_races(races)
         win_apply_snapshots_to_races(wins, races, entries)
+        # 外部騎手サンプルは少数を自動補完。全員を対象にしたい場合は騎手補完画面から選択。
+        try:
+            with st.spinner('騎手の公開履歴を照合中...'):
+                jm_public_enrich(races,mobile_selected_date,max_riders=18)
+        except Exception as ext_exc:
+            st.session_state['jm_external_diagnostics']={'errors':[str(ext_exc)[:200]],'prior_ride_jockeys':0,'prior_rides':0}
         with st.spinner("3連複の組合せ別オッズ・人気を取得中..."):
             markets, errs, market_diag = trio_collect_for_loaded_races(races)
         st.session_state["mobile_scraped_races"] = races
@@ -11551,6 +11949,9 @@ if st.button("📲 出走表＋過去成績＋単勝＋3連複人気を一括取
             f"発走前履歴{len(histories)}件・単勝{meta['win_horses']}頭・3連複{meta['trio_combinations']}組。"
             f"新馬（履歴対象外）{meta.get('debut_horses', 0)}頭・"
             f"履歴取得失敗{meta.get('history_errors', 0)}頭。"
+            f" 騎手名{meta['jockey_now_present']}/{meta['jockey_now_total']}頭、"
+            f"過去走騎手{meta['jockey_past_present']}/{meta['jockey_past_total']}走、"
+            f"タイプ判定可能{meta['jockey_style_types']}騎手。"
         )
         st.rerun()
     except Exception as exc:
@@ -11561,6 +11962,122 @@ if st.button("📲 出走表＋過去成績＋単勝＋3連複人気を一括取
 if st.session_state.get("mobile_persist_status"):
     message = st.session_state["mobile_persist_status"]
     (st.warning if message.startswith("⚠️") else st.success)(message)
+
+with st.expander("🏇 競馬ラボ・ウマピア｜騎手公開データ補完", expanded=False):
+    st.caption("騎手別の過去騎乗・4角位置取りはウマピアから照合。競馬ラボは総合成績の確認用です。"
+               "どちらもサイト側の制限で取得できない場合があり、その際は既存の履歴だけで評価します。")
+    public_races=st.session_state.get('mobile_scraped_races') or []
+    if public_races:
+        available_races={str(r.get('netkeiba_race_id')):r for r in public_races if r.get('netkeiba_race_id')}
+        public_rid=st.selectbox('騎手情報を補完するレース',list(available_races),
+             format_func=lambda rid:f"{available_races[rid].get('course','')} {available_races[rid].get('race_no','')}R {available_races[rid].get('race_name','')}",
+             key='public_jockey_selected_race') if available_races else None
+        if st.button('このレースの騎手情報を両サイトから取得・再分析',key='public_jockey_fetch',
+                     disabled=not public_rid,use_container_width=True):
+            target_date=available_races[public_rid].get('race_date')
+            try:
+                with st.spinner('騎手別の過去騎乗履歴を照合中...'):
+                    jm_public_enrich(public_races,target_date,selected_rid=public_rid,max_riders=30)
+                    try:
+                        mobile_save_github()
+                    except Exception as save_exc:
+                        st.session_state.setdefault('jm_external_diagnostics',{}).setdefault('errors',[]).append(
+                            '騎手履歴のGitHub保存未完了: '+str(save_exc)[:160])
+                # 保存済みの4頭買い目は更新しない。未固定の予測画面のみ新しい評価を反映。
+                st.rerun()
+            except Exception as exc:
+                st.error('外部騎手情報の取得に失敗: '+str(exc)[:200])
+        report=st.session_state.get('jm_external_diagnostics') or {}
+        if report:
+            st.write(f"外部履歴：**{report.get('prior_ride_jockeys',0)}騎手・{report.get('prior_rides',0)}騎乗** ｜ "
+                     f"競馬ラボ照合：**{report.get('keibalab_stats_count',0)}騎手**")
+            st.caption(report.get('source_note',''))
+            profiles=st.session_state.get('jm_external_profiles',{}).get(report.get('date',''),{})
+            raw_stats=st.session_state.get('jm_external_stats',{})
+            target_date=datetime.date.fromisoformat(report['date']) if report.get('date') else None
+            if profiles and target_date:
+                # 公開履歴の利用件数・ソースを騎手別に監査可能にする。
+                matching=_jm_style_database([],target_date)
+                rows=[]
+                for rider,pr in sorted(profiles.items()):
+                    good=[r for r in pr.get('rides',[]) if _jm_before(r,target_date)]
+                    stats=raw_stats.get(rider,{})
+                    typ=matching.get(rider,{})
+                    rows.append({'騎手名':rider,'ウマピア過去騎乗':len(good),
+                                 '4角位置によるタイプ':typ.get('type') or '根拠不足',
+                                 '競馬ラボ騎乗回数':stats.get('騎乗数'),
+                                 '競馬ラボ複勝率(%)':stats.get('複勝率'),
+                                 '騎手分析の根拠':'ウマピア騎乗履歴' if good else 'なし'})
+                st.dataframe(pd.DataFrame(rows),hide_index=True,use_container_width=True,
+                    column_config={'競馬ラボ複勝率(%)':st.column_config.NumberColumn('競馬ラボ複勝率(%)',format='%.1f')})
+            if report.get('errors'):
+                with st.expander('取得できなかった理由'):
+                    for line in report['errors'][:25]:st.write(line)
+    else:
+        st.caption('先に出走表と過去成績を取得してください。')
+
+with st.expander("🏇 騎手取得・分析の診断／不足分の再取得", expanded=True):
+    saved_races=st.session_state.get('mobile_scraped_races') or []
+    entries=st.session_state.get('mobile_entries') or []
+    histories=st.session_state.get('mobile_histories') or []
+    if not saved_races:
+        st.info('騎手の自動取得と乗り替わり判定には、上のスマホ直接取得で出走表・過去走を取得してください。Google DriveのExcelに騎手列がなければ補完できません。')
+    else:
+        current=sum(bool(_jm_name(r.get('騎手'))) for r in entries)
+        past=sum(bool(_jm_name(r.get('騎手'))) for r in histories)
+        passage=sum(bool(_jm_name(r.get('騎手'))) and bool(r.get('通過')) for r in histories)
+        all_horses=[h for race in saved_races for h in race.get('horses',[])]
+        target_date=saved_races[0].get('race_date')
+        if isinstance(target_date,str):
+            try:target_date=datetime.date.fromisoformat(target_date)
+            except ValueError:target_date=None
+        style_db=_jm_style_database(all_horses,target_date)
+        st.write(f'今回の騎手名：**{current} / {len(entries)}頭** ｜ 過去走の騎手名：**{past} / {len(histories)}走** ｜ '
+                 f'騎手名と4角位置が揃った過去走：**{passage}走** ｜ タイプ判定可能：**{len(style_db)}騎手**')
+        if current<len(entries) or past<len(histories):
+            st.warning('騎手データが不足しています。現在の新AIでは評価不能な騎手を中立50点として扱っています。')
+        else:
+            st.success('取得した出走馬と過去走には騎手名があります。ただし各騎手のタイプを評価できるかは騎乗件数によります。')
+        examples=[]
+        for race in saved_races:
+            for h in race.get('horses',[]):
+                examples.append({'レース':race.get('race_name'),'馬番':h.get('horse_no'),'馬名':h.get('name'),
+                                 '今回騎手':h.get('jockey') or '未取得',
+                                 '過去走騎手が分かる走数':sum(bool(_jm_name(x.get('jockey'))) for x in _jm_histories(h)),
+                                 '今回騎手のタイプ':style_db.get(_jm_name(h.get('jockey')),{}).get('type','判定保留')})
+        if examples:
+            st.dataframe(pd.DataFrame(examples),hide_index=True,use_container_width=True)
+        st.caption('騎手タイプは「4角位置の傾向」に限る参考評価です。騎手の総合技量とは異なります。'
+                   '騎手情報だけを後日補完した過去レースは、発走前の独立検証データには扱いません。')
+        if st.button('🔄 騎手名の欠損だけ再取得して解析（オッズ・固定4頭は保持）',key='jockey_refresh_only'):
+            if not isinstance(target_date,datetime.date):
+                st.error('開催日を確定できません。更新を停止しました。')
+            else:
+                try:
+                    with st.spinner('騎手名の欠損を出走表・過去成績から補完しています…'):
+                        stats,errors=mobile_refresh_jockey_data(saved_races,entries,histories,target_date)
+                    meta=st.session_state.get('mobile_scrape_meta') or {}
+                    meta.update(jockey_refresh_stats=stats,jockey_refresh_at=stats['更新日時JST'])
+                    meta['fetched_at']=stats['更新日時JST']
+                    st.session_state['mobile_scrape_meta']=meta
+                    if errors:
+                        st.session_state['jockey_refresh_log']=errors
+                    try:
+                        mobile_save_github()
+                        st.session_state['jockey_refresh_saved']='騎手補完情報をGitHubに保存しました。'
+                    except Exception as ex:
+                        st.session_state['jockey_refresh_saved']='騎手補完は画面内に保持。GitHub保存失敗: '+str(ex)
+                    st.session_state['jockey_refresh_stats']=stats
+                    st.rerun()
+                except Exception as ex:
+                    st.error(f'騎手再取得に失敗しました: {type(ex).__name__}: {ex}')
+        if st.session_state.get('jockey_refresh_stats'):
+            st.info(f'前回の騎手再取得結果：{st.session_state["jockey_refresh_stats"]}')
+        if st.session_state.get('jockey_refresh_saved'):
+            st.caption(st.session_state['jockey_refresh_saved'])
+        for warning in (st.session_state.get('jockey_refresh_log') or [])[:8]:
+            st.warning(warning)
+
 
 with st.expander("📥 手元に保存した完全データJSONから復元"):
     backup_upload = st.file_uploader("予想復元データ.json を選択", type=["json"], key="mobile_upload_backup")
@@ -11741,86 +12258,8 @@ if st.session_state.get("market_refresh_message"):
     renderer = st.success if st.session_state.get("market_refresh_success") else st.warning
     renderer(st.session_state["market_refresh_message"])
 
-st.subheader("🏇 単勝オッズ・人気")
-st.caption("単勝オッズはnetkeiba APIから馬番で照合。未発売・取得不可なら推測しません。"
-           "取得・更新は上の単勝＋3連複一括ボタンで行います。")
-win_snaps = st.session_state.get("win_market_snapshots", {})
-if win_snaps:
-    win_frame = win_allmarket_csv(win_snaps)
-    st.caption(f"APIで単勝を取得済み：{len(win_snaps)}レース・{len(win_frame)}頭。オッズは取得時点の値です。")
-    st.download_button("📥 単勝オッズ・人気CSVを保存", data=win_frame.to_csv(index=False).encode("utf-8-sig"),
-                       file_name="JRA_単勝オッズ人気_取得結果.csv", mime="text/csv",
-                       key="win_odds_csv", use_container_width=True)
-with st.expander("単勝オッズ一覧（未取得馬を含む）"):
-    visible = []
-    visible_races = st.session_state.get("mobile_scraped_races") or all_loaded_races
-    for r in visible_races:
-        if not r.get("is_dirt_race"):
-            continue
-        rid = trio_race_id(r)
-        snapshot = win_snaps.get(rid, {})
-        market = snapshot.get("market", {})
-        for horse in r.get("horses", []):
-            rec = market.get(int(horse["horse_no"])) if rid else None
-            visible.append({"レース": r.get("race_name", ""), "馬番": horse["horse_no"],
-                            "馬名": horse.get("name", ""),
-                            "単勝オッズ": rec.get("odds") if rec else horse.get("odds"),
-                            "単勝人気": rec.get("popularity") if rec else horse.get("pop_rank"),
-                            "取得元": "単勝API" if rec else ("出走表" if horse.get("odds") is not None else "未取得")})
-    if visible:
-        st.dataframe(pd.DataFrame(visible), hide_index=True, use_container_width=True,
-                     column_config={"単勝オッズ": st.column_config.NumberColumn("単勝オッズ", format="%.1f")})
-    else:
-        st.info("現在表示中の出走表にダート出走馬がありません。")
-if st.session_state.get("win_market_diagnostics"):
-    with st.expander("単勝APIの取得診断"):
-        st.dataframe(pd.DataFrame(st.session_state["win_market_diagnostics"]),
-                     hide_index=True, use_container_width=True)
-if st.session_state.get("win_market_errors"):
-    with st.expander(f"単勝未取得レース・理由（{len(st.session_state['win_market_errors'])}件）"):
-        for message in st.session_state["win_market_errors"]:
-            st.write(message)
-
-st.divider()
-st.subheader("📊 3連複オッズ・人気")
-st.caption("単勝と同じ一括更新ボタンで取得した3連複の組合せ別オッズ・人気です。")
-
-if st.session_state.get("trio_market_github_save"):
-    message = st.session_state["trio_market_github_save"]
-    if message.startswith("取得日時付き"):
-        st.success(message)
-    else:
-        st.warning(message + "。以下のZIP保存をご利用ください。")
-
-trio_snapshots = st.session_state["trio_market_snapshots"]
-if trio_snapshots:
-    st.caption(" / ".join(f"{v['race_name']}: {trio_market_summary(v['market'])}" for v in list(trio_snapshots.values())[:8]))
-    for v in trio_snapshots.values():
-        if v.get("timing") != "発走前取得":
-            st.warning("発走時刻以降に取得した市場データが含まれます。過去の予想・バックテストに混ぜないでください。")
-            break
-    market_csv = trio_allmarket_csv(trio_snapshots)
-    st.download_button("📥 取得した3連複オッズ・人気をCSV保存", data=market_csv.to_csv(index=False).encode("utf-8-sig"),
-                       file_name="JRA_3連複オッズ人気_取得結果.csv", mime="text/csv", key="trio_market_download", use_container_width=True)
-# スマホから取得失敗もCSVに保存できるようにする（成功・失敗両方のログ）。
-if st.session_state["trio_market_diagnostics"]:
-    diag_df = pd.DataFrame(st.session_state["trio_market_diagnostics"])
-    st.download_button("📥 3連複取得診断・失敗理由CSV", data=diag_df.to_csv(index=False).encode("utf-8-sig"),
-                       file_name="JRA_3連複人気_取得診断.csv", mime="text/csv", key="trio_diagnostic_download", use_container_width=True)
-    bundle = io.BytesIO()
-    with zipfile.ZipFile(bundle, "w", zipfile.ZIP_DEFLATED) as zf:
-        zf.writestr("3連複オッズ人気.csv", trio_allmarket_csv(st.session_state["trio_market_snapshots"]).to_csv(index=False).encode("utf-8-sig"))
-        zf.writestr("単勝オッズ人気.csv", win_allmarket_csv(st.session_state.get("win_market_snapshots", {})).to_csv(index=False).encode("utf-8-sig"))
-        zf.writestr("取得診断.csv", diag_df.to_csv(index=False).encode("utf-8-sig"))
-        zf.writestr("単勝取得診断.csv", pd.DataFrame(st.session_state.get("win_market_diagnostics", [])).to_csv(index=False).encode("utf-8-sig"))
-    st.download_button("📦 単勝＋3連複の取得結果・診断をZIP保存", data=bundle.getvalue(),
-                       file_name="JRA_単勝3連複取得結果_診断一式.zip", mime="application/zip", key="trio_bundle_download", use_container_width=True)
-
-if st.session_state["trio_market_errors"]:
-    with st.expander(f"取得できなかったレース・理由（{len(st.session_state['trio_market_errors'])}件）"):
-        for err in st.session_state["trio_market_errors"]:
-            st.write(err)
-st.caption("人気順位とオッズだけで回収率100%を保証することはできません。指数候補は購入確定ではなく、購入しない判断も可能です。")
+# 専用の単勝・3連複オッズ／人気一覧・ダウンロード表示は非表示。
+# 取得・馬番照合・候補絞り込み・購入判定・内部履歴保存はこれまで通り継続。
 
 # ====================================================================
 # 統合追加: 3連複4頭BOX 発走前購入/見送り研究 (v1.0)
@@ -12105,16 +12544,7 @@ def bs_eval_history():
 def bs_show_ui():
     st.divider()
     st.subheader("🎯 3連複4頭BOX｜購入・見送り研究（統合版）")
-    st.caption("同じ4頭を固定し、発走前の3連複4組のオッズから低配当除外を検証。"
-               "推奨レース数は0件で正常。現段階の『購入候補』は未実証の研究ラベルであり、利益を保証しません。")
-    st.info("新AIの配分は年次補正タイム55%・距離15%・馬場10%・騎手相性20%。"
-            "乗り替わりのタイプ類似は過去の騎乗4角位置の実績が揃う場合だけ算出。"
-            "データ不足なら中立扱いとし、根拠充足率を表示します。"
-            "人気1～7位から4頭を固定し、旧版の購入・見送り記録とモデル版を区別します。")
-    st.warning("年次補正タイム指数も、4頭BOXの組み合わせ確率も、購入優位性が未実証です。"
-               "13倍未満の除外基準はあくまで研究用で、利益を保証しません。")
-    st.caption("固定の暫定ルール：4組の3連複オッズがすべて13.0倍以上なら研究候補、"
-               "1組でも13.0倍未満なら低配当として見送り。閾値は過去データ最適化で得たものではありません。")
+    # 注意文の重複表示は省略。取得時点・時刻検証はバックエンドで必須。
     active = [r for r in (st.session_state.get("mobile_scraped_races") or all_loaded_races)
               if r.get("is_dirt_race") and trio_race_id(r)]
     active.sort(key=lambda r: (str(r.get("race_date")), str(r.get("course")), int(r.get("race_no") or 0)))
@@ -12132,9 +12562,9 @@ def bs_show_ui():
     if initial_lock:
         st.info("固定済みの4頭：" + "・".join(map(str, initial_lock["selected4"])) +
                 "（人気・オッズが変化しても4頭の再選択はしません）")
-    if st.button("📌 このレースの単勝＋3連複を再取得 → 4頭固定・購入/見送り記録", key="bs_capture_button", type="primary", use_container_width=True):
+    if st.button("📌 このレースを再判定・4頭固定・保存", key="bs_capture_button", type="primary", use_container_width=True):
         try:
-            with st.spinner("該当レースの市場オッズを最新取得し、馬番と時刻を照合中..."):
+            with st.spinner("レース情報の取得時刻と購入判定を確認中..."):
                 record, messages = bs_record_capture(race)
             st.success("判定記録：" + record["decision"])
             for msg in messages:
@@ -12145,14 +12575,8 @@ def bs_show_ui():
     if history:
         latest = sorted(history, key=lambda r: r["captured_at_jst"])[-1]
         st.markdown("**最新記録：" + latest["decision"] + "**")
-        st.write(latest["reason"])
         st.caption("取得 " + latest["captured_at_jst"] + " / " + latest["timing_note"])
-        lines = [{"3連複4点": k, "取得時オッズ": v, "100円あたり参考払戻": round(float(v)*100)}
-                 for k, v in latest["trio_odds4"].items()]
-        st.dataframe(pd.DataFrame(lines), hide_index=True, use_container_width=True,
-                     column_config={"取得時オッズ": st.column_config.NumberColumn("取得時オッズ", format="%.1f")})
-        st.caption(f"4頭BOX投資額400円 / 4組中最低オッズ{min(latest['trio_odds4'].values()):.1f}倍。"
-                   "市場価格は変動するため実際の払戻は結果登録時に確定します。")
+        # 3連複4組オッズは履歴JSONに保存。画面には表示しない。
         st.download_button("📥 このレースの最新判定JSON", data=json.dumps(latest, ensure_ascii=False, indent=2),
                            file_name=f"{chosen_rid}_buy_skip_snapshot.json", mime="application/json", key="bs_one_export")
     col1, col2 = st.columns(2)
