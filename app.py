@@ -8938,7 +8938,7 @@ LEGACY_NEW_WEIGHTS = {"time": .25, "last3f": .20, "margin": .20,
 # 新AI: 年次補正時計55%、距離15%、馬場10%、騎手相性20%。
 # 上がり3F・着差は独立した加点を廃止。時計と重複させない。
 NEW_WEIGHTS = {"time": .55, "distance": .15, "going": .10, "jockey": .20}
-NEW_AI_VERSION = "YEARCLOCK55_DISTANCE15_GOING10_JOCKEY20_MIN4_CLOCK_20261112v3"
+NEW_AI_VERSION = "YEARCLOCK55_DISTANCE15_GOING10_JOCKEY20_HORSE_STYLE_UMAPIA_AUTO_20261113v1"
 
 def dirt_model_before_yearclock(horses, target_distance=None, target_going=None):
     runs_all = [r for h in horses for r in h.get("dirt_histories", [])]
@@ -9079,54 +9079,99 @@ def _jm_style_database(horses,target_date,reference_horses=None):
     return result
 
 
+def _jm_horse_running_style(horse, target_date):
+    """過去ダート走の4角位置から、馬自身の脚質を開催前履歴だけで推定。
+
+    騎手名の有無は一切問わない。1走のみならタイプ確定せず中立扱い。
+    位置取りは頭数補正し、馬が頭数で位置を変える影響を小さくする。
+    """
+    positions=[]
+    seen=set()
+    for run in _jm_histories(horse):
+        if not _jm_before(run,target_date):
+            continue
+        field=run.get('field')
+        corner=run.get('corner_pos')
+        if not isinstance(field,(int,float)) or not isinstance(corner,(int,float)):
+            continue
+        if field<3 or not 1<=corner<=field:
+            continue
+        identity=(str(run.get('date')),str(run.get('race_id') or ''),
+                  str(run.get('course') or ''),str(run.get('distance') or ''))
+        if identity in seen:
+            continue
+        seen.add(identity)
+        positions.append((float(corner)-1.0)/(float(field)-1.0))
+    n=len(positions)
+    if n<2:
+        return {'position':None,'type':None,'runs':n,'std':None}
+    mean=float(np.mean(positions))
+    std=float(np.std(positions))
+    typ='先行傾向' if mean<.38 else ('中団傾向' if mean<.67 else '後方傾向')
+    return {'position':mean,'type':typ,'runs':n,'std':std}
+
+
 def _jm_jockey_score(horse,target_date,style_db):
-    """同騎手の実績を優先し、乗り替わりは『過去好走騎手との統計的な位置傾向』だけ比較。
-    判定不可ならNone。推測で有名騎手のタイプ等を割り当てない。
+    """過去の同一騎手実績を維持し、乗り替わりは馬自身の脚質×今回騎手の脚質で採点。
+
+    外部騎手履歴が揃えば好走時の過去騎手名が無くても評価できる。
+    この類似度は検証前の研究指標であり、騎手の腕前・勝率ではない。
     """
     now=_jm_name(horse.get('jockey'))
-    details={'jockey_now':now or None,'jockey_type':style_db.get(now,{}).get('type'),
-             'jockey_style_rides':style_db.get(now,{}).get('rides',0),
-             'jockey_similarity':None,'jockey_scoring_method':'騎手名未取得',
-             'jockey_good_rider':None,'jockey_evidence_runs':0}
-    if not now:return None,details
-    runs=[r for r in _jm_histories(horse) if _jm_before(r,target_date)]
-    if not any(_jm_name(r.get('jockey')) for r in runs):
-        details['jockey_scoring_method']='過去走の騎手名が未取得（タイプ比較不可）'
+    rider_info=style_db.get(now,{}) if now else {}
+    own=_jm_horse_running_style(horse,target_date)
+    details={
+        'jockey_now':now or None,
+        'jockey_type':rider_info.get('type'),
+        'jockey_style_rides':rider_info.get('rides',0),
+        'jockey_style_source':rider_info.get('source','出走馬の過去走') if rider_info else None,
+        'horse_running_style':own.get('type'),
+        'horse_style_position':round(own['position'],3) if own['position'] is not None else None,
+        'horse_style_runs':own['runs'],
+        'horse_style_std':round(own['std'],3) if own['std'] is not None else None,
+        'jockey_similarity':None,
+        'jockey_scoring_method':'騎手名未取得',
+        'jockey_good_rider':None,
+        'jockey_evidence_runs':0,
+    }
+    if not now:
         return None,details
+    runs=[r for r in _jm_histories(horse) if _jm_before(r,target_date)]
     same=[]
     for r in runs:
-        if _jm_name(r.get('jockey'))!=now:continue
+        if _jm_name(r.get('jockey'))!=now:
+            continue
         rank=r.get('rank'); field=r.get('field')
         if isinstance(rank,(int,float)) and isinstance(field,(int,float)) and field>1 and 1<=rank<=field:
             same.append(float(100*(field-rank)/(field-1)))
     if same:
-        # 事例1走だけの極端な高評価を抑えるため、50点3走の事前値に縮約。
+        # 従来どおり同騎手との実績を優先。サンプル3走の中立事前値で縮約。
         score=(150+sum(same))/(3+len(same))
-        details.update(jockey_scoring_method='今回騎手との過去ダート実績',jockey_evidence_runs=len(same),
+        details.update(jockey_scoring_method='今回騎手との過去ダート実績',
+                       jockey_evidence_runs=len(same),
                        jockey_good_rider=now if any(v>=75 for v in same) else None)
         return round(float(np.clip(score,0,100)),2),details
-    # 乗り替わり：過去の好走で騎乗した騎手の統計的な脚質傾向と比較。
-    if now not in style_db:
-        details['jockey_scoring_method']='乗り替わり・新騎手の4角傾向データ不足'
+
+    # 乗り替わりの評価。『好走時の騎手の名前と履歴』は条件にしない。
+    if not rider_info:
+        details['jockey_scoring_method']='乗り替わり・今回騎手の騎乗傾向データ不足'
         return None,details
-    good=[]
-    for r in runs:
-        rank=r.get('rank');past=_jm_name(r.get('jockey'))
-        if not past or not isinstance(rank,(int,float)) or rank>3 or rank<1 or past==now:continue
-        if past not in style_db:continue
-        good.append((past,style_db[past]['position'],max(1,4-int(rank))))
-    if not good:
-        details['jockey_scoring_method']='乗り替わり・好走時騎手の比較データ不足'
+    if own['position'] is None:
+        details['jockey_scoring_method']='乗り替わり・馬の過去4角位置が2走未満'
         return None,details
-    target_pos=style_db[now]['position']
-    similarities=[max(0.,1.-abs(target_pos-pos)/.55) for _,pos,_ in good]
-    weights=[w for _,_,w in good]
-    similarity=float(np.average(similarities,weights=weights))
-    score=50+60*(similarity-.5)  # 20〜80点・タイプ近似度が高いほど加点
-    details.update(jockey_scoring_method='乗り替わり・好走騎手との4角傾向類似',
-                   jockey_similarity=round(similarity,3),jockey_evidence_runs=len(good),
-                   jockey_good_rider=','.join(dict.fromkeys(p for p,_,_ in good)))
-    return round(float(np.clip(score,0,100)),2),details
+    rider_pos=rider_info['position']
+    horse_pos=own['position']
+    similarity=max(0.,1.-abs(rider_pos-horse_pos)/.55)
+    # 少標本のタイプ一致に過大加点しない。標本が十分なときも20～80の範囲。
+    horse_reliability=own['runs']/(own['runs']+2.0)
+    rider_reliability=rider_info['rides']/(rider_info['rides']+5.0)
+    consistency=max(.6, 1.0-own['std'])
+    shrink=horse_reliability*rider_reliability*consistency
+    score=50.+60.*(similarity-.5)*shrink
+    details.update(jockey_scoring_method='乗り替わり・馬の4角位置×今回騎手の騎乗傾向',
+                   jockey_similarity=round(similarity,3),
+                   jockey_evidence_runs=own['runs'])
+    return round(float(np.clip(score,20.,80.)),2),details
 
 
 def dirt_model(horses, target_distance=None, target_going=None, target_date=None, jockey_reference_horses=None):
@@ -9508,7 +9553,7 @@ def mobile_get_soup(url, session=None, tries=3):
 # ※騎手タイプは4角位置からの傾向であり手腕や因果効果ではない。
 # ====================================================================
 JM_PUBLIC_VERSION = "umapia-rides-keibalab-optional-20261111-v1"
-JM_PUBLIC_MAX_RIDERS = 24
+JM_PUBLIC_MAX_RIDERS = 160   # 当日の現役騎手を最優先。従来の18人制限を廃止。
 
 
 def jm_public_umapia_index(soup):
@@ -9632,24 +9677,29 @@ def jm_public_enrich(races, target_date, selected_rid=None, max_riders=JM_PUBLIC
     if not isinstance(target_date,datetime.date):
         raise ValueError('開催日が不明なので外部騎手成績の時点を確定できません')
     active=[r for r in (races or []) if not selected_rid or str(r.get('netkeiba_race_id'))==str(selected_rid)]
+    # 乗り替わり判定は「馬自身の4角位置×今回騎手の傾向」に統一したため、
+    # 過去の好走時騎手を大量取得する必要はなくなった。外部サイトへの負荷も削減。
     requested=[]
     for race in active:
         for h in race.get('horses') or []:
             nm=_jm_name(h.get('jockey'))
             if nm and nm not in requested:
                 requested.append(nm)
-            # 好走時の騎手とのタイプ比較にも必要。現在の騎手を優先して後ろへ追加。
+    old=st.session_state.get('jm_external_profiles',{}).get(target_date.isoformat(),{})
+    # 今回騎乗する騎手の履歴だけを一括取得。過去好走騎手の外部取得は不要。
+    current_names=[]
     for race in active:
         for h in race.get('horses') or []:
-            for hist in _jm_histories(h):
-                if not _jm_before(hist,target_date) or not (isinstance(hist.get('rank'),(int,float)) and 1<=hist['rank']<=3):
-                    continue
-                nm=_jm_name(hist.get('jockey'))
-                if nm and nm not in requested:
-                    requested.append(nm)
-    old=st.session_state.get('jm_external_profiles',{}).get(target_date.isoformat(),{})
-    requested=[nm for nm in requested if nm not in old][:max(1,int(max_riders))]
+            nm=_jm_name(h.get('jockey'))
+            if nm and nm not in current_names:
+                current_names.append(nm)
+    requested=list(dict.fromkeys(current_names+requested))
+    missing=[nm for nm in requested if nm not in old]
+    limit=max(len(current_names), int(max_riders)) if max_riders is not None else len(missing)
+    requested=missing[:max(1,limit)]
     errors=[]
+    if len(missing)>len(requested):
+        errors.append(f'当日騎乗する騎手{len(missing)-len(requested)}名は取得上限で未取得')
     try:
         index=jm_public_index_cached(target_date.year)
     except Exception as exc:
@@ -9671,7 +9721,7 @@ def jm_public_enrich(races, target_date, selected_rid=None, max_riders=JM_PUBLIC
             return nm,jm_public_rides_cached(rid,nm),None
         except Exception as exc:
             return nm,[],str(exc)[:140]
-    with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
+    with concurrent.futures.ThreadPoolExecutor(max_workers=6) as pool:
         for nm,rides,err in pool.map(retrieve,available):
             if err:
                 errors.append(nm+': '+err)
@@ -9685,15 +9735,29 @@ def jm_public_enrich(races, target_date, selected_rid=None, max_riders=JM_PUBLIC
     st.session_state.setdefault('jm_external_stats',{}).update({nm:leading[nm] for nm in requested if nm in leading})
     st.session_state['jm_external_diagnostics']={
        'date':target_date.isoformat(),'requested':len(requested),'matched_index':len(available),
+       'current_jockeys':len(current_names),
+       'current_jockeys_with_rides':sum(nm in profiles for nm in current_names),
        'prior_ride_jockeys':len(profiles),'prior_rides':sum(len(p['rides']) for p in profiles.values()),
        'keibalab_stats_count':len(st.session_state['jm_external_stats']), 'errors':errors,
        'source_note':'ウマピア騎乗履歴は芝ダ混合。競馬ラボの当年累計成績は診断専用で指数加点なし'}
     pool_horses=[h for r in races for h in (r.get('horses') or [])]
+    scored=0;horse_style_scored=0; neutral=0
     for race in races:
         if race.get('horses') and race.get('race_date')==target_date:
             dirt_model(race['horses'],race.get('target_distance'),race.get('target_going'),target_date,
                        jockey_reference_horses=pool_horses)
-    return st.session_state['jm_external_diagnostics']
+            for h in race['horses']:
+                if h.get('jockey_score') is None:
+                    neutral+=1
+                else:
+                    scored+=1
+                if '馬の4角位置×今回騎手' in str(h.get('jockey_scoring_method') or ''):
+                    horse_style_scored+=1
+    report=st.session_state['jm_external_diagnostics']
+    report.update({'scored_horses':scored,'neutral_horses':neutral,
+                   'horse_jockey_style_scored':horse_style_scored,
+                   'new_ai_version':NEW_AI_VERSION})
+    return report
 
 
 def mobile_race_list(soup, target_date, min_race=6, max_race=12):
@@ -10362,6 +10426,28 @@ def mobile_export_zip(entries, histories, diagnostics, trio_snaps, meta, win_sna
             f"{prefix}_単勝オッズ人気.csv":win_allmarket_csv(win_snaps or {}),
             f"{prefix}_単勝取得診断.csv":pd.DataFrame(win_diagnostics or []),
         }
+        # 騎手データも同じ一括ダウンロードに含める。成績表と指数反映値を別表で監査可能にする。
+        all_horses=[(race,h) for race in (st.session_state.get('mobile_scraped_races') or [])
+                    for h in (race.get('horses') or [])]
+        if all_horses:
+            horse_audit=[]
+            for race,h in all_horses:
+                horse_audit.append({'開催日':str(race.get('race_date') or ''),
+                    'レース':race.get('race_name'),'馬番':h.get('horse_no'),'馬名':h.get('name'),
+                    '今回騎手':h.get('jockey'),'馬の脚質':h.get('horse_running_style'),
+                    '馬の根拠走数':h.get('horse_style_runs'),
+                    '騎手タイプ':h.get('jockey_type'),'騎手データ元':h.get('jockey_style_source'),
+                    '騎手騎乗根拠数':h.get('jockey_style_rides'),
+                    '相性評価点':h.get('jockey_score'),
+                    '指数に使用した騎手点':h.get('jockey_score_applied'),
+                    '評価理由':h.get('jockey_scoring_method'),
+                    '新AIモデルバージョン':h.get('new_ai_model_version')})
+            archive.writestr(f"{prefix}_騎手相性と新AI指数の反映.csv",
+                             pd.DataFrame(horse_audit).to_csv(index=False).encode('utf-8-sig'))
+        public=st.session_state.get('jm_external_diagnostics') or {}
+        if public:
+            archive.writestr(f"{prefix}_ウマピア騎手取得診断.json",
+                             json.dumps(public,ensure_ascii=False,indent=2,default=str).encode('utf-8'))
         for filename, frame in datasets.items():
             archive.writestr(filename, frame.to_csv(index=False).encode("utf-8-sig"))
         archive.writestr(f"{prefix}_取得情報.json", json.dumps(meta, ensure_ascii=False, indent=2).encode("utf-8"))
@@ -10416,7 +10502,7 @@ def calculate_ai_indices(horses_data):
 
 
 # --- GitHub Private repository persistence ---
-APP_VERSION = "dual-model-4.9-yearclock-fallback-20261112"
+APP_VERSION = "dual-model-5.0-umapia-horse-rider-auto-20261113"
 
 def score_old_model(horses):
     data = []
@@ -11400,14 +11486,17 @@ def render_races(day, date):
                                 "今回騎手":hr.get('jockey'),"騎手評価":hr.get('jockey_score'),
                                 "指数への反映値":hr.get('jockey_score_applied'),
                                 "現在の騎手傾向":hr.get('jockey_type'),
+                                "馬の過去位置取り傾向":hr.get('horse_running_style'),
+                                "馬の4角根拠走数":hr.get('horse_style_runs'),
+                                "騎手データ元":hr.get('jockey_style_source'),
                                 "比較できた騎乗数":hr.get('jockey_style_rides'),
                                 "好走時の騎手":hr.get('jockey_good_rider'),
                                 "タイプ類似度":hr.get('jockey_similarity'),
                                 "評価に使った実例":hr.get('jockey_evidence_runs'),
                                 "根拠・不足理由":hr.get('jockey_scoring_method')})
                         st.dataframe(pd.DataFrame(jockey_rows),hide_index=True,use_container_width=True)
-                        st.caption("騎手タイプは過去走で確認できた4角位置を頭数で正規化して推定。騎手別5騎乗・異なる馬3頭以上が必要。"
-                                   "不足時はタイプを作らず、20%枠に中立50点を仮置きします。")
+                        st.caption("馬の脚質は過去ダート走2走以上の4角位置で推定します。乗り替わり時は今回騎手の騎乗傾向（ウマピア優先）と直接照合。"
+                                   "騎手タイプの根拠は5騎乗・3頭以上、標本不足は中立50点。相性の効果は未検証です。")
                     with st.expander("⏱️ 年次補正時計の根拠（各馬の過去走）"):
                         evidence_rows = []
                         for _,hr in df.iterrows():
@@ -11941,7 +12030,7 @@ def trio_store_snapshot_github(snapshots, diagnostics):
 # ============================================================
 st.subheader("📱 出走表・過去成績を取得")
 st.caption(f"🔧 取得エンジン: {MOBILE_FETCH_BUILD} ｜ 11月8日のID直接補完：有効")
-st.caption("日付を指定してダートレースの出走表・過去走を取得します。市場データは裏側で自動更新します。")
+st.caption("日付指定で出走表・過去走・ウマピアの当日騎手履歴・市場データをまとめて取得し、騎手相性20％まで自動再計算します。")
 default_mobile_date = datetime.datetime.now(TRIO_JST).date()
 if st.session_state.get("mobile_scrape_meta", {}).get("date"):
     try:
@@ -11952,7 +12041,7 @@ mobile_selected_date = st.date_input(
     "取得する開催日", value=default_mobile_date,
     key="mobile_target_date"
 )
-if st.button("📲 出走表＋過去成績を一括取得", key="mobile_fetch_all",
+if st.button("📲 出走表＋過去成績＋ウマピア騎手を一括取得", key="mobile_fetch_all",
              type="primary", use_container_width=True):
     st.session_state["win_market_message"] = ""
     st.session_state["mobile_fetch_message"] = ""
@@ -11963,12 +12052,18 @@ if st.button("📲 出走表＋過去成績を一括取得", key="mobile_fetch_a
         with st.spinner("単勝オッズ・人気を取得中..."):
             wins, win_errors, win_diag = win_collect_for_loaded_races(races)
         win_apply_snapshots_to_races(wins, races, entries)
-        # 外部騎手サンプルは少数を自動補完。全員を対象にしたい場合は騎手補完画面から選択。
+        # 日付指定の一括取得で、その日の今回騎乗する騎手をウマピアからまとめて取得。
+        # 時計55％・馬場10％などは変更せず、騎手相性20％へ必ず再計算して渡す。
         try:
-            with st.spinner('騎手の公開履歴を照合中...'):
-                jm_public_enrich(races,mobile_selected_date,max_riders=18)
+            with st.spinner('ウマピアの当日騎手全員の過去騎乗と4角位置を取得・新AIに反映中...'):
+                jm_public_enrich(races,mobile_selected_date,max_riders=JM_PUBLIC_MAX_RIDERS)
         except Exception as ext_exc:
             st.session_state['jm_external_diagnostics']={'errors':[str(ext_exc)[:200]],'prior_ride_jockeys':0,'prior_rides':0}
+            # 外部通信で問題が起きても出走表・過去走を破棄しない。
+            pool_horses=[h for r in races for h in (r.get('horses') or [])]
+            for r in races:
+                dirt_model(r['horses'],r.get('target_distance'),r.get('target_going'),r.get('race_date'),
+                           jockey_reference_horses=pool_horses)
         with st.spinner("3連複の組合せ別オッズ・人気を取得中..."):
             markets, errs, market_diag = trio_collect_for_loaded_races(races)
         st.session_state["mobile_scraped_races"] = races
@@ -11984,6 +12079,14 @@ if st.button("📲 出走表＋過去成績を一括取得", key="mobile_fetch_a
         meta["trio_races"] = len(markets)
         meta["trio_combinations"] = sum(len(v.get("market",{})) for v in markets.values())
         meta["trio_errors"] = len(errs)
+        jockey_report=st.session_state.get('jm_external_diagnostics') or {}
+        meta['umapia_jockeys_with_history']=jockey_report.get('current_jockeys_with_rides',0)
+        meta['umapia_jockeys_total']=jockey_report.get('current_jockeys',0)
+        meta['jockey_scored_horses']=jockey_report.get('scored_horses',0)
+        meta['jockey_horse_style_scored']=jockey_report.get('horse_jockey_style_scored',0)
+        meta['jockey_neutral_horses']=jockey_report.get('neutral_horses',len(entries))
+        meta['jockey_public_errors']=len(jockey_report.get('errors') or [])
+        # 直接取得前のデータを日付変更で参照しないよう、予想と一緒に復元・保存。
         st.session_state["mobile_scrape_meta"] = meta
         st.session_state["trio_market_snapshots"] = markets
         st.session_state["trio_market_errors"] = errs
@@ -12011,7 +12114,10 @@ if st.button("📲 出走表＋過去成績を一括取得", key="mobile_fetch_a
             f"履歴取得失敗{meta.get('history_errors', 0)}頭。"
             f" 騎手名{meta['jockey_now_present']}/{meta['jockey_now_total']}頭、"
             f"過去走騎手{meta['jockey_past_present']}/{meta['jockey_past_total']}走、"
-            f"タイプ判定可能{meta['jockey_style_types']}騎手。"
+            f"取得時の内部タイプ{meta['jockey_style_types']}騎手、"
+            f"ウマピア今回騎手{meta['umapia_jockeys_with_history']}/{meta['umapia_jockeys_total']}人、"
+            f"騎手相性採点{meta['jockey_scored_horses']}頭（うち馬×騎手傾向{meta['jockey_horse_style_scored']}頭）、"
+            f"中立{meta['jockey_neutral_horses']}頭。"
         )
         st.rerun()
     except Exception as exc:
@@ -12051,6 +12157,9 @@ with st.expander("🏇 競馬ラボ・ウマピア｜騎手公開データ補完
         if report:
             st.write(f"外部履歴：**{report.get('prior_ride_jockeys',0)}騎手・{report.get('prior_rides',0)}騎乗** ｜ "
                      f"競馬ラボ照合：**{report.get('keibalab_stats_count',0)}騎手**")
+            st.write(f"今回騎手のウマピア履歴：**{report.get('current_jockeys_with_rides',0)}/{report.get('current_jockeys',0)}人** ｜ "
+                     f"騎手相性採点：**{report.get('scored_horses',0)}頭**（馬×騎手タイプ："
+                     f"**{report.get('horse_jockey_style_scored',0)}頭**） ｜ 中立：**{report.get('neutral_horses',0)}頭**")
             st.caption(report.get('source_note',''))
             profiles=st.session_state.get('jm_external_profiles',{}).get(report.get('date',''),{})
             raw_stats=st.session_state.get('jm_external_stats',{})
@@ -12103,8 +12212,13 @@ with st.expander("🏇 騎手取得・分析の診断／不足分の再取得", 
             for h in race.get('horses',[]):
                 examples.append({'レース':race.get('race_name'),'馬番':h.get('horse_no'),'馬名':h.get('name'),
                                  '今回騎手':h.get('jockey') or '未取得',
+                                 '馬の脚質傾向':h.get('horse_running_style') or '根拠不足',
+                                 '馬の4角根拠走数':h.get('horse_style_runs',0),
                                  '過去走騎手が分かる走数':sum(bool(_jm_name(x.get('jockey'))) for x in _jm_histories(h)),
-                                 '今回騎手のタイプ':style_db.get(_jm_name(h.get('jockey')),{}).get('type','判定保留')})
+                                 '今回騎手のタイプ':style_db.get(_jm_name(h.get('jockey')),{}).get('type','判定保留'),
+                                 '騎手相性評価':h.get('jockey_score'),
+                                 '新AI指数への騎手寄与':round(.20*((h.get('jockey_score') if h.get('jockey_score') is not None else 50.)-50.),2),
+                                 '騎手相性の根拠':h.get('jockey_scoring_method')})
         if examples:
             st.dataframe(pd.DataFrame(examples),hide_index=True,use_container_width=True)
         st.caption('騎手タイプは「4角位置の傾向」に限る参考評価です。騎手の総合技量とは異なります。'
@@ -12327,7 +12441,7 @@ if st.session_state.get("market_refresh_message"):
 # 新AIは年次時計55%と騎手相性20%を反映。4頭BOX期待回収率は未校正である。
 # ====================================================================
 BS_BASE_APP_SHA256 = "708e1baeb1469d6682a6ea30fe705ef20c0217daaf4606b4b7959966ac2bf7c8"
-BS_RULE_VERSION = "top7_newai_YEARCLOCK55_JOCKEY20_lowpayout_min13_v3_20261109"
+BS_RULE_VERSION = "top7_newai_YEARCLOCK55_JOCKEY20_horse_jockey_UMAPIA_AUTO_min13_v4_20261113"
 BS_MIN_ODDS = 13.0    # 研究上の仮説。的中確率が32%なら損益分岐約12.5倍、利益保証はない
 BS_MIN_LEAD_MINUTES = 5
 BS_MAX_MARKET_AGE_MINUTES = 20
