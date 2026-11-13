@@ -8938,7 +8938,7 @@ LEGACY_NEW_WEIGHTS = {"time": .25, "last3f": .20, "margin": .20,
 # 新AI: 年次補正時計55%、距離15%、馬場10%、騎手相性20%。
 # 上がり3F・着差は独立した加点を廃止。時計と重複させない。
 NEW_WEIGHTS = {"time": .55, "distance": .15, "going": .10, "jockey": .20}
-NEW_AI_VERSION = "YEARCLOCK55_DISTANCE15_GOING10_JOCKEY20_HORSE_STYLE_UMAPIA_AUTO_20261113v1"
+NEW_AI_VERSION = "YEARCLOCK55_DISTANCE15_GOING10_JOCKEY20_HORSE_STYLE_DAYRESTORE_20261113v2"
 
 def dirt_model_before_yearclock(horses, target_distance=None, target_going=None):
     runs_all = [r for h in horses for r in h.get("dirt_histories", [])]
@@ -9073,7 +9073,8 @@ def _jm_style_database(horses,target_date,reference_horses=None):
                 # 同数以上の独立騎乗例が揃う場合にだけ公開履歴の評価を優先する。
                 if name not in result or len(vals) >= result[name]['rides']:
                     result[name] = {'position': m, 'type': t, 'rides': len(vals),
-                                    'horses': different, 'source': 'ウマピア騎手別履歴（芝ダ混合・開催前のみ）'}
+                                    'horses': different, 'source': 'ウマピア騎手別履歴（芝ダ混合・開催前のみ）',
+                                    'fetched_at':profile.get('fetched_at')}
     except (ValueError, TypeError, AttributeError, KeyError):
         pass
     return result
@@ -9119,12 +9120,28 @@ def _jm_jockey_score(horse,target_date,style_db):
     """
     now=_jm_name(horse.get('jockey'))
     rider_info=style_db.get(now,{}) if now else {}
+    # 取得直後に指数へ反映したタイプの根拠を馬自身にも保存する。
+    # モバイル再起動・別端末で開催日別履歴が未復元のとき、50点への逆戻りを防ぐ。
+    # 別日・別騎手への使い回しはしない。
+    saved_day=str(horse.get('jockey_style_reference_date') or '')
+    saved_now=_jm_name(horse.get('jockey_now'))
+    saved_pos=horse.get('jockey_style_position')
+    saved_count=horse.get('jockey_style_rides')
+    if (not rider_info and now and saved_day==str(target_date) and saved_now==now and
+            isinstance(saved_pos,(int,float)) and isinstance(saved_count,(int,float)) and
+            0<=saved_pos<=1 and saved_count>=5):
+        rider_info={'position':float(saved_pos),'type':horse.get('jockey_type'),
+                    'rides':int(saved_count),'source':horse.get('jockey_style_source') or '保存済みの開催日別騎手タイプ',
+                    'fetched_at':horse.get('jockey_style_fetched_at')}
     own=_jm_horse_running_style(horse,target_date)
     details={
         'jockey_now':now or None,
         'jockey_type':rider_info.get('type'),
         'jockey_style_rides':rider_info.get('rides',0),
         'jockey_style_source':rider_info.get('source','出走馬の過去走') if rider_info else None,
+        'jockey_style_position':round(float(rider_info['position']),5) if isinstance(rider_info.get('position'),(int,float)) else None,
+        'jockey_style_reference_date':str(target_date) if rider_info and isinstance(target_date,datetime.date) else None,
+        'jockey_style_fetched_at':rider_info.get('fetched_at'),
         'horse_running_style':own.get('type'),
         'horse_style_position':round(own['position'],3) if own['position'] is not None else None,
         'horse_style_runs':own['runs'],
@@ -9555,6 +9572,106 @@ def mobile_get_soup(url, session=None, tries=3):
 JM_PUBLIC_VERSION = "umapia-rides-keibalab-optional-20261111-v1"
 JM_PUBLIC_MAX_RIDERS = 160   # 当日の現役騎手を最優先。従来の18人制限を廃止。
 
+# 開催日ごとにウマピアの「開催前騎乗のみ」の診断用履歴を分離保存する。
+# 旧版の mobile_data にはこの履歴がなく、画面再実行時に騎手相性が50点へ戻る
+# 事例があったため、出走表の保存形式に依存しない別レコードも作る。
+JM_DAY_PROFILES_SCHEMA = 1
+
+
+def jm_day_profile_path(target_date):
+    if isinstance(target_date, str):
+        target_date = datetime.date.fromisoformat(target_date)
+    if not isinstance(target_date, datetime.date):
+        raise ValueError('騎手履歴の開催日が不正です')
+    return f'jockey_profiles/{target_date:%Y}/{target_date:%Y-%m-%d}.json'
+
+
+def jm_save_profiles_github(target_date):
+    import zlib
+    day=target_date.isoformat()
+    source=st.session_state.get('jm_external_profiles',{}).get(day,{})
+    if not source:
+        return False
+    compact={}
+    for name, profile in source.items():
+        rides=[]
+        for ride in profile.get('rides',[]):
+            if not _jm_before(ride,target_date):
+                continue
+            f,c=ride.get('field'),ride.get('corner_pos')
+            if not isinstance(f,(int,float)) or not isinstance(c,(int,float)) or not 3<=f<=18 or not 1<=c<=f:
+                continue
+            rides.append({'date':str(ride.get('date'))[:10], 'horse_name':str(ride.get('horse_name') or ''),
+                          'field':int(f), 'corner_pos':int(c)})
+        if rides:
+            compact[_jm_name(name)]={'rides':rides,'jockey_id':str(profile.get('jockey_id','')),
+                         'source':'ウマピア（開催前の4角位置）',
+                         'fetched_at':str(profile.get('fetched_at',''))}
+    if not compact:
+        return False
+    encoded=json.dumps(compact,ensure_ascii=False,separators=(',',':'),allow_nan=False).encode('utf-8')
+    if len(encoded)>12_000_000:
+        raise ValueError('騎手履歴が保存上限を超えました')
+    packed=base64.b64encode(zlib.compress(encoded,9)).decode('ascii')
+    record={'schema':JM_DAY_PROFILES_SCHEMA,'date':day,
+            'fetched_at':datetime.datetime.now(TRIO_JST).isoformat(timespec='seconds'),
+            'post_event_reanalysis':datetime.datetime.now(TRIO_JST).date()>target_date,
+            'format':'zlib+base64+json', 'payload':packed,
+            'jockey_count':len(compact),'rides':sum(len(v['rides']) for v in compact.values())}
+    put_record(jm_day_profile_path(target_date),record,overwrite=True)
+    return True
+
+
+def jm_restore_profiles_github(target_date):
+    """開催日別の騎手タイプの根拠を復元。旧日付の予測履歴は書き換えない。"""
+    import zlib
+    if not isinstance(target_date,datetime.date):
+        return False
+    day=target_date.isoformat()
+    if st.session_state.get('jm_external_profiles',{}).get(day):
+        return True
+    attempted=st.session_state.setdefault('_jm_day_profiles_restore_tried',{})
+    if attempted.get(day):
+        return False
+    attempted[day]=True
+    try:
+        record,_=get_record(jm_day_profile_path(target_date))
+        if not record:
+            return False
+        if record.get('schema')!=JM_DAY_PROFILES_SCHEMA or record.get('date')!=day or record.get('format')!='zlib+base64+json':
+            return False
+        packed=record.get('payload','')
+        if not isinstance(packed,str) or len(packed)>2_500_000:
+            return False
+        data=zlib.decompress(base64.b64decode(packed,validate=True))
+        if len(data)>12_000_000:
+            return False
+        profiles=json.loads(data.decode('utf-8'))
+        if not isinstance(profiles,dict):
+            return False
+        validated={}
+        for name,profile in profiles.items():
+            if not isinstance(profile,dict):
+                continue
+            rides=[]
+            for ride in profile.get('rides',[]):
+                if isinstance(ride,dict) and _jm_before(ride,target_date):
+                    rides.append(ride)
+            if rides:
+                validated[_jm_name(name)]={**profile,'rides':rides}
+        if not validated:
+            return False
+        st.session_state.setdefault('jm_external_profiles',{})[day]=validated
+        st.session_state.setdefault('_jm_day_profile_metadata',{})[day]={
+             'fetched_at':record.get('fetched_at'),
+             'post_event_reanalysis':bool(record.get('post_event_reanalysis',False)),
+             'jockey_count':len(validated),'rides':sum(len(v['rides']) for v in validated.values())}
+        return True
+    except Exception as exc:
+        st.session_state.setdefault('_jm_day_profile_restore_errors',{})[day]=type(exc).__name__+': '+str(exc)[:180]
+        return False
+
+
 
 def jm_public_umapia_index(soup):
     """公開騎手一覧の各リンクから氏名と内部IDを取得（年のURLで固定IDを推測しない）。"""
@@ -9671,7 +9788,7 @@ def jm_public_keibalab_cached():
     return jm_public_keibalab_leading(soup)
 
 
-def jm_public_enrich(races, target_date, selected_rid=None, max_riders=JM_PUBLIC_MAX_RIDERS):
+def jm_public_enrich(races, target_date, selected_rid=None, max_riders=JM_PUBLIC_MAX_RIDERS, force_refresh=False):
     """騎手氏名の照合と4角位置の独立サンプルを取得。過去日の通算成績を使わない。"""
     import concurrent.futures
     if not isinstance(target_date,datetime.date):
@@ -9694,7 +9811,16 @@ def jm_public_enrich(races, target_date, selected_rid=None, max_riders=JM_PUBLIC
             if nm and nm not in current_names:
                 current_names.append(nm)
     requested=list(dict.fromkeys(current_names+requested))
-    missing=[nm for nm in requested if nm not in old]
+    # 明示的な再取得では旧セッションの騎手タイプを信用して取得省略しない。
+    # 保存プロフィールに4角位置がない場合も再取得する。
+    def usable_profile(profile):
+        valid=[]
+        for ride in (profile or {}).get('rides',[]):
+            f,c=ride.get('field'),ride.get('corner_pos')
+            if _jm_before(ride,target_date) and isinstance(f,(int,float)) and isinstance(c,(int,float)) and f>=3 and 1<=c<=f:
+                valid.append(ride)
+        return len(valid)>=5 and len({_jm_name(ride.get('horse_name')) for ride in valid if _jm_name(ride.get('horse_name'))})>=3
+    missing=[nm for nm in requested if force_refresh or not usable_profile(old.get(nm))]
     limit=max(len(current_names), int(max_riders)) if max_riders is not None else len(missing)
     requested=missing[:max(1,limit)]
     errors=[]
@@ -9734,7 +9860,7 @@ def jm_public_enrich(races, target_date, selected_rid=None, max_riders=JM_PUBLIC
     st.session_state.setdefault('jm_external_profiles',{})[target_date.isoformat()]=profiles
     st.session_state.setdefault('jm_external_stats',{}).update({nm:leading[nm] for nm in requested if nm in leading})
     st.session_state['jm_external_diagnostics']={
-       'date':target_date.isoformat(),'requested':len(requested),'matched_index':len(available),
+       'date':target_date.isoformat(),'requested':len(requested),'force_refresh':bool(force_refresh),'matched_index':len(available),
        'current_jockeys':len(current_names),
        'current_jockeys_with_rides':sum(nm in profiles for nm in current_names),
        'prior_ride_jockeys':len(profiles),'prior_rides':sum(len(p['rides']) for p in profiles.values()),
@@ -9756,7 +9882,15 @@ def jm_public_enrich(races, target_date, selected_rid=None, max_riders=JM_PUBLIC
     report=st.session_state['jm_external_diagnostics']
     report.update({'scored_horses':scored,'neutral_horses':neutral,
                    'horse_jockey_style_scored':horse_style_scored,
-                   'new_ai_version':NEW_AI_VERSION})
+                   'new_ai_version':NEW_AI_VERSION,
+                   'post_event_reanalysis':datetime.datetime.now(TRIO_JST).date()>target_date,
+                   'date_specific_jockey_styles':len(_jm_style_database(pool_horses,target_date))})
+    # モバイル出走表に依存せず保存。GitHub障害時はセッションの採点は維持。
+    try:
+        report['day_profiles_saved']=bool(jm_save_profiles_github(target_date))
+    except Exception as exc:
+        report['day_profiles_saved']=False
+        report.setdefault('errors',[]).append('開催日別の騎手タイプ保存未完了: '+type(exc).__name__+': '+str(exc)[:120])
     return report
 
 
@@ -10502,7 +10636,7 @@ def calculate_ai_indices(horses_data):
 
 
 # --- GitHub Private repository persistence ---
-APP_VERSION = "dual-model-5.0-umapia-horse-rider-auto-20261113"
+APP_VERSION = "dual-model-5.1-umapia-dated-rider-restoration-20261113"
 
 def score_old_model(horses):
     data = []
@@ -11337,6 +11471,33 @@ def render_races(day, date):
     if mismatches:
         st.error(f"{day}: 開催日が不一致のレースが{len(mismatches)}件あります。確定保存を停止しました。")
         return
+    # レース自体が旧版の保存データでも、開催日で紐づく騎手分析を復元してから採点。
+    jm_restore_profiles_github(date)
+    day_jockeys=[_jm_name(h.get('jockey')) for rr in source_races for h in rr.get('horses',[])]
+    known_profiles=st.session_state.get('jm_external_profiles',{}).get(date.isoformat(),{})
+    matched_names=sum(bool(n and n in known_profiles) for n in day_jockeys)
+    st.caption(f'騎手データ（{date:%Y-%m-%d}）：出走{len(day_jockeys)}頭／今回騎手名あり{sum(bool(n) for n in day_jockeys)}頭／'
+               f'ウマピア履歴照合{matched_names}頭。乗り替わり相性には馬の4角位置2走以上も必要です。')
+    day_refresh_key=f'jm_refresh_displayed_{date:%Y%m%d}_{day}'
+    if st.button(f'🏇 {date:%m/%d}の騎手履歴を再取得して新AIへ反映',key=day_refresh_key,use_container_width=True):
+        try:
+            with st.spinner('表示中の開催日のウマピア騎乗履歴を取得・照合中...'):
+                report=jm_public_enrich(source_races,date,max_riders=JM_PUBLIC_MAX_RIDERS,force_refresh=True)
+            st.session_state.setdefault('_jm_date_refresh_report',{})[date.isoformat()]=report
+            st.rerun()
+        except Exception as exc:
+            st.error('表示日の騎手履歴の取得・反映に失敗: '+type(exc).__name__+': '+str(exc)[:240])
+    last_report=st.session_state.get('_jm_date_refresh_report',{}).get(date.isoformat())
+    if last_report:
+        st.info(f"騎手再解析：履歴あり{last_report.get('current_jockeys_with_rides',0)}/{last_report.get('current_jockeys',0)}騎手、"
+                f"相性点あり{last_report.get('scored_horses',0)}頭、"
+                f"馬×騎手タイプ{last_report.get('horse_jockey_style_scored',0)}頭、"
+                f"中立{last_report.get('neutral_horses',0)}頭。")
+        if last_report.get('errors'):
+            with st.expander('騎手情報の照合・保存に失敗した理由'):
+                for reason in last_report['errors'][:20]:st.write(reason)
+    if datetime.datetime.now(TRIO_JST).date()>date and (last_report or st.session_state.get('_jm_day_profile_metadata',{}).get(date.isoformat(),{}).get('post_event_reanalysis')):
+        st.caption('過去日付の騎手データを後日再取得した参考解析です。発走前に保存された予想・購入判定の検証成績には加えません。')
     selected, excluded = choose_dual(day)
     # Always show source races even if the model screens them out.
     source_dirt = [r for r in source_races if r.get("is_dirt_race")]
@@ -11472,6 +11633,8 @@ def render_races(day, date):
                 for c in integer_columns:
                     display_df[c] = display_df[c].map(_fmt_int)
                 display_df = display_df.rename(columns=jp_col_map)
+                if '騎手タイプ' in display_df.columns:
+                    display_df['騎手タイプ']=display_df['騎手タイプ'].fillna('データ不足')
                 styled = green_placed_rows(display_df, placed_set, number_col='馬番')
                 st.caption("表の項目名は日本語表示です。"
                            "新AIは年次補正走破タイム55%、距離適性15%、馬場適性10%、騎手相性20%で評価します。"
@@ -11495,6 +11658,12 @@ def render_races(day, date):
                                 "評価に使った実例":hr.get('jockey_evidence_runs'),
                                 "根拠・不足理由":hr.get('jockey_scoring_method')})
                         st.dataframe(pd.DataFrame(jockey_rows),hide_index=True,use_container_width=True)
+                        reason_counts=pd.Series([str(v or '不明') for v in df.get('jockey_scoring_method',pd.Series(dtype=str))]).value_counts()
+                        if not df.empty and pd.to_numeric(df.get('jockey_score'),errors='coerce').notna().sum()==0:
+                            st.warning('このレースは騎手相性の根拠が0頭です。騎手データ不足のまま全馬50点で暫定評価しています。'
+                                       '上の「表示中の開催日の騎手履歴を再取得」で、今回騎手と過去4角位置の照合結果を確認してください。')
+                        if not reason_counts.empty:
+                            st.caption('騎手評価の理由別頭数：'+', '.join(f'{k} {v}頭' for k,v in reason_counts.items()))
                         st.caption("馬の脚質は過去ダート走2走以上の4角位置で推定します。乗り替わり時は今回騎手の騎乗傾向（ウマピア優先）と直接照合。"
                                    "騎手タイプの根拠は5騎乗・3頭以上、標本不足は中立50点。相性の効果は未検証です。")
                     with st.expander("⏱️ 年次補正時計の根拠（各馬の過去走）"):
@@ -12056,7 +12225,7 @@ if st.button("📲 出走表＋過去成績＋ウマピア騎手を一括取得"
         # 時計55％・馬場10％などは変更せず、騎手相性20％へ必ず再計算して渡す。
         try:
             with st.spinner('ウマピアの当日騎手全員の過去騎乗と4角位置を取得・新AIに反映中...'):
-                jm_public_enrich(races,mobile_selected_date,max_riders=JM_PUBLIC_MAX_RIDERS)
+                jm_public_enrich(races,mobile_selected_date,max_riders=JM_PUBLIC_MAX_RIDERS,force_refresh=True)
         except Exception as ext_exc:
             st.session_state['jm_external_diagnostics']={'errors':[str(ext_exc)[:200]],'prior_ride_jockeys':0,'prior_rides':0}
             # 外部通信で問題が起きても出走表・過去走を破棄しない。
@@ -12143,7 +12312,7 @@ with st.expander("🏇 競馬ラボ・ウマピア｜騎手公開データ補完
             target_date=available_races[public_rid].get('race_date')
             try:
                 with st.spinner('騎手別の過去騎乗履歴を照合中...'):
-                    jm_public_enrich(public_races,target_date,selected_rid=public_rid,max_riders=30)
+                    jm_public_enrich(public_races,target_date,selected_rid=public_rid,max_riders=30,force_refresh=True)
                     try:
                         mobile_save_github()
                     except Exception as save_exc:
