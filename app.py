@@ -11552,6 +11552,310 @@ with st.sidebar.expander("📅 更新データの開催日確認", expanded=True
 st.sidebar.caption("日付の手入力は不要です。Google Driveの内容を更新したら『最新データを再取得』を押してください。")
 
 
+# 競馬ラボのコースタグは本番モデルとは別の事前比較にだけ使用。
+LAB_ABILITY_RULE = "keibalab-exact-dirt-course-jockey-plus5-v1"
+LAB_ABILITY_ORIGIN = "https://www.keibalab.jp"
+LAB_ABILITY_LEADING = "/db/leading.html?kind=jockey"
+
+
+def lab_ability_profile_links(soup, base_url):
+    """騎手一覧に実在するプロフィールリンクからだけIDを取得する。"""
+    choices, pages = {}, set()
+    for link in soup.select("a[href]"):
+        url = urllib.parse.urlsplit(urllib.parse.urljoin(base_url, link["href"]))
+        if url.scheme != "https" or url.netloc not in {"www.keibalab.jp", "keibalab.jp"}:
+            continue
+        match = re.fullmatch(r"/db/jockey/(\d{4,8})/?", url.path)
+        if match:
+            name = _jm_rider_name(link.get_text(" ", strip=True))
+            if name:
+                choices.setdefault(name, set()).add(match.group(1))
+        if url.path == "/db/leading.html":
+            query = urllib.parse.parse_qs(url.query)
+            page = query.get("page", [""])[0]
+            if query.get("kind") == ["jockey"] and re.fullmatch(r"[1-9]\d?", page):
+                pages.add(int(page))
+    return choices, pages
+
+
+def lab_ability_dirt_tag(value):
+    tag = re.sub(r"\s+", "", unicodedata.normalize("NFKC", str(value or "")))
+    match = re.fullmatch(r"(" + "|".join(COURSES) + r")ダ(?:ート)?([1-9]\d{3})m", tag, re.I)
+    return f"{match[1]}ダ{match[2]}m" if match else None
+
+
+def lab_ability_parse_profile(soup, expected_name):
+    heading = soup.select_one("h1")
+    title = heading.get_text(" ", strip=True) if heading else ""
+    title = re.split(r"[（(]", title, maxsplit=1)[0].strip()
+    if not title or _jm_rider_name(title) != expected_name:
+        raise ValueError("騎手プロフィールの氏名を照合できません")
+    boxes = [box for box in soup.select("div.jockey_ico")
+             if any(re.sub(r"\s+", "", h.get_text(" ", strip=True)) == "イチ推しアビリティ"
+                    for h in box.select("h5"))]
+    if len(boxes) != 1 or not boxes[0].select("li"):
+        raise ValueError("イチ推しアビリティ欄を確認できません")
+    dirt_items = boxes[0].select("li.fav_dirt")
+    parsed = [lab_ability_dirt_tag(li.get_text(" ", strip=True)) for li in dirt_items]
+    if any(tag is None for tag in parsed):
+        raise ValueError("ダートタグの表記を確認できません")
+    return sorted(set(parsed))
+
+
+def lab_ability_collect(names):
+    """開催日の騎手のみ。サイトがアクセスを制限した場合は追加要求を止める。"""
+    from concurrent.futures import ThreadPoolExecutor
+    wanted = set(names)
+    profiles, errors = {}, []
+    if not wanted:
+        return profiles, ["出走表に照合可能な騎手名がありません"]
+    choices, seen = {}, set()
+    pending = {1}
+    while pending and len(seen) < 8:
+        page = min(pending)
+        pending.remove(page)
+        seen.add(page)
+        url = LAB_ABILITY_ORIGIN + LAB_ABILITY_LEADING + (f"&page={page}" if page > 1 else "")
+        try:
+            page_choices, more = lab_ability_profile_links(jm_public_get_soup(url), url)
+            for name, ids in page_choices.items():
+                if name in wanted:
+                    choices.setdefault(name, set()).update(ids)
+        except Exception as exc:
+            errors.append(f"騎手一覧 {page}ページ目: {type(exc).__name__}: {str(exc)[:160]}")
+            if getattr(getattr(exc, "response", None), "status_code", None) in (403, 429) or not choices:
+                return {}, errors
+            break
+        if wanted <= choices.keys():
+            break
+        pending.update(more - seen)
+    resolved = [(name, next(iter(choices[name]))) for name in sorted(wanted)
+                if len(choices.get(name, ())) == 1]
+    missing = sorted(wanted - {name for name, _ in resolved})
+    if missing:
+        errors.append("プロフィール未照合: " + "、".join(missing))
+
+    def fetch(pair):
+        name, rider_id = pair
+        url = f"{LAB_ABILITY_ORIGIN}/db/jockey/{rider_id}/"
+        try:
+            tags = lab_ability_parse_profile(jm_public_get_soup(url), name)
+            return name, {"url": url, "tags": tags, "fetched_at_jst": datetime.datetime.now(TRIO_JST).isoformat()}, None, False
+        except Exception as exc:
+            blocked = getattr(getattr(exc, "response", None), "status_code", None) in (403, 429)
+            return name, None, f"{name}: {type(exc).__name__}: {str(exc)[:160]}", blocked
+
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        for first in range(0, len(resolved), 3):
+            blocked = False
+            for name, profile, error, denied in pool.map(fetch, resolved[first:first+3]):
+                if profile is not None:
+                    profiles[name] = profile
+                if error:
+                    errors.append(error)
+                blocked = blocked or denied
+            if blocked:
+                errors.append("アクセス制限を受けたため、残りのプロフィール取得を停止しました")
+                break
+    return profiles, errors
+
+
+def lab_ability_path(day):
+    return f"jockey_ability_trials/{day.year}/{day.isoformat()}.json"
+
+
+def lab_ability_restore(day):
+    """同日・同じルールの比較記録だけ復元。通常の予想履歴は触らない。"""
+    key = day.isoformat()
+    state = st.session_state.setdefault("lab_ability_trials", {})
+    attempted = st.session_state.setdefault("lab_ability_restore_attempted", {})
+    if not attempted.get(key):
+        attempted[key] = True
+        try:
+            saved, _ = get_record(lab_ability_path(day))
+            if saved is not None:
+                if saved.get("rule") != LAB_ABILITY_RULE or saved.get("date") != key or not isinstance(saved.get("races"), dict):
+                    raise ValueError("保存された比較記録の開催日・形式が一致しません")
+                state[key] = {**state.get(key, {}), **saved["races"]}
+        except Exception as exc:
+            st.session_state.setdefault("lab_ability_messages", {})[key] = ["比較記録の復元未完了: " + str(exc)[:180]]
+    return state.setdefault(key, {})
+
+
+def lab_ability_save(day, trial_races):
+    """初回の発走前比較を固定し、同時更新でも既存レースの記録を上書きしない。"""
+    path, key = lab_ability_path(day), day.isoformat()
+    for attempt in range(3):
+        old, sha = get_record(path)
+        if old is not None and (old.get("date") != key or old.get("rule") != LAB_ABILITY_RULE or not isinstance(old.get("races"), dict)):
+            raise ValueError("既存の比較記録の形式が一致しません")
+        merged = {**trial_races, **(old or {}).get("races", {})}
+        if old is not None and merged == old["races"]:
+            return merged
+        record = {"date": key, "rule": LAB_ABILITY_RULE, "races": merged}
+        data = json.dumps(record, ensure_ascii=False, allow_nan=False, separators=(",", ":")).encode()
+        payload = {"message": "JRA: record pre-race jockey ability comparisons", "content": base64.b64encode(data).decode("ascii")}
+        if sha:
+            payload["sha"] = sha
+        try:
+            github_request("PUT", path, payload)
+            return merged
+        except RuntimeError as exc:
+            # 競合なら最新の既存記録を読み直して、先に保存された結果を優先。
+            if attempt == 2 or not re.search(r"HTTP (409|422)\b", str(exc)):
+                raise
+    raise RuntimeError("比較記録を保存できませんでした")
+
+
+def lab_ability_compare(race, ranked, profiles, captured_at):
+    """現行の新AI指数は変更せず、別の列で騎手相性の加点差を計算する。"""
+    if (not race.get("is_dirt_race") or race.get("surface_conflict") or race.get("horse_numbers_unverified")
+            or trio_snapshot_kind(race, captured_at) != "発走前取得"):
+        return None
+    course = lab_ability_dirt_tag(f"{race.get('course', '')}ダ{race.get('target_distance', '')}m")
+    if not course or ranked.empty or len(ranked) != len(race.get("horses", [])):
+        return None
+    rows, evidence = [], {}
+    for _, horse in ranked.iterrows():
+        number = int(horse["horse_no"])
+        if not horse.get("horse_no_verified") or not 1 <= number <= 18:
+            return None
+        jockey = _jm_rider_name(horse.get("jockey"))
+        profile = profiles.get(jockey)
+        if profile is not None:
+            try:
+                retrieved = datetime.datetime.fromisoformat(profile["fetched_at_jst"])
+                if retrieved.tzinfo is None or retrieved > captured_at or trio_snapshot_kind(race, retrieved) != "発走前取得":
+                    profile = None
+            except (ValueError, TypeError, KeyError):
+                profile = None
+        if profile is not None:
+            evidence[jockey] = dict(profile)
+        matched = profile is not None and course in profile["tags"]
+        ai = horse.get("ai_score")
+        ai = float(ai) if pd.notna(ai) and np.isfinite(ai) else None
+        applied = horse.get("jockey_score_applied")
+        applied = float(applied) if pd.notna(applied) and np.isfinite(applied) else 50.0
+        rider_bonus = min(5.0, max(0.0, 100.0 - applied)) if matched else 0.0
+        trial = round(min(100.0, ai + 0.20 * rider_bonus), 2) if ai is not None else None
+        rows.append({"馬番":number, "馬名":str(horse.get("name") or ""), "騎手":jockey,
+                     "競馬ラボ照合":"一致" if matched else ("不一致" if profile is not None else "未確認"),
+                     "一致タグ":course if matched else "", "馬との相性根拠":"中立50点" if pd.isna(horse.get("jockey_score")) else "あり",
+                     "騎手相性・現行":applied, "試験加点":round(rider_bonus, 2),
+                     "騎手相性・試験":round(applied + rider_bonus, 2), "新AI・現行":ai, "新AI・試験":trial,
+                     "総合指数差":round(trial-ai,2) if ai is not None else None,
+                     "タグ取得時刻JST":profile["fetched_at_jst"] if profile is not None else None,
+                     "出典":profile["url"] if profile is not None else None})
+    if len({r["馬番"] for r in rows}) != len(rows) or not any(r["出典"] for r in rows):
+        return None
+    baseline = sorted((r for r in rows if r["新AI・現行"] is not None), key=lambda r: (-r["新AI・現行"], r["馬番"]))
+    trial = sorted(baseline, key=lambda r: (-r["新AI・試験"], r["馬番"]))
+    for column, ranked_rows in (("現行順位",baseline), ("試験順位",trial)):
+        ranks = {r["馬番"]: pos for pos, r in enumerate(ranked_rows,1)}
+        for row in rows:
+            row[column] = ranks.get(row["馬番"])
+    # 未採点の馬を落として4頭を作らない。4・5位の交代と上位4頭の変化は分ける。
+    comparable = len(rows) >= 5 and len(baseline) == len(rows)
+    before = [r["馬番"] for r in baseline[:5]] if comparable else []
+    after = [r["馬番"] for r in trial[:5]] if comparable else []
+    return {"race_name":str(race.get("race_name") or ""), "course":course, "captured_at_jst":captured_at.isoformat(),
+            "model":NEW_AI_VERSION, "rows":rows, "tag_evidence":evidence, "baseline_top5":before, "trial_top5":after,
+            "top4_changed":set(before[:4]) != set(after[:4]) if comparable else None,
+            "fourth_fifth_swapped":before[3:5] == after[3:5][::-1] if comparable else None,
+            "verified_horses":sum(r["出典"] is not None for r in rows),
+            "matched_horses":sum(r["競馬ラボ照合"] == "一致" for r in rows)}
+
+
+def lab_ability_render(races, day):
+    """開催日内の全対象レース。通常の候補枠や固定4頭BOXとは独立。"""
+    with st.expander("競馬ラボ・コース適性の試験比較"):
+        st.caption("今回のダートの競馬場と距離が完全一致した場合だけ騎手相性に最大5点を加算します。"
+                   "新AI総合指数では最大1.00点です。本番の指数・固定4頭BOX・買う／見送り判定には反映しません。")
+        st.caption("発走前に確認できた初回の比較を保存します。芝・脚質・格のタグは対象外。"
+                   "取得できない場合は未確認とし、元の点数を維持します。")
+        key = day.isoformat()
+        day_trials = lab_ability_restore(day)
+        state = st.session_state.setdefault("lab_ability_trials", {})
+        notices = st.session_state.setdefault("lab_ability_messages", {})
+        unsaved = st.session_state.setdefault("lab_ability_unsaved", {})
+        eligible = {}
+        now = datetime.datetime.now(TRIO_JST)
+        for race in races:
+            if (not race.get("is_dirt_race") or not race.get("identified", True)
+                    or race.get("surface_conflict") or race.get("horse_numbers_unverified")
+                    or trio_snapshot_kind(race, now) != "発走前取得"):
+                continue
+            rid = trio_race_id(race)
+            if rid and rid not in day_trials and lab_ability_dirt_tag(f"{race.get('course','')}ダ{race.get('target_distance','')}m"):
+                eligible[rid] = race
+        if st.button("競馬ラボのタグを取得して発走前比較を記録", key=f"lab_ability_capture_{key}",
+                     disabled=not eligible, use_container_width=True):
+            messages = []
+            try:
+                with st.spinner("今回の騎手のダートコース適性を照合中…"):
+                    names = {_jm_rider_name(h.get("jockey")) for race in eligible.values() for h in race.get("horses", [])}
+                    profiles, errors = lab_ability_collect(names - {""})
+                    messages.extend(errors)
+                    fresh = {}
+                    if profiles:
+                        for rid, race in eligible.items():
+                            if trio_snapshot_kind(race, datetime.datetime.now(TRIO_JST)) != "発走前取得":
+                                continue
+                            frame = score_new_model(race.get("horses", []), race)
+                            item = lab_ability_compare(race, frame, profiles, datetime.datetime.now(TRIO_JST))
+                            if item is not None:
+                                fresh[rid] = item
+                    messages.insert(0, f"発走前の比較を {len(fresh)}レース記録しました。" if fresh else
+                                    "発走前に照合できたレースはありません。現行指数は変更していません。")
+                    if fresh:
+                        day_trials.update(fresh)
+                        unsaved[key] = True
+                        try:
+                            state[key] = day_trials = lab_ability_save(day, day_trials)
+                            unsaved[key] = False
+                        except Exception as exc:
+                            messages.append("GitHubへの比較記録保存未完了: " + str(exc)[:180])
+            except Exception as exc:
+                messages.append("試験比較の取得未完了: " + str(exc)[:180])
+            notices[key] = messages
+        if unsaved.get(key):
+            st.warning("比較結果は現在の画面にあります。GitHub保存が完了していないため、必要ならJSONを保存してください。")
+            if st.button("取得済みの比較記録をGitHubへ再保存", key=f"lab_ability_resave_{key}"):
+                try:
+                    state[key] = day_trials = lab_ability_save(day, day_trials)
+                    unsaved[key] = False
+                    st.rerun()
+                except Exception as exc:
+                    st.warning("比較記録の保存未完了: " + str(exc)[:180])
+        for msg in notices.get(key, [])[:12]:
+            st.write(msg)
+        if not day_trials:
+            if not eligible:
+                st.info("発走前と確認できる未記録のダートレースがありません。現在のタグを過去のレースには付けません。")
+            return
+        summary = []
+        for item in day_trials.values():
+            summary.append({"レース":item["race_name"],"対象コース":item["course"],"取得日時":item["captured_at_jst"],
+                            "照合済み":f"{item['verified_horses']}/{len(item['rows'])}頭",
+                            "一致":item["matched_horses"],
+                            "現行上位4頭":"・".join(map(str,item["baseline_top5"][:4])) or "比較不可",
+                            "試験上位4頭":"・".join(map(str,item["trial_top5"][:4])) or "比較不可",
+                            "4頭の入れ替わり":item["top4_changed"],"4・5位の交代":item["fourth_fifth_swapped"]})
+        st.dataframe(pd.DataFrame(summary), hide_index=True, use_container_width=True)
+        st.caption("上位4頭は全馬の新AI指数の順位比較です。単勝人気を使う本番の固定4頭BOXとは別です。"
+                   "未確認馬がいるレースは部分照合として扱い、時計の未採点馬がいれば順位比較を保留します。")
+        rid = st.selectbox("比較の明細を表示", list(day_trials),
+                           format_func=lambda value: day_trials[value]["race_name"], key=f"lab_ability_select_{key}")
+        item = day_trials[rid]
+        numeric = ("騎手相性・現行","試験加点","騎手相性・試験","新AI・現行","新AI・試験","総合指数差")
+        st.dataframe(pd.DataFrame(item["rows"]), hide_index=True, use_container_width=True,
+                     column_config={col: st.column_config.NumberColumn(format="%.2f") for col in numeric})
+        st.download_button("発走前の比較記録をJSONで保存",
+                           json.dumps({"date":key, "rule":LAB_ABILITY_RULE,"races":day_trials}, ensure_ascii=False, indent=2, allow_nan=False),
+                           file_name=f"{key}_jockey_ability_comparison.json", mime="application/json",
+                           key=f"lab_ability_download_{key}")
+
+
 def render_races(day, date):
     # Never treat a race from a different date or an unverified surface as eligible.
     # The original records in GitHub are not modified by this filter.
@@ -11617,6 +11921,7 @@ def render_races(day, date):
                 for reason in last_report['errors'][:20]:st.write(reason)
     if datetime.datetime.now(TRIO_JST).date()>date and (last_report or st.session_state.get('_jm_day_profile_metadata',{}).get(date.isoformat(),{}).get('post_event_reanalysis')):
         st.caption('過去日付の騎手データを後日再取得した参考解析です。発走前に保存された予想・購入判定の検証成績には加えません。')
+    lab_ability_render(source_races, date)
     selected, excluded = choose_dual(day)
     # Always show source races even if the model screens them out.
     source_dirt = [r for r in source_races if r.get("is_dirt_race")]
@@ -12282,6 +12587,7 @@ def trio_store_snapshot_github(snapshots, diagnostics):
 # ============================================================
 st.subheader("📱 出走表・過去成績を取得")
 st.caption(f"🔧 アプリ版: {APP_VERSION} ｜ 取得エンジン: {MOBILE_FETCH_BUILD}")
+st.caption("比較機能追加版：競馬ラボ・ダートコース適性 v1")
 st.caption("日付指定で出走表・過去走・ウマピアの当日騎手履歴・市場データをまとめて取得し、騎手相性20％まで自動再計算します。")
 default_mobile_date = datetime.datetime.now(TRIO_JST).date()
 if st.session_state.get("mobile_scrape_meta", {}).get("date"):
