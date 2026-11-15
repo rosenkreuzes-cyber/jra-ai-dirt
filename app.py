@@ -10013,13 +10013,15 @@ def mobile_schedule_venues(target_date, session):
 
 # 取得エンジンの稼働版を画面・診断・バックアップへ表示する。
 # 旧版か新版か区別できない状態での調査を防ぐ。
-MOBILE_FETCH_BUILD = "2026-11-08-verified-id-v3"
+MOBILE_FETCH_BUILD = "2026-11-15-multiday-id-v4"
 
 # この2開催日はJRA公式の開催情報および実在する出走表IDを照合済み。
 # 対象日以外に適用しない。候補生成後も個別出走表側の開催日を検証する。
 MOBILE_CONFIRMED_SESSIONS = {
     datetime.date(2026, 11, 7): (("東京", 5, 1), ("京都", 5, 1), ("福島", 3, 1)),
     datetime.date(2026, 11, 8): (("東京", 5, 2), ("京都", 5, 2), ("福島", 3, 2)),
+    datetime.date(2026, 11, 14): (("東京", 5, 3), ("京都", 5, 3), ("福島", 3, 3)),
+    datetime.date(2026, 11, 15): (("東京", 5, 4), ("京都", 5, 4), ("福島", 3, 4)),
 }
 
 
@@ -11907,8 +11909,17 @@ all_loaded_races, load_errors, load_diagnostics = load_races_from_google_drive()
 # 条件変更・画面再実行でもsession_stateを保持し、新セッションはGitHubから復元する。
 mobile_saved = st.session_state.get("mobile_scraped_races", [])
 if mobile_saved:
-    mobile_days = {r.get("day_label") for r in mobile_saved}
-    all_loaded_races = [r for r in all_loaded_races if r.get("day_label") not in mobile_days] + mobile_saved
+    cache = st.session_state.setdefault("mobile_races_by_date", {})
+    current_date = str((st.session_state.get("mobile_scrape_meta") or {}).get("date") or "")
+    if current_date:
+        cache[current_date] = mobile_saved
+    direct_races = [r for day, day_races in cache.items() for r in day_races]
+    # 同一日・同一レースのみ置換。土曜/日曜の別日を消さない。
+    direct_ids = {str(r.get("netkeiba_race_id")) for r in direct_races}
+    direct_dates = {r.get("race_date") for r in direct_races}
+    all_loaded_races = [r for r in all_loaded_races
+                        if str(r.get("netkeiba_race_id")) not in direct_ids
+                        and r.get("race_date") not in direct_dates] + direct_races
     load_diagnostics.append(f"スマホ直接取得：{len(mobile_saved)}ダートレース / "
                             f"{st.session_state.get('mobile_scrape_meta',{}).get('fetched_at','')} JST")
 
@@ -12792,6 +12803,18 @@ mobile_selected_date = st.date_input(
     "取得する開催日", value=default_mobile_date,
     key="mobile_target_date"
 )
+if st.button("📂 指定日のGitHub保存済み出走表を復元", key="mobile_restore_selected_day"):
+    try:
+        day_state = mobile_read_github(mobile_selected_date)
+        if not day_state or not day_state.get("mobile_scraped_races"):
+            st.warning(f"{mobile_selected_date} のGitHub保存データはありません。直接取得を実行してください。")
+        else:
+            cache = st.session_state.setdefault("mobile_races_by_date", {})
+            cache[mobile_selected_date.isoformat()] = day_state["mobile_scraped_races"]
+            st.session_state["mobile_day_restore_notice"] = f"{mobile_selected_date} の保存済みレースを復元しました。"
+            st.rerun()
+    except Exception as e:
+        st.error(f"指定日の復元に失敗：{type(e).__name__}: {e}")
 if st.button("📲 出走表＋過去成績＋ウマピア騎手を一括取得", key="mobile_fetch_all",
              type="primary", use_container_width=True):
     st.session_state["win_market_message"] = ""
@@ -12829,6 +12852,13 @@ if st.button("📲 出走表＋過去成績＋ウマピア騎手を一括取得"
                            jockey_reference_horses=pool_horses)
         with st.spinner("3連複の組合せ別オッズ・人気を取得中..."):
             markets, errs, market_diag = trio_collect_for_loaded_races(races)
+        # 取得日の異なるレースを上書きせず、同じセッションに並存させる。
+        day_cache = st.session_state.setdefault("mobile_races_by_date", {})
+        for old_race in st.session_state.get("mobile_scraped_races", []):
+            old_day = old_race.get("race_date")
+            if isinstance(old_day, datetime.date):
+                day_cache.setdefault(old_day.isoformat(), []).append(old_race)
+        day_cache[mobile_selected_date.isoformat()] = races
         st.session_state["mobile_scraped_races"] = races
         st.session_state["mobile_entries"] = entries
         st.session_state["mobile_histories"] = histories
@@ -12871,6 +12901,7 @@ if st.button("📲 出走表＋過去成績＋ウマピア騎手を一括取得"
                 "ブラウザを閉じると復元できない可能性があります: " + str(save_exc)
             )
         st.session_state["mobile_fetch_message"] = (
+            f"【{mobile_selected_date:%Y/%m/%d}／取得版{MOBILE_FETCH_BUILD}】 "
             f"出走表取得：ダート{len(races)}レース・{len(entries)}頭・"
             f"発走前履歴{len(histories)}件・単勝{meta['win_horses']}頭・3連複{meta['trio_combinations']}組。"
             f"新馬（履歴対象外）{meta.get('debut_horses', 0)}頭・"
