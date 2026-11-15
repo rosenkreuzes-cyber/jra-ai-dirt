@@ -9488,6 +9488,7 @@ def parse_sheet_rows(rows, day_label, sheet_name=""):
             "time_index": time_score, "last3f_index": last3f_score,
             "track_aptitude": 75.0,
             "history_count": len(valid_histories),
+            "audit_all_history_texts": list(valid_histories),
             "dirt_runs": dirt_runs,
             "relative_score": relative_score,
             "dirt_score": dirt_score,
@@ -10675,10 +10676,10 @@ def mobile_parse_shutuba(soup, rid, target_date):
         j_cell = tr.select_one('td.Jockey, td[class*="Jockey"]')
         jockey_now = _jm_rider_name(mobile_visible_text(j_link)) or _jm_rider_name(mobile_visible_text(j_cell))
         # JRA公式結果で確認済みの個別欠損を補正。取得済みの名前は上書きしない。
-        if (not jockey_now and target_date==datetime.date(2026,11,15)
+        if (not jockey_now and target_date==datetime.date(2026,11,14)
                 and venue=="東京" and race_num==7 and horse_number==1
                 and _jm_name(name)=="ソリッドベーシス"):
-            jockey_now="佐々木大輔"
+            jockey_now="原優介"
         if not jockey_now:
             problems.append(f"騎手名未取得:{name}")
         entrants.append({
@@ -10926,6 +10927,7 @@ def mobile_horse_from_runs(entry, runs, target_date):
         "pop_rank":entry.get("人気"), "odds":entry.get("オッズ"),
         "time_index":time_score, "last3f_index":last3f_score,
         "track_aptitude":75.0, "history_count":len(texts), "dirt_runs":dirt_runs,
+        "audit_all_history_texts":list(texts),
         "relative_score":relative,
         "dirt_score":sum(dirt_scores)/len(dirt_scores) if dirt_scores else None,
         "dirt_histories":[v for v in (parse_dirt_run(txt) for txt in texts) if v],
@@ -12349,72 +12351,92 @@ def render_races(day, date):
                             st.caption('騎手評価の理由別頭数：'+', '.join(f'{k} {v}頭' for k,v in reason_counts.items()))
                         st.caption("馬の過去ダートでの位置取りと、ウマピア騎乗履歴から算出した今回騎手のタイプを比較します。"
                                    "人馬コンビの過去実績があれば従来評価を優先します。少数例は中立に近づけます。")
-                    with st.expander("🔎 新AI指数監査｜全馬の内訳・芝ダート・中央地方・根拠充足度"):
-                        st.caption("診断専用：指数・順位・買い目は変更しません。時計55%／距離15%／馬場10%／騎手20%。"
-                                   "未評価項目は指数計算上50点扱い。地方・芝の過去走は年次時計の評価対象外です。")
-                        audit_rows=[]
-                        run_rows=[]
-                        for _,hr in df.iterrows():
-                            num=int(hr['horse_no'])
-                            dirt_hist=hr.get('dirt_histories') or []
-                            evaluated=hr.get('year_clock_evidence') or []
-                            reasons=hr.get('year_clock_unmatched_reasons') or []
-                            total=int(hr.get('history_count') or 0)
-                            dirt_n=int(hr.get('dirt_runs') or 0)
-                            clock=hr.get('time_score')
-                            dist=hr.get('distance_score')
-                            going=hr.get('going_score')
-                            jockey=hr.get('jockey_score')
-                            def valid(v):
-                                try:return v is not None and bool(np.isfinite(float(v)))
-                                except (TypeError,ValueError):return False
-                            components={'時計55%':(clock,.55),'距離15%':(dist,.15),
-                                        '馬場10%':(going,.10),'騎手20%':(jockey,.20)}
-                            contribution={k:round((float(v) if valid(v) else 50.)*w,3)
-                                          for k,(v,w) in components.items()}
-                            audit_rows.append({
-                                '馬番':num,'馬名':hr.get('name'),'指数順位':hr.get('idx_rank'),
-                                '新AI指数':hr.get('ai_score'),'時計55%寄与':contribution['時計55%'],
-                                '距離15%寄与':contribution['距離15%'],
-                                '馬場10%寄与':contribution['馬場10%'],
-                                '騎手20%寄与':contribution['騎手20%'],
-                                '計算寄与合計':round(sum(contribution.values()),2) if valid(clock) else None,
-                                '全過去走（直近対象）':total,'ダート走':dirt_n,
-                                '芝など非ダート走':max(0,total-dirt_n),
-                                '時計に採用したJRAダート走':len(evaluated),
-                                '厳密基準走':hr.get('year_clock_primary_run_count'),
-                                '代替基準走':hr.get('year_clock_fallback_run_count'),
-                                '根拠充足率%':hr.get('evidence_coverage'),
-                                '騎手判定元':hr.get('jockey_style_source'),
-                                '騎手評価種別':hr.get('jockey_scoring_kind'),
-                                '時計除外理由': '／'.join(map(str,reasons)) or 'なし',
-                                '注意':('ダート実績0走・時計根拠なし' if dirt_n==0 else
-                                       '時計根拠なし' if not evaluated else
-                                       '時計根拠1走のみ' if len(evaluated)==1 else '')})
-                            for run in dirt_hist:
-                                if not isinstance(run,dict):continue
-                                run_rows.append({'馬番':num,'馬名':hr.get('name'),
-                                    '過去走日':str(run.get('date') or ''),
-                                    '競馬場':run.get('course'),'距離m':run.get('distance'),
-                                    '馬場':run.get('going'),'実時計秒':run.get('time'),
-                                    '過去走の競走区分':'JRA候補' if run.get('course') in YC_VENUES else '地方または未識別',
-                                    '芝ダート区分':'ダート（解析済み）',
-                                    '年次時計採用':any(str(z.get('date'))==str(run.get('date'))
-                                        and z.get('course')==run.get('course')
-                                        and z.get('distance')==run.get('distance') for z in evaluated)})
-                        st.dataframe(pd.DataFrame(audit_rows),hide_index=True,use_container_width=True)
-                        st.caption("中央・地方の区分は競馬場名からの暫定判定です。非ダート走は件数のみ表示し、"
-                                   "この一覧では元の芝レース名・時計までは復元しません。"
-                                   "過去走の詳細が未収録の場合は『不明』として扱ってください。")
-                        if run_rows:
-                            st.markdown("**過去ダート走ごとの採用状況**")
-                            st.dataframe(pd.DataFrame(run_rows),hide_index=True,use_container_width=True)
-                        else:
-                            st.info("表示可能な過去ダート走がありません。芝からの転向初戦や履歴取得不足を確認してください。")
-                        suspicious=[x for x in audit_rows if x['指数順位']==1 and
-                                    (x['ダート走']==0 or x['時計に採用したJRAダート走']<2)]
-                        if suspicious:
-                            st.warning("指数1位の根拠が薄い馬があります。現段階では減点せず、上記の内訳と過去走を確認してください。")
+                    if label == "新AI":
+                        with st.expander("🔎 新AI指数監査｜全馬の内訳・芝ダート・中央地方・根拠充足度"):
+                            st.caption("診断専用：指数・順位・買い目は変更しません。時計55%／距離15%／馬場10%／騎手20%。"
+                                       "未評価項目は指数計算上50点扱い。地方・芝の過去走は年次時計の評価対象外です。")
+                            audit_rows=[]
+                            run_rows=[]
+                            for _,hr in df.iterrows():
+                                num=int(hr['horse_no'])
+                                dirt_hist=hr.get('dirt_histories') or []
+                                evaluated=hr.get('year_clock_evidence') or []
+                                reasons=hr.get('year_clock_unmatched_reasons') or []
+                                total=int(hr.get('history_count') or 0)
+                                dirt_n=int(hr.get('dirt_runs') or 0)
+                                clock=hr.get('time_score')
+                                dist=hr.get('distance_score')
+                                going=hr.get('going_score')
+                                jockey=hr.get('jockey_score')
+                                def valid(v):
+                                    try:return v is not None and bool(np.isfinite(float(v)))
+                                    except (TypeError,ValueError):return False
+                                components={'時計55%':(clock,.55),'距離15%':(dist,.15),
+                                            '馬場10%':(going,.10),'騎手20%':(jockey,.20)}
+                                contribution={k:round((float(v) if valid(v) else 50.)*w,3)
+                                              for k,(v,w) in components.items()}
+                                audit_rows.append({
+                                    '馬番':num,'馬名':hr.get('name'),'指数順位':hr.get('idx_rank'),
+                                    '新AI指数':hr.get('ai_score'),'時計55%寄与':contribution['時計55%'],
+                                    '距離15%寄与':contribution['距離15%'],
+                                    '馬場10%寄与':contribution['馬場10%'],
+                                    '騎手20%寄与':contribution['騎手20%'],
+                                    '計算寄与合計':round(sum(contribution.values()),2) if valid(clock) else None,
+                                    '全過去走（直近対象）':total,'ダート走':dirt_n,
+                                    '芝など非ダート走':max(0,total-dirt_n),
+                                    '時計に採用したJRAダート走':len(evaluated),
+                                    '厳密基準走':hr.get('year_clock_primary_run_count'),
+                                    '代替基準走':hr.get('year_clock_fallback_run_count'),
+                                    '根拠充足率%':hr.get('evidence_coverage'),
+                                    '騎手判定元':hr.get('jockey_style_source'),
+                                    '騎手評価種別':hr.get('jockey_scoring_kind'),
+                                    '時計除外理由': '／'.join(map(str,reasons)) or 'なし',
+                                    '注意':(('芝からの転向初戦候補（直近履歴は芝のみ）' if hr.get('audit_all_history_texts') and all(re.search(r'\d{3,4}\s*芝',clean_text(x)) for x in hr.get('audit_all_history_texts')) else 'ダート0走・履歴不足または区分不明') if dirt_n==0 else
+                                           '時計根拠なし' if not evaluated else
+                                           '時計根拠1走のみ' if len(evaluated)==1 else '')})
+                            raw_hist=hr.get('audit_all_history_texts')
+                            if not isinstance(raw_hist,list):
+                                raw_hist=[]
+                            for i,raw in enumerate(raw_hist,1):
+                                txt=clean_text(raw)
+                                dirt_match=re.search(r"(?<!\d)(\d{3,4})\s*(?:ダート|ダ)(?![一-龯])",txt)
+                                turf_match=re.search(r"(?<!\d)(\d{3,4})\s*(?:芝)(?![一-龯])",txt)
+                                if dirt_match and not turf_match: surface='ダート'
+                                elif turf_match and not dirt_match: surface='芝'
+                                else: surface='不明（要確認）'
+                                parsed=parse_dirt_run(txt) if surface=='ダート' else None
+                                venue=(parsed or {}).get('course') or next((c for c in COURSES if re.search(r'(?:^|\n)\s*'+re.escape(c)+r'\s*(?:\n|$)',txt)),None)
+                                if venue in YC_VENUES: jurisdiction='JRA（競馬場名による）'
+                                elif venue: jurisdiction='地方またはその他（競馬場名による）'
+                                else: jurisdiction='不明'
+                                run_date=parse_prior_history_date(txt)
+                                matching=[z for z in evaluated if parsed and str(z.get('date'))==str(parsed.get('date'))
+                                          and z.get('course')==parsed.get('course') and z.get('distance')==parsed.get('distance')]
+                                run_rows.append({'馬番':num,'馬名':hr.get('name'),'履歴番号':i,
+                                    '過去走日':str(run_date or ''),'競馬場':venue or '不明',
+                                    '芝ダート区分':surface,'中央地方区分':jurisdiction,
+                                    '距離m':(parsed or {}).get('distance') or (int((dirt_match or turf_match).group(1)) if dirt_match or turf_match else None),
+                                    '着順':(parsed or {}).get('rank') or (int(re.search(r'(?<!\d)(\d{1,2})着',txt).group(1)) if re.search(r'(?<!\d)(\d{1,2})着',txt) else None),
+                                    '年次時計採用':('採用' if matching else '非採用') if surface=='ダート' else '対象外',
+                                    '年次時計根拠':(' / '.join(str(z.get('reference_type','')) for z in matching) if matching else ''),
+                                    '元履歴（冒頭）':txt.replace('\n',' / ')[:180]})
+                            if not raw_hist:
+                                run_rows.append({'馬番':num,'馬名':hr.get('name'),'履歴番号':None,
+                                    '芝ダート区分':'履歴未取得・未保存（判定不能）',
+                                    '中央地方区分':'不明','年次時計採用':'判定不能'})
+                            st.dataframe(pd.DataFrame(audit_rows),hide_index=True,use_container_width=True)
+                            st.caption("中央・地方の区分は競馬場名からの暫定判定です。非ダート走は件数のみ表示し、"
+                                       "この一覧では元の芝レース名・時計までは復元しません。"
+                                       "過去走の詳細が未収録の場合は『不明』として扱ってください。")
+                            if run_rows:
+                                st.markdown("**全過去走の芝・ダート・不明区分と年次時計採用状況**")
+                                st.dataframe(pd.DataFrame(run_rows),hide_index=True,use_container_width=True)
+                            else:
+                                st.info("表示可能な過去ダート走がありません。芝からの転向初戦や履歴取得不足を確認してください。")
+                            suspicious=[x for x in audit_rows if x['指数順位']==1 and
+                                        (x['ダート走']==0 or x['時計に採用したJRAダート走']<2)]
+                            if suspicious:
+                                st.warning("指数1位の根拠が薄い馬があります。現段階では減点せず、上記の内訳と過去走を確認してください。")
                     with st.expander("⏱️ 年次補正時計の根拠（各馬の過去走）"):
                         evidence_rows = []
                         for _,hr in df.iterrows():
