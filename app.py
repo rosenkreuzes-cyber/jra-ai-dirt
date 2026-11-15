@@ -10145,16 +10145,35 @@ GOING_TOKEN = r"(稍重|不良|良|重|稍|不)(?![一-龯ぁ-んァ-ン])"
 
 
 def going_netkeiba_card(soup):
-    surface, _, _ = mobile_race_surface(soup)
-    if surface != "ダート":
+    """結果・出馬表の競走条件欄からダート馬場だけを抽出する。"""
+    nodes = soup.select(".RaceData01")
+    if not nodes:
         return None
-    text = " / ".join(unicodedata.normalize("NFKC", x.get_text(" ",strip=True))
-                      for x in soup.select(".RaceData01"))
-    if not text or re.search(r"予報|予想|見込み",text):
+    text = " / ".join(unicodedata.normalize("NFKC", n.get_text(" ", strip=True)) for n in nodes)
+    if re.search(r"予報|予想|見込み", text):
         return None
-    found={going_normalize(v) for v in re.findall(
-        r"(?:ダート(?:馬場(?:状態)?)?|馬場(?:状態)?)[ \t:：]*"+GOING_TOKEN,text)}
-    return found.pop() if len(found)==1 else None
+    # 結果ページでは「ダ1800m」「ダート・右1800m」など表記が異なる。
+    # .RaceData01 に限り競走条件のダート表記を確認する。
+    is_dirt = bool(re.search(r"(?:ダート|ダ)\s*(?:[・･/／\- ]*\s*(?:右|左|直線|外|内)?\s*)?\d{3,4}\s*m", text))
+    if not is_dirt:
+        surface, _, _ = mobile_race_surface(soup)
+        is_dirt = surface == "ダート"
+    if not is_dirt:
+        return None
+    # 馬場欄は「馬場 : 良」「ダート : 稍重」「ダ : 重」等を許容。
+    # 距離表記の「ダ1800m」は状態値と混同しない。
+    patterns = (
+        r"(?:ダート馬場(?:状態)?|ダート|ダ|馬場(?:状態)?)\s*[:：=]\s*(稍重|不良|良|重|稍|不)(?![一-龯ぁ-んァ-ン])",
+        r"(?:ダート馬場(?:状態)?|馬場(?:状態)?)\s+(稍重|不良|良|重|稍|不)(?![一-龯ぁ-んァ-ン])",
+    )
+    for pattern in patterns:
+        values = {going_normalize(m) for m in re.findall(pattern, text)}
+        values.discard(None)
+        if len(values) == 1:
+            return values.pop()
+        if len(values) > 1:
+            return None
+    return None
 
 
 def going_netkeiba_track(soup, day, checked):
@@ -10470,7 +10489,7 @@ def going_update_finished_races(races):
                 return item,None,"結果ページのレースIDを確認できない"
             label=going_netkeiba_card(soup)
             if not label:
-                return item,None,"ダート馬場を特定できない"
+                return item,None,"ダート馬場を特定できない（競走条件欄: " + re.sub(r"\s+", " ", soup.select_one(".RaceData01").get_text(" ", strip=True))[:140] + "）"
             return item,(label,"netkeiba 確定結果",None,url,datetime.datetime.now(TRIO_JST)),None
         except Exception as exc:
             return item,None,f"{type(exc).__name__}: {str(exc)[:100]}"
