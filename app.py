@@ -9703,19 +9703,35 @@ def jm_restore_profiles_github(target_date):
 
 
 def jm_public_umapia_index(soup):
-    """公開騎手一覧の各リンクから氏名と内部IDを取得（年のURLで固定IDを推測しない）。"""
+    """一覧の氏名と騎手IDを抽出。姓名の空白や付記を吸収する。"""
     choices = {}
     for a in soup.find_all('a', href=True):
-        m = re.fullmatch(r'/search/jockeys/(\d{1,8})/?', urllib.parse.urlsplit(a['href']).path)
-        if not m:
-            continue
-        nm = _jm_rider_name(a.get_text(' ', strip=True))
-        if nm:
-            choices.setdefault(nm, set()).add(m.group(1))
-    found = {nm: next(iter(ids)) for nm, ids in choices.items() if len(ids) == 1}
-    if not found:
-        raise RuntimeError('ウマピアの騎手リンクが見つかりません（ページ変更の可能性）')
+        path=urllib.parse.urlsplit(urllib.parse.urljoin('https://umapia.jp',a['href'])).path
+        m=re.fullmatch(r'/search/jockeys/(\d{1,8})/?',path)
+        if not m:continue
+        label=a.get_text(' ',strip=True)
+        # 一覧のリンクに騎乗数等が混ざる場合、名前だけを使う。
+        label=re.split(r'[（(【\[\d]',label,1)[0].strip()
+        nm=_jm_rider_name(label)
+        if nm:choices.setdefault(nm,set()).add(m.group(1))
+    found={nm:next(iter(ids)) for nm,ids in choices.items() if len(ids)==1}
+    if not found:raise RuntimeError('ウマピアの騎手リンクが見つかりません（ページ変更の可能性）')
     return found
+
+
+def jm_public_match_ids(names,year):
+    """当年だけに依存せず過去年の騎手一覧も検索。IDの競合は推測で選ばない。"""
+    wanted=set(names); found={}; errors=[]
+    for y in range(int(year),max(2019,int(year)-6)-1,-1):
+        pending=wanted-set(found)
+        if not pending:break
+        try: index=jm_public_index_cached(y)
+        except Exception as exc:
+            errors.append(f'{y}年一覧: {type(exc).__name__}: {str(exc)[:100]}')
+            continue
+        for nm in pending:
+            if nm in index:found[nm]=index[nm]
+    return found,errors
 
 
 def jm_public_umapia_rides(soup, name):
@@ -9804,7 +9820,7 @@ def jm_public_next_page(soup,url):
 def jm_public_index_cached(year):
     url=f'https://umapia.jp/search/jockeys?year={int(year)}'
     profiles={}
-    for _ in range(6):
+    for _ in range(12):
         try:
             soup=jm_public_get_soup(url)
             for name,jid in jm_public_umapia_index(soup).items():
@@ -9859,11 +9875,8 @@ def jm_public_enrich(races, target_date, selected_rid=None, max_riders=JM_PUBLIC
     errors=[]
     if len(missing)>len(requested):
         errors.append(f'当日騎乗する騎手{len(missing)-len(requested)}名は取得上限で未取得')
-    try:
-        index=jm_public_index_cached(target_date.year)
-    except Exception as exc:
-        index={}
-        errors.append('ウマピア一覧: '+str(exc)[:150])
+    index,index_errors=jm_public_match_ids(requested,target_date.year)
+    errors.extend(index_errors)
     profiles=dict(old)
     available=[(nm,index[nm]) for nm in requested if nm in index]
     absent=[nm for nm in requested if nm not in index]
@@ -9894,7 +9907,7 @@ def jm_public_enrich(races, target_date, selected_rid=None, max_riders=JM_PUBLIC
     st.session_state.setdefault('jm_external_profiles',{})[target_date.isoformat()]=profiles
     typed=_jm_style_database([],target_date)
     st.session_state['jm_external_diagnostics']={
-       'date':target_date.isoformat(),'requested':len(requested),'force_refresh':bool(force_refresh),'matched_index':len(available),
+       'date':target_date.isoformat(),'requested':len(requested),'force_refresh':bool(force_refresh),'matched_index':len(available),'unmatched_names':absent,
        'current_jockeys':len(current_names),
        'current_jockeys_with_rides':sum(nm in typed for nm in current_names),
        'prior_ride_jockeys':len(profiles),'prior_rides':sum(len(p['rides']) for p in profiles.values()),
