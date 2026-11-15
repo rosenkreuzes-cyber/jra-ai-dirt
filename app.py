@@ -9571,7 +9571,7 @@ def mobile_get_soup(url, session=None, tries=3):
     failures = []
     for attempt in range(1, tries + 1):
         try:
-            response = session.get(url, timeout=(8, 23), allow_redirects=True)
+            response = session.get(url, timeout=(5, 9), allow_redirects=True)
             response.raise_for_status()
             if len(response.content) < 250:
                 raise RuntimeError("HTML本文が短すぎます")
@@ -10013,7 +10013,7 @@ def mobile_schedule_venues(target_date, session):
 
 # 取得エンジンの稼働版を画面・診断・バックアップへ表示する。
 # 旧版か新版か区別できない状態での調査を防ぐ。
-MOBILE_FETCH_BUILD = "2026-11-15-multiday-id-v4"
+MOBILE_FETCH_BUILD = "2026-11-15-history-fast-v5"
 
 # この2開催日はJRA公式の開催情報および実在する出走表IDを照合済み。
 # 対象日以外に適用しない。候補生成後も個別出走表側の開催日を検証する。
@@ -10912,7 +10912,7 @@ def mobile_fetch_date(target_date, min_race=6, max_race=12):
             return hid, run_list, excluded_today, excluded_unknown, ""
         except Exception as exc:
             return hid, [], 0, 0, str(exc)[:250]
-    with concurrent.futures.ThreadPoolExecutor(max_workers=3) as pool:
+    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
         futures = [pool.submit(fetch_horse, one) for one in eligible_horses]
         for i, future in enumerate(concurrent.futures.as_completed(futures), 1):
             hid, rows, skip_day, skip_unknown, error = future.result()
@@ -12815,43 +12815,63 @@ if st.button("📂 指定日のGitHub保存済み出走表を復元", key="mobil
             st.rerun()
     except Exception as e:
         st.error(f"指定日の復元に失敗：{type(e).__name__}: {e}")
+historical_fast_mode = st.checkbox(
+    "過去開催日の高速再取得（出走表・過去走を優先し、時間のかかる馬場・オッズ・ウマピアの再照会を省略）",
+    value=True, key="mobile_historical_fast_mode",
+    help="11/14・11/15など確定済みの過去日を取り直すためのモード。省略項目は新しい取得結果として扱いません。"
+)
 if st.button("📲 出走表＋過去成績＋ウマピア騎手を一括取得", key="mobile_fetch_all",
              type="primary", use_container_width=True):
     st.session_state["win_market_message"] = ""
     st.session_state["mobile_fetch_message"] = ""
     try:
+        st.info(f"取得対象：{mobile_selected_date:%Y/%m/%d}。出走表最大21ページと出走馬の過去走を取得します。進捗表示が動かない場合は通信待ちの可能性があります。")
         with st.spinner("対象日のダートレースと過去成績を取得中..."):
             races, entries, histories, diagnostics, meta = mobile_fetch_date(mobile_selected_date)
-        with st.spinner("当日のダート馬場を確認中..."):
-            # 同じ日の出走表を入れ直す時も、確認済みの馬場・確認時刻を失わない。
-            previous={trio_race_id(r):r for r in (st.session_state.get("mobile_scraped_races") or [])
-                      if r.get("race_date")==mobile_selected_date and r.get("going_checked_at") and going_effective(r)}
-            for r in races:
-                old=previous.get(trio_race_id(r))
-                if old and (not r.get("going_checked_at") or old.get("going_observed_at")
-                            or str(old.get("going_source") or "").startswith("JRA")):
-                    r.update({k:old.get(k) for k in ("target_going","going_source","going_observed_at",
-                                                     "going_checked_at","going_source_url")})
-            going_report=going_update_races(races)
-        meta["going_confirmed_races"]=going_report["confirmed"]
-        # 市場データの発売前・通信失敗で出走表や過去走を消さない。
-        with st.spinner("単勝オッズ・人気を取得中..."):
-            wins, win_errors, win_diag = win_collect_for_loaded_races(races)
-        win_apply_snapshots_to_races(wins, races, entries)
-        # 日付指定の一括取得で、その日の今回騎乗する騎手をウマピアからまとめて取得。
-        # 時計55％・馬場10％などは変更せず、騎手相性20％へ必ず再計算して渡す。
-        try:
-            with st.spinner('ウマピアの当日騎手全員の過去騎乗と4角位置を取得・新AIに反映中...'):
-                jm_public_enrich(races,mobile_selected_date,max_riders=JM_PUBLIC_MAX_RIDERS,force_refresh=True)
-        except Exception as ext_exc:
-            st.session_state['jm_external_diagnostics']={'errors':[str(ext_exc)[:200]],'prior_ride_jockeys':0,'prior_rides':0}
-            # 外部通信で問題が起きても出走表・過去走を破棄しない。
-            pool_horses=[h for r in races for h in (r.get('horses') or [])]
-            for r in races:
-                dirt_model(r['horses'],r.get('target_distance'),going_effective(r),r.get('race_date'),
-                           jockey_reference_horses=pool_horses)
-        with st.spinner("3連複の組合せ別オッズ・人気を取得中..."):
-            markets, errs, market_diag = trio_collect_for_loaded_races(races)
+        if historical_fast_mode and mobile_selected_date < datetime.datetime.now(TRIO_JST).date():
+            # 事後取得ではオッズや騎手の現在値を発走前の根拠として使用しない。
+            # 取得を長時間ブロックする外部照会を省き、過去走・出走表を先に確定する。
+            going_report = {"confirmed": 0}
+            wins, win_errors, win_diag = {}, [], []
+            markets, errs, market_diag = {}, [], []
+            st.session_state["jm_external_diagnostics"] = {
+                "errors": ["過去日高速再取得：ウマピアの再照会を省略"],
+                "current_jockeys_with_rides": 0, "current_jockeys": 0,
+                "scored_horses": 0, "horse_jockey_style_scored": 0,
+                "neutral_horses": len(entries),
+            }
+            st.info("過去日高速取得：出走表・過去走を取得。馬場・オッズ・ウマピアの外部照会は省略しました。")
+        else:
+            with st.spinner("当日のダート馬場を確認中..."):
+                # 同じ日の出走表を入れ直す時も、確認済みの馬場・確認時刻を失わない。
+                previous={trio_race_id(r):r for r in (st.session_state.get("mobile_scraped_races") or [])
+                          if r.get("race_date")==mobile_selected_date and r.get("going_checked_at") and going_effective(r)}
+                for r in races:
+                    old=previous.get(trio_race_id(r))
+                    if old and (not r.get("going_checked_at") or old.get("going_observed_at")
+                                or str(old.get("going_source") or "").startswith("JRA")):
+                        r.update({k:old.get(k) for k in ("target_going","going_source","going_observed_at",
+                                                         "going_checked_at","going_source_url")})
+                going_report=going_update_races(races)
+            meta["going_confirmed_races"]=going_report["confirmed"]
+            # 市場データの発売前・通信失敗で出走表や過去走を消さない。
+            with st.spinner("単勝オッズ・人気を取得中..."):
+                wins, win_errors, win_diag = win_collect_for_loaded_races(races)
+            win_apply_snapshots_to_races(wins, races, entries)
+            # 日付指定の一括取得で、その日の今回騎乗する騎手をウマピアからまとめて取得。
+            # 時計55％・馬場10％などは変更せず、騎手相性20％へ必ず再計算して渡す。
+            try:
+                with st.spinner('ウマピアの当日騎手全員の過去騎乗と4角位置を取得・新AIに反映中...'):
+                    jm_public_enrich(races,mobile_selected_date,max_riders=JM_PUBLIC_MAX_RIDERS,force_refresh=True)
+            except Exception as ext_exc:
+                st.session_state['jm_external_diagnostics']={'errors':[str(ext_exc)[:200]],'prior_ride_jockeys':0,'prior_rides':0}
+                # 外部通信で問題が起きても出走表・過去走を破棄しない。
+                pool_horses=[h for r in races for h in (r.get('horses') or [])]
+                for r in races:
+                    dirt_model(r['horses'],r.get('target_distance'),going_effective(r),r.get('race_date'),
+                               jockey_reference_horses=pool_horses)
+            with st.spinner("3連複の組合せ別オッズ・人気を取得中..."):
+                markets, errs, market_diag = trio_collect_for_loaded_races(races)
         # 取得日の異なるレースを上書きせず、同じセッションに並存させる。
         day_cache = st.session_state.setdefault("mobile_races_by_date", {})
         for old_race in st.session_state.get("mobile_scraped_races", []):
