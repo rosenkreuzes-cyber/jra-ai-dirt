@@ -9090,7 +9090,7 @@ def _jm_umapia_profile_style(profile, target_date):
 
 
 def _jm_style_database(horses,target_date,reference_horses=None):
-    """乗替時の騎手タイプはウマピア由来のみ。出走馬側の過去騎乗サンプルと混ぜない。"""
+    """ウマピア優先。未取得騎手だけJRA過去ダート騎乗の位置取りで補完。"""
     if not isinstance(target_date,datetime.date):
         return {}
     profiles=st.session_state.get('jm_external_profiles',{}).get(target_date.isoformat(),{})
@@ -9100,6 +9100,34 @@ def _jm_style_database(horses,target_date,reference_horses=None):
         info=_jm_umapia_profile_style(profile,target_date)
         if info and name:
             result[name]=info
+    samples={}
+    seen=set()
+    pool=reference_horses if reference_horses is not None else horses
+    for horse in pool or []:
+        for run in _jm_histories(horse):
+            if not isinstance(run,dict) or not _jm_before(run,target_date):
+                continue
+            name=_jm_rider_name(run.get('jockey'))
+            if not name or name in result:
+                continue
+            field,corner=run.get('field'),run.get('corner_pos')
+            if not isinstance(field,(int,float)) or not isinstance(corner,(int,float)):
+                continue
+            if not (3<=field<=18 and 1<=corner<=field):
+                continue
+            race_id=str(run.get('race_id') or '').strip()
+            dt=str(run.get('date'))[:10]
+            key=(name,dt,race_id) if race_id else (name,dt,str(run.get('course') or ''),str(run.get('distance') or ''),str(horse.get('name') or ''))
+            if key in seen:
+                continue
+            seen.add(key)
+            samples.setdefault(name,[]).append((float(corner)-1)/(float(field)-1))
+    for name,positions in samples.items():
+        if len(positions)<3:
+            continue
+        pos=round(float(np.mean(positions)),5)
+        result[name]={'position':pos,'type':_jm_position_type(pos),'rides':len(positions),
+                      'source':'JRA過去ダート騎乗実績から推定（ウマピア未取得）','fetched_at':None}
     return result
 
 
@@ -9152,7 +9180,7 @@ def _jm_jockey_score(horse,target_date,style_db):
     saved_count=horse.get('jockey_style_rides')
     if (not rider_info and now and saved_day==str(target_date) and saved_now==now and
             isinstance(saved_pos,(int,float)) and isinstance(saved_count,(int,float)) and
-            0<=saved_pos<=1 and saved_count>=1 and 'ウマピア' in saved_source):
+            0<=saved_pos<=1 and saved_count>=1 and ('ウマピア' in saved_source or 'JRA過去ダート' in saved_source)):
         rider_info={'position':float(saved_pos),'type':_jm_position_type(float(saved_pos)),
                      'rides':int(saved_count),'source':saved_source,
                     'fetched_at':horse.get('jockey_style_fetched_at')}
@@ -9187,18 +9215,12 @@ def _jm_jockey_score(horse,target_date,style_db):
             same.append(float(100*(field-rank)/(field-1)))
     # 乗り替わりの評価。『好走時の騎手の名前と履歴』は条件にしない。
     if not rider_info:
-        # ウマピアのタイプが未取得の場合だけ、過去の同一騎手実績を代替根拠として使う。
-        if same:
-            score=(150+sum(same))/(3+len(same))
-            details.update(jockey_scoring_method='ウマピア未照合・今回騎手との過去ダート実績による代替評価',
-                           jockey_scoring_kind='same_pair_fallback',
-                           jockey_evidence_runs=len(same),
-                           jockey_good_rider=now if any(v>=75 for v in same) else None)
-            return round(float(np.clip(score,0,100)),2),details
-        details['jockey_scoring_method']='ウマピア騎手タイプ未取得・相性を判定できず（指数計算上のみ中立50点）'
+        details['jockey_scoring_method']='ウマピア未取得・JRA騎手タイプの根拠3走未満（中立50点）'
         return None,details
+    is_jra_fallback='JRA過去ダート' in str(rider_info.get('source') or '')
+    origin='JRA推定' if is_jra_fallback else 'ウマピア'
     if own['position'] is None:
-        details['jockey_scoring_method']=f"ウマピア：{rider_info['type']}／馬の過去通過順位を確認できず（中立50点）"
+        details['jockey_scoring_method']=f"{origin}：{rider_info['type']}／馬の過去通過順位を確認できず（中立50点）"
         return None,details
     rider_pos=rider_info['position']
     horse_pos=own['position']
@@ -9210,9 +9232,9 @@ def _jm_jockey_score(horse,target_date,style_db):
     shrink=horse_reliability*rider_reliability*consistency
     score=50.+60.*(similarity-.5)*shrink
     fit='近い' if similarity >= .66 else ('やや近い' if similarity >= .50 else '離れている')
-    details.update(jockey_scoring_method=(f"馬：{own['type']}×ウマピア騎手：{rider_info['type']}（{fit}）"
+    details.update(jockey_scoring_method=(f"馬：{own['type']}×{origin}騎手：{rider_info['type']}（{fit}）"
                                          + ('・少数例' if own['runs']<2 or rider_info['rides']<5 else '')),
-                    jockey_scoring_kind='umapia_style',
+                    jockey_scoring_kind=('jra_style_fallback' if is_jra_fallback else 'umapia_style'),
                    jockey_similarity=round(similarity,3),
                    jockey_evidence_runs=own['runs'])
     return round(float(np.clip(score,20.,80.)),2),details
@@ -11896,6 +11918,8 @@ def mobile_refresh_jockey_data(races, entries, histories, target_date):
     stats={'今回騎手取得':sum(bool(e.get('騎手')) for e in entries),'出走馬':len(entries),
            '過去走騎手取得':sum(bool(x.get('騎手')) for x in histories),'過去走':len(histories),
            'タイプ判定可能な騎手':len(_jm_style_database(pool,target_date)),
+           'ウマピアタイプ判定':sum('ウマピア' in str(v.get('source') or '') for v in _jm_style_database(pool,target_date).values()),
+           'JRAタイプ推定':sum('JRA過去ダート' in str(v.get('source') or '') for v in _jm_style_database(pool,target_date).values()),
            '今回補完':updated_now,'過去走補完':updated_past,'更新日時JST':stamp,
            '事後補完':datetime.datetime.now(TRIO_JST).date()>target_date}
     return stats,log
@@ -12964,7 +12988,7 @@ if st.session_state.get("mobile_persist_status"):
     (st.warning if message.startswith("⚠️") else st.success)(message)
 
 with st.expander("🏇 ウマピア｜騎手タイプの照合・再取得", expanded=False):
-    st.caption("ウマピアの開催日前の騎乗履歴から位置取りタイプを算出し、馬の脚質と優先照合します。未取得時のみ同一騎手の過去実績を代替利用します。")
+    st.caption("ウマピアの開催日前の騎乗履歴から位置取りタイプを算出し、馬の脚質と優先照合します。未取得時のみJRA過去ダート騎乗3走以上の4角位置から騎手タイプを推定します。")
     public_races=st.session_state.get('mobile_scraped_races') or []
     available_races={str(r.get('netkeiba_race_id')):r for r in public_races if r.get('netkeiba_race_id')}
     if available_races:
@@ -13014,6 +13038,30 @@ with st.expander("🏇 騎手取得・分析の診断／不足分の再取得", 
             try:target_date=datetime.date.fromisoformat(target_date)
             except ValueError:target_date=None
         style_db=_jm_style_database(all_horses,target_date)
+        # タイプ取得元の内訳。今回出走騎手と過去走由来の全騎手を分離して表示。
+        current_riders=sorted({name for h in all_horses
+                               if (name:=_jm_rider_name(h.get('jockey')))})
+        umapia_styles={name:info for name,info in style_db.items()
+                       if 'ウマピア' in str(info.get('source') or '')}
+        jra_styles={name:info for name,info in style_db.items()
+                    if 'JRA過去ダート' in str(info.get('source') or '')}
+        unknown_riders=[name for name in current_riders if name not in style_db]
+        st.write(f'**タイプ判定内訳（全履歴）**：ウマピア **{len(umapia_styles)}人** ｜ '
+                 f'JRA推定 **{len(jra_styles)}人** ｜ 合計 **{len(style_db)}人**')
+        st.write(f'**今回出走騎手（重複除外）**：{len(current_riders)}人 ｜ '
+                 f'ウマピア **{sum(n in umapia_styles for n in current_riders)}人** ｜ '
+                 f'JRA推定 **{sum(n in jra_styles for n in current_riders)}人** ｜ '
+                 f'タイプ根拠不足 **{len(unknown_riders)}人**')
+        if current_riders:
+            st.dataframe(pd.DataFrame([{
+                '騎手':name,
+                'タイプ':style_db[name].get('type','不明') if name in style_db else '根拠不足',
+                '取得元':('ウマピア' if name in umapia_styles else
+                        'JRA過去ダート推定' if name in jra_styles else '未判定（中立50点）'),
+                '根拠騎乗数':style_db[name].get('rides',0) if name in style_db else 0,
+            } for name in current_riders]),hide_index=True,use_container_width=True)
+        st.caption('「今回補完」「過去走補完」は騎手名・通過順位の欠損補完件数で、騎手タイプのJRA推定人数とは別です。'
+                   '全履歴の人数には今回出走しない騎手も含まれます。')
         st.write(f'今回の騎手名：**{current} / {len(entries)}頭** ｜ 過去走の騎手名：**{past} / {len(histories)}走** ｜ '
                  f'騎手名と4角位置が揃った過去走：**{passage}走** ｜ タイプ判定可能：**{len(style_db)}騎手**')
         if current<len(entries) or past<len(histories):
@@ -13028,13 +13076,13 @@ with st.expander("🏇 騎手取得・分析の診断／不足分の再取得", 
                                  '馬の脚質傾向':h.get('horse_running_style') or '根拠不足',
                                  '馬の過去通過根拠走数':h.get('horse_style_runs',0),
                                  '過去走騎手が分かる走数':sum(bool(_jm_name(x.get('jockey'))) for x in _jm_histories(h)),
-                                 '今回騎手のタイプ':h.get('jockey_type') or 'ウマピア未照合',
+                                 '今回騎手のタイプ':h.get('jockey_type') or '騎手タイプ根拠不足',
                                  '騎手相性評価':h.get('jockey_score'),
                                  '新AI指数への騎手寄与':round(.20*((h.get('jockey_score') if h.get('jockey_score') is not None else 50.)-50.),2),
                                  '騎手相性の根拠':h.get('jockey_scoring_method')})
         if examples:
             st.dataframe(pd.DataFrame(examples),hide_index=True,use_container_width=True)
-        st.caption('騎手タイプはウマピアの通過順位から算出した位置取りの傾向で、騎手の総合技量とは異なります。'
+        st.caption('騎手タイプはウマピアまたはJRA過去ダート走の4角位置から算出した位置取りの傾向で、騎手の総合技量とは異なります。'
                    '騎手情報だけを後日補完した過去レースは、発走前の独立検証データには扱いません。')
         if st.button('🔄 騎手名・4角位置の不足分を再取得（オッズ・固定4頭は保持）',key='jockey_refresh_only'):
             if not isinstance(target_date,datetime.date):
