@@ -9720,18 +9720,42 @@ def jm_public_umapia_index(soup):
 
 
 def jm_public_match_ids(names,year):
-    """当年だけに依存せず過去年の騎手一覧も検索。IDの競合は推測で選ばない。"""
-    wanted=set(names); found={}; errors=[]
+    """ウマピアの正式姓名と出馬表の略称を安全に照合する。
+
+    例: 河原田→河原田菜々、柴田裕→柴田裕一郎、菊沢→菊沢一樹。
+    同じ略称に複数の正式名が該当する場合は推測せず未照合にする。
+    """
+    requested=list(dict.fromkeys(_jm_rider_name(n) for n in names if _jm_rider_name(n)))
+    all_profiles={}
+    errors=[]
+    # 当年の全ページを優先。過去年の結果は当年で見つからない場合だけ補完。
     for y in range(int(year),max(2019,int(year)-6)-1,-1):
-        pending=wanted-set(found)
-        if not pending:break
-        try: index=jm_public_index_cached(y)
+        try:
+            year_index=jm_public_index_cached(y)
         except Exception as exc:
             errors.append(f'{y}年一覧: {type(exc).__name__}: {str(exc)[:100]}')
             continue
-        for nm in pending:
-            if nm in index:found[nm]=index[nm]
-    return found,errors
+        for full_name,jid in year_index.items():
+            all_profiles.setdefault(_jm_rider_name(full_name),set()).add(str(jid))
+        if all(n in all_profiles for n in requested):
+            break
+    matched={}
+    for short in requested:
+        # 完全一致を先に評価し、他の騎手への誤照合を防ぐ。
+        exact=all_profiles.get(short,set())
+        if len(exact)==1:
+            matched[short]=next(iter(exact))
+            continue
+        # 日本人騎手の短縮名は姓名の先頭部分としてのみ照合する。
+        # 例: 石川→石川裕紀人、和田陽→和田陽希。
+        if re.fullmatch(r'[一-龯々ぁ-ゖァ-ヺー]{2,12}',short):
+            candidates={(full,next(iter(ids))) for full,ids in all_profiles.items()
+                        if full.startswith(short) and len(ids)==1}
+            if len(candidates)==1:
+                matched[short]=next(iter(candidates))[1]
+            elif len(candidates)>1:
+                errors.append(short+': 略称に複数候補 '+','.join(sorted(x[0] for x in candidates)[:5]))
+    return matched,errors
 
 
 def jm_public_umapia_rides(soup, name):
