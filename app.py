@@ -11056,13 +11056,15 @@ def calculate_ai_indices(horses_data):
     df = pd.DataFrame(horses_data)
     df["ai_score"] = pd.to_numeric(df["ai_score"], errors="coerce")
     df = df.sort_values(["ai_score", "horse_no"], ascending=[False, True], na_position="last").reset_index(drop=True)
-    df["idx_rank"] = range(1, len(df)+1)
+    # 指数欠損馬には順位を付けない（従来は欠損馬にも順位を付与していた）。
+    df["idx_rank"] = pd.Series(range(1, len(df)+1), index=df.index, dtype="Int64")
+    df.loc[df["ai_score"].isna(), "idx_rank"] = pd.NA
     df["divergence"] = pd.to_numeric(df["pop_rank"], errors="coerce") - df["idx_rank"]
     return df
 
 
 # --- GitHub Private repository persistence ---
-APP_VERSION = "dual-model-5.4-result-import-20261115"
+APP_VERSION = "dual-model-5.5-score-audit-20261115"
 
 def score_old_model(horses):
     data = []
@@ -11218,26 +11220,59 @@ def screen_scored_race_new(race, df):
 
 
 def dual_snapshot(date, race, evaluations, settings):
+    """発走前の指数・順位・欠損理由・モデル識別子を一緒に固定保存する。"""
     models = {}
     for label, ev in evaluations.items():
         df = ev["df"]
-        top = [int(x) for x in df.head(4)["horse_no"]] if df["ai_score"].notna().sum() >= 4 else []
+        scored = df.loc[df["ai_score"].notna()]
+        top = [int(x) for x in scored.head(4)["horse_no"]] if len(scored) >= 4 else []
         if label == "新AI" and yc_unassessed_horses(df):
             top = []
-        models[label] = {"top4": top, "eligible": ev["metrics"] is not None,
-                         "metrics": ev["metrics"], "reason": ev["reason"],
-                         "scores": [{"horse_no": int(r["horse_no"]), "ai_score": float(r["ai_score"]) if pd.notna(r["ai_score"]) else None}
-                                    for _, r in df.iterrows()]}
-    # 新AIの時計不足を旧AI4頭で補填して購入対象にしない。
+        scores = []
+        for _, r in df.iterrows():
+            value = pd.to_numeric(r.get("ai_score"), errors="coerce")
+            valid = pd.notna(value) and np.isfinite(float(value))
+            rank = r.get("idx_rank")
+            reason = ""
+            if not valid:
+                reason = str(r.get("new_ai_missing_reason") or "").strip() if label == "新AI" else ""
+                if not reason:
+                    reason = "指数算出不可（詳細原因未取得）"
+            item = {
+                "horse_no": int(r["horse_no"]),
+                "horse_name": str(r.get("name") or ""),
+                "ai_score": float(value) if valid else None,
+                "idx_rank": int(rank) if valid and pd.notna(rank) else None,
+                "missing_reason": reason,
+            }
+            if label == "新AI":
+                item.update({
+                    "year_clock_run_count": int(r.get("year_clock_run_count") or 0),
+                    "year_clock_reference_state": str(r.get("year_clock_reference_state") or ""),
+                    "year_clock_unmatched_reasons": list(r.get("year_clock_unmatched_reasons") or []),
+                    "evidence_coverage": float(r["evidence_coverage"]) if pd.notna(r.get("evidence_coverage")) else None,
+                })
+            scores.append(item)
+        models[label] = {
+            "top4": top, "eligible": ev["metrics"] is not None,
+            "metrics": ev["metrics"], "reason": ev["reason"],
+            "scored_count": sum(x["ai_score"] is not None for x in scores),
+            "missing_count": sum(x["ai_score"] is None for x in scores),
+            "scores": scores,
+        }
     primary = models["新AI"]
-    return {"race_id": race_key(date, race), "race_date": date.isoformat(),
-            "day_label": race["day_label"], "course": race["course"],
-            "race_no": int(race["race_no"]), "race_name": race["race_name"],
-            "netkeiba_race_id": trio_race_id(race),
-            "saved_at_utc": datetime.datetime.now(datetime.timezone.utc).isoformat(),
-            "model_version": APP_VERSION, "settings": settings,
-            "models": models, "top4": primary["top4"], "metrics": primary["metrics"] or {"score":0,"gap":0},
-            "bet_unit": int(bet_unit)}
+    return {
+        "race_id": race_key(date, race), "race_date": date.isoformat(),
+        "day_label": race["day_label"], "course": race["course"],
+        "race_no": int(race["race_no"]), "race_name": race["race_name"],
+        "netkeiba_race_id": trio_race_id(race),
+        "saved_at_utc": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+        "model_version": APP_VERSION, "new_ai_version": NEW_AI_VERSION,
+        "year_clock_version": YC_VERSION, "year_clock_reference_max_date": YC_SOURCE_MAX_DATE,
+        "settings": settings, "models": models, "top4": primary["top4"],
+        "metrics": primary["metrics"] or {"score": 0, "gap": 0},
+        "bet_unit": int(bet_unit),
+    }
 
 
 def github_config():
@@ -12243,6 +12278,18 @@ def render_races(day, date):
             save_preview = None
             save_reasons.append("保存データ生成失敗: " + str(preview_exc)[:180])
         save_path = f"predictions/{date.year}/{r_key}.json"
+        if save_preview is not None:
+            for model_name in ("旧AI", "新AI"):
+                model_data = save_preview["models"][model_name]
+                missing_rows = [x for x in model_data["scores"] if x["ai_score"] is None]
+                if missing_rows:
+                    st.warning(model_name + "：指数欠損 " + str(len(missing_rows)) + "頭（欠損を隠さず理由付きで保存します）")
+                    st.dataframe(pd.DataFrame([{
+                        "馬番": x["horse_no"], "馬名": x["horse_name"],
+                        "原因": x["missing_reason"],
+                        "時計根拠走数": x.get("year_clock_run_count"),
+                        "時計照合不成立理由": "／".join(x.get("year_clock_unmatched_reasons") or [])
+                    } for x in missing_rows]), hide_index=True, use_container_width=True)
         if save_reasons:
             st.warning("確定保存できない理由：" + "／".join(save_reasons))
         save_status_key = "confirmed_save_status_" + r_key
@@ -12270,8 +12317,16 @@ def render_races(day, date):
                 stored, _ = get_record(save_path)
                 if stored:
                     st.success("保存確認済：" + str(stored.get("saved_at_utc", "")) + " UTC")
-                    st.caption("新AI指数 " + str(len(stored.get("models", {}).get("新AI", {}).get("scores", []))) +
-                               "頭／選定4頭 " + str(stored.get("models", {}).get("新AI", {}).get("top4", [])))
+                    saved_model = stored.get("models", {}).get("新AI", {})
+                    saved_scores = saved_model.get("scores", [])
+                    missing_saved = [x for x in saved_scores if x.get("ai_score") is None]
+                    st.caption("新AI指数算出 " + str(len(saved_scores)-len(missing_saved)) +
+                               "／全" + str(len(saved_scores)) + "頭、欠損 " + str(len(missing_saved)) +
+                               "頭／選定4頭 " + str(saved_model.get("top4", [])))
+                    if missing_saved:
+                        st.warning("確定保存時の欠損馬：" + "、".join(
+                            str(x.get("horse_no")) + "番（" + str(x.get("missing_reason") or "旧形式・理由未記録") + "）"
+                            for x in missing_saved))
                 else:
                     st.warning("GitHubに確定予想がありません。発走前であれば保存ボタンから登録してください。")
             except Exception as exc:
