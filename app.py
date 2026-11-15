@@ -10446,6 +10446,49 @@ def going_update_races(races, refetch_netkeiba=False):
     return {"eligible":len(candidates),"confirmed":confirmed,"refreshed":updated}
 
 
+def going_update_finished_races(races):
+    """確定済みの各レース結果ページから、そのレースの実際のダート馬場を確認。"""
+    from concurrent.futures import ThreadPoolExecutor
+    now=datetime.datetime.now(TRIO_JST)
+    targets=[]
+    for race in races:
+        day=race.get("race_date")
+        rid=trio_race_id(race)
+        if (race.get("is_dirt_race") and isinstance(day,datetime.date)
+                and day<=now.date() and rid and trio_snapshot_kind(race,now)!="発走前取得"):
+            targets.append((rid,race))
+    def fetch(item):
+        rid,race=item
+        url=f"https://race.netkeiba.com/race/result.html?race_id={rid}"
+        try:
+            soup=jm_public_get_soup(url)
+            # 結果ページに表示されたレースIDとダート表記を照合する。
+            if not soup or not soup.select_one(".RaceData01"):
+                return item,None,"結果ページに馬場欄なし"
+            canonical=str(soup)
+            if rid not in canonical:
+                return item,None,"結果ページのレースIDを確認できない"
+            label=going_netkeiba_card(soup)
+            if not label:
+                return item,None,"ダート馬場を特定できない"
+            return item,(label,"netkeiba 確定結果",None,url,datetime.datetime.now(TRIO_JST)),None
+        except Exception as exc:
+            return item,None,f"{type(exc).__name__}: {str(exc)[:100]}"
+    updated=0;failed=[]
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        for (rid,race),reading,error in pool.map(fetch,targets):
+            if not reading:
+                failed.append(f"{race.get('race_date')} {race.get('course')} {race.get('race_no')}R: {error}")
+                continue
+            label,source,observed,url,checked=reading
+            if going_effective(race)!=label or not race.get("going_checked_at"):
+                updated+=1
+            race.update(target_going=label,going_source=source,going_observed_at=observed,
+                        going_checked_at=checked.isoformat(timespec="seconds"),going_source_url=url)
+    return {"eligible":len(targets),"confirmed":len(targets)-len(failed),
+            "refreshed":updated,"failures":failed}
+
+
 def going_effective(race):
     # 旧保存版のnetkeiba馬場は観測時刻がなく予報混入を排除できない。
     if race.get("netkeiba_race_id") and not race.get("going_checked_at"):
@@ -10463,18 +10506,28 @@ def going_restore_overrides(races):
 
 
 def going_refresh_ui(races):
-    with st.expander("🌧️ 当日のダート馬場｜取得・反映",expanded=False):
-        st.caption("当日のJRA発表値を優先。netkeibaの馬場欄も確認し、新旧は公表時刻で比較します。天気予報は使いません。"
-                   "発走前の未固定予想にのみ反映し、固定済み4頭と保存済みの判定は変更しません。")
-        if st.button("🔄 当日のダート馬場を再取得して新AIへ反映",key="going_live_refresh",use_container_width=True):
-            with st.spinner("当日のダート馬場を確認中..."):
-                report=going_update_races(races,refetch_netkeiba=True)
+    with st.expander("🌧️ ダート馬場｜当日・確定後の取得と反映",expanded=False):
+        st.caption("発走前は当日公表値、確定後はレース結果ページの実馬場を確認します。"
+                   "確定後の馬場で新AIを再計算するため、当時の予想値とは異なる場合があります。")
+        if st.button("🔄 土日すべてのダート馬場を取得・新AIへ反映",key="going_live_refresh",use_container_width=True):
+            with st.spinner("発走前の公表値と確定後の実馬場を確認中..."):
+                live=going_update_races(races,refetch_netkeiba=True)
+                finished=going_update_finished_races(races)
                 saved=st.session_state.setdefault("going_day_overrides",{})
                 for r in races:
                     if going_effective(r) and r.get("going_checked_at"):
                         saved[(str(r.get("race_date")),trio_race_id(r))]={k:r.get(k) for k in
                             ("target_going","going_source","going_observed_at","going_checked_at","going_source_url")}
-                if report["refreshed"] and st.session_state.get("mobile_scraped_races"):
+                pool_horses=[h for r in races for h in (r.get("horses") or [])]
+                for r in races:
+                    if r.get("is_dirt_race") and r.get("horses"):
+                        dirt_model(r["horses"],r.get("target_distance"),going_effective(r),
+                                   r.get("race_date"),jockey_reference_horses=pool_horses)
+                report={"eligible":live["eligible"]+finished["eligible"],
+                        "confirmed":live["confirmed"]+finished["confirmed"],
+                        "refreshed":live["refreshed"]+finished["refreshed"],
+                        "failures":finished["failures"]}
+                if st.session_state.get("mobile_scraped_races"):
                     try:
                         mobile_save_github()
                     except Exception as exc:
@@ -10483,17 +10536,18 @@ def going_refresh_ui(races):
             st.rerun()
         report=st.session_state.get("going_refresh_report")
         if report:
-            st.info(f"今回確認 {report['refreshed']}レース／発走前の対象 {report['eligible']}レース。"
-                    f"採用値あり {report['confirmed']}レース（前回確認分を含む）。")
-            if report.get("detail"):
-                st.caption(report["detail"])
+            st.info(f"確認対象 {report['eligible']}レース／馬場確認 {report['confirmed']}レース／更新 {report['refreshed']}レース")
+            if report.get("failures"):
+                with st.expander(f"未確認の理由（{len(report['failures'])}件）"):
+                    for msg in report["failures"]:
+                        st.caption(msg)
             if report.get("save_error"):
-                st.warning("馬場更新は画面内に保持。保存に失敗しました。 "+report["save_error"])
-        today=datetime.datetime.now(TRIO_JST).date()
-        rows=[{"レース":r.get("race_name"),"ダート馬場":going_effective(r) or "未確認",
-               "出典":r.get("going_source") or ("読み込み元" if going_effective(r) else "—"),
-               "公表時刻":r.get("going_observed_at") or "—","確認時刻（JST）":r.get("going_checked_at") or "—"}
-              for r in races if r.get("is_dirt_race") and r.get("race_date")==today]
+                st.warning("画面内の馬場は更新しましたが、GitHub保存に失敗しました。"+report["save_error"])
+        rows=[{"開催日":str(r.get("race_date")),"レース":r.get("race_name"),
+               "ダート馬場":going_effective(r) or "未確認",
+               "出典":r.get("going_source") or "—",
+               "確認時刻（JST）":r.get("going_checked_at") or "—"}
+              for r in races if r.get("is_dirt_race")]
         if rows:
             st.dataframe(pd.DataFrame(rows),hide_index=True,use_container_width=True)
 
