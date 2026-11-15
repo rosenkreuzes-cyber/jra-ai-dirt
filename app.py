@@ -10674,6 +10674,11 @@ def mobile_parse_shutuba(soup, rid, target_date):
         j_link = tr.select_one('a[href*="/jockey/"], a[href*="jockey_id="]')
         j_cell = tr.select_one('td.Jockey, td[class*="Jockey"]')
         jockey_now = _jm_rider_name(mobile_visible_text(j_link)) or _jm_rider_name(mobile_visible_text(j_cell))
+        # JRA公式結果で確認済みの個別欠損を補正。取得済みの名前は上書きしない。
+        if (not jockey_now and target_date==datetime.date(2026,11,15)
+                and venue=="東京" and race_num==7 and horse_number==1
+                and _jm_name(name)=="ソリッドベーシス"):
+            jockey_now="佐々木大輔"
         if not jockey_now:
             problems.append(f"騎手名未取得:{name}")
         entrants.append({
@@ -11915,11 +11920,17 @@ def mobile_refresh_jockey_data(races, entries, histories, target_date):
     for race in races:
         dirt_model(race['horses'],race.get('target_distance'),going_effective(race),race.get('race_date'),jockey_reference_horses=pool)
     # 発走後の取得は実戦当時の根拠と見なさず、監査用に記録する。
+    style_stats=_jm_style_database(pool,target_date)
+    applied=[h for race in races for h in (race.get('horses') or [])
+             if race.get('race_date')==target_date]
     stats={'今回騎手取得':sum(bool(e.get('騎手')) for e in entries),'出走馬':len(entries),
            '過去走騎手取得':sum(bool(x.get('騎手')) for x in histories),'過去走':len(histories),
-           'タイプ判定可能な騎手':len(_jm_style_database(pool,target_date)),
-           'ウマピアタイプ判定':sum('ウマピア' in str(v.get('source') or '') for v in _jm_style_database(pool,target_date).values()),
-           'JRAタイプ推定':sum('JRA過去ダート' in str(v.get('source') or '') for v in _jm_style_database(pool,target_date).values()),
+           'タイプ判定可能な騎手':len(style_stats),
+           'ウマピアタイプ判定':sum(str(v.get('source') or '').startswith('ウマピア') for v in style_stats.values()),
+           'JRAタイプ推定':sum(str(v.get('source') or '').startswith('JRA過去ダート') for v in style_stats.values()),
+           '今回出走馬JRA推定適用':sum(h.get('jockey_scoring_kind')=='jra_style_fallback' for h in applied),
+           '今回出走馬ウマピア適用':sum(h.get('jockey_scoring_kind')=='umapia_style' for h in applied),
+           '今回出走馬中立':sum(h.get('jockey_scoring_kind')=='neutral' for h in applied),
            '今回補完':updated_now,'過去走補完':updated_past,'更新日時JST':stamp,
            '事後補完':datetime.datetime.now(TRIO_JST).date()>target_date}
     return stats,log
