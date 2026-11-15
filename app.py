@@ -10013,15 +10013,13 @@ def mobile_schedule_venues(target_date, session):
 
 # 取得エンジンの稼働版を画面・診断・バックアップへ表示する。
 # 旧版か新版か区別できない状態での調査を防ぐ。
-MOBILE_FETCH_BUILD = "2026-11-15-minimal-date-support-v1"
+MOBILE_FETCH_BUILD = "2026-11-08-verified-id-v3"
 
 # この2開催日はJRA公式の開催情報および実在する出走表IDを照合済み。
 # 対象日以外に適用しない。候補生成後も個別出走表側の開催日を検証する。
 MOBILE_CONFIRMED_SESSIONS = {
     datetime.date(2026, 11, 7): (("東京", 5, 1), ("京都", 5, 1), ("福島", 3, 1)),
     datetime.date(2026, 11, 8): (("東京", 5, 2), ("京都", 5, 2), ("福島", 3, 2)),
-    datetime.date(2026, 11, 14): (("東京", 5, 3), ("京都", 5, 3), ("福島", 3, 3)),
-    datetime.date(2026, 11, 15): (("東京", 5, 4), ("京都", 5, 4), ("福島", 3, 4)),
 }
 
 
