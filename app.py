@@ -12221,16 +12221,61 @@ def render_races(day, date):
         pre_start = save_timing == "発走前取得"
         if not pre_start:
             st.caption(f"確定保存不可：{save_timing}。結果を知った後のデータを事前予想に混ぜません。")
-        if st.button("💾 旧AI・新AIの予想を同時に確定保存", key="save_" + race_key(date, race), disabled=(not verified or not pre_start or detected_date != date or not race.get("is_dirt_race") or race.get("surface_conflict") or race.get("horse_numbers_unverified", False))):
-            rec = dual_snapshot(date, race, evaluations, settings)
-            path = f"predictions/{date.year}/{rec['race_id']}.json"
+        # 保存できない理由を明示し、GitHubへの確定書き込み後に読み戻して検証する。
+        save_reasons = []
+        if not verified or detected_date != date:
+            save_reasons.append("開催日が一致しません")
+        if not pre_start:
+            save_reasons.append("発走前の取得ではありません（" + save_timing + "）")
+        if not race.get("is_dirt_race") or race.get("surface_conflict"):
+            save_reasons.append("ダート競走の照合ができません")
+        if race.get("horse_numbers_unverified", False):
+            save_reasons.append("実際の馬番を確認できません")
+        try:
+            save_preview = dual_snapshot(date, race, evaluations, settings)
+            for model_name in ("旧AI", "新AI"):
+                model_data = save_preview.get("models", {}).get(model_name, {})
+                if len(model_data.get("scores", [])) != len(evaluations[model_name]["df"]):
+                    save_reasons.append(model_name + "の全頭指数が揃いません")
+                if len(model_data.get("top4", [])) != 4:
+                    save_reasons.append(model_name + "の選定4頭が揃いません")
+        except Exception as preview_exc:
+            save_preview = None
+            save_reasons.append("保存データ生成失敗: " + str(preview_exc)[:180])
+        save_path = f"predictions/{date.year}/{r_key}.json"
+        if save_reasons:
+            st.warning("確定保存できない理由：" + "／".join(save_reasons))
+        save_status_key = "confirmed_save_status_" + r_key
+        if st.button("💾 旧AI・新AIの予想を同時に確定保存", key="save_" + r_key,
+                     disabled=bool(save_reasons)):
             try:
-                if put_record(path, rec):
-                    st.success("両モデルの予想を同時保存しました。")
+                if put_record(save_path, save_preview):
+                    stored, _ = get_record(save_path)
+                    if not stored or stored.get("race_id") != r_key or stored.get("models") != save_preview.get("models"):
+                        raise RuntimeError("GitHubへの保存後の読み戻し照合に失敗しました")
+                    st.session_state[save_status_key] = "保存・照合完了：" + str(stored.get("saved_at_utc", "")) + " UTC"
+                    st.success("旧AI・新AIの全頭指数、選定4頭、設定をGitHubに保存し、読み戻し確認しました。")
                 else:
-                    st.warning("このレースはすでに保存済みです。")
+                    stored, _ = get_record(save_path)
+                    if stored:
+                        st.session_state[save_status_key] = "既存の確定予想あり：" + str(stored.get("saved_at_utc", "")) + " UTC（上書きなし）"
+                    st.info("すでに確定予想が保存されています。発走前の記録を保護するため上書きしません。")
             except Exception as e:
-                st.error("保存失敗: " + str(e))
+                st.session_state[save_status_key] = "保存未確認：" + str(e)[:250]
+                st.error("保存失敗または保存確認不可：" + str(e))
+        if st.session_state.get(save_status_key):
+            st.caption("確定保存状態：" + st.session_state[save_status_key])
+        if st.button("🔎 GitHubの確定予想を照合", key="verify_saved_" + r_key):
+            try:
+                stored, _ = get_record(save_path)
+                if stored:
+                    st.success("保存確認済：" + str(stored.get("saved_at_utc", "")) + " UTC")
+                    st.caption("新AI指数 " + str(len(stored.get("models", {}).get("新AI", {}).get("scores", []))) +
+                               "頭／選定4頭 " + str(stored.get("models", {}).get("新AI", {}).get("top4", [])))
+                else:
+                    st.warning("GitHubに確定予想がありません。発走前であれば保存ボタンから登録してください。")
+            except Exception as exc:
+                st.error("保存確認失敗：" + str(exc)[:250])
         # Retrospective snapshots are deliberately isolated from pre-race history.
         # They never overwrite an existing prediction or affect official ROI.
         if r_key in results_dict:
