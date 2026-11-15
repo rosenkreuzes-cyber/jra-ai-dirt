@@ -11868,14 +11868,65 @@ def win_apply_snapshots_to_races(snapshots, races, entries):
 mobile_try_autorestore()
 all_loaded_races, load_errors, load_diagnostics = load_races_from_google_drive()
 
-# 同一曜日のDrive旧データより、直接取得データを必ず優先する。
-# 条件変更・画面再実行でもsession_stateを保持し、新セッションはGitHubから復元する。
-mobile_saved = st.session_state.get("mobile_scraped_races", [])
+# 日付別GitHubアーカイブを土曜・日曜それぞれ独立して復元する。
+# mobile_scraped_races は既存の取得・オッズ保存処理が使う「現在の1日分」のまま維持し、
+# 他曜日の復元は表示用の別キャッシュに格納する（既存の取得/計算/結果処理を変更しない）。
+def mobile_weekend_display_races():
+    current = st.session_state.get("mobile_scraped_races") or []
+    meta = st.session_state.get("mobile_scrape_meta") or {}
+    try:
+        anchor = datetime.date.fromisoformat(str(meta.get("date", ""))[:10])
+    except (ValueError, TypeError):
+        return list(current), []
+    # 土曜日を起点にすると、土曜を後から再取得しても翌日の日曜を失わない。
+    saturday = anchor - datetime.timedelta(days=(anchor.weekday() - 5) % 7)
+    if anchor.weekday() == 6:
+        saturday = anchor - datetime.timedelta(days=1)
+    sunday = saturday + datetime.timedelta(days=1)
+    wanted = ((saturday, "土曜日開催"), (sunday, "日曜日開催"))
+    cached = st.session_state.setdefault("_mobile_weekend_display_cache", {})
+    notices = []
+    output = []
+    for date, day_label in wanted:
+        date_key = date.isoformat()
+        if str(meta.get("date")) == date_key and current:
+            # 現在の取得結果が最優先。日付別キャッシュも最新状態に更新する。
+            output.extend(current)
+            cached[date_key] = {"races": current, "source": "現在の直接取得"}
+            continue
+        if date_key not in cached:
+            try:
+                saved = mobile_read_github(date)
+                if saved:
+                    races = saved.get("mobile_scraped_races") or []
+                    if not races or any(r.get("race_date") != date for r in races):
+                        raise ValueError("保存レースの開催日が一致しません")
+                    # ここでは既存の予想やオッズを再計算・変更しない。
+                    cached[date_key] = {"races": races, "source": "GitHub日付別保存"}
+                else:
+                    cached[date_key] = {"races": [], "source": "保存なし"}
+            except Exception as exc:
+                # 読み込みエラーを古いDriveデータで黙って隠さない。
+                notices.append(f"{date_key} のGitHub復元に失敗: {type(exc).__name__}: {exc}")
+                cached[date_key] = {"races": [], "source": "復元失敗"}
+        entry = cached[date_key]
+        if entry["races"]:
+            output.extend(entry["races"])
+            notices.append(f"{day_label} {date_key}: {len(entry['races'])}レースを{entry['source']}から復元")
+        elif entry["source"] == "保存なし":
+            notices.append(f"{day_label} {date_key}: GitHub日付別保存なし（Driveデータを使用）")
+    return output, notices
+
+# 同一曜日のDrive旧データより、日付別の直接取得データを必ず優先する。
+# 現在の取得データはsession_stateのまま維持し、もう一方の曜日は表示用だけ復元する。
+mobile_saved, mobile_restore_notices = mobile_weekend_display_races()
 if mobile_saved:
     mobile_days = {r.get("day_label") for r in mobile_saved}
     all_loaded_races = [r for r in all_loaded_races if r.get("day_label") not in mobile_days] + mobile_saved
-    load_diagnostics.append(f"スマホ直接取得：{len(mobile_saved)}ダートレース / "
-                            f"{st.session_state.get('mobile_scrape_meta',{}).get('fetched_at','')} JST")
+    load_diagnostics.extend(mobile_restore_notices)
+    load_diagnostics.append(f"直接取得の表示対象：{len(mobile_saved)}ダートレース（土日合計）")
+else:
+    load_diagnostics.extend(mobile_restore_notices)
 
 with st.sidebar.expander("📡 データ取得診断", expanded=bool(load_errors)):
     excluded_summary = summarize_history_exclusions(all_loaded_races)
