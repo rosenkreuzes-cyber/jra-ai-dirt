@@ -11903,7 +11903,11 @@ def win_apply_snapshots_to_races(snapshots, races, entries):
 
 # 予想計算に使うデータは、常に「最新の直接取得」をDriveより優先する。
 mobile_try_autorestore()
-all_loaded_races, load_errors, load_diagnostics = load_races_from_google_drive()
+if st.session_state.get("mobile_scraped_races"):
+    # 直接取得済みの場合は旧Driveを待たずに予想を表示する。
+    all_loaded_races, load_errors, load_diagnostics = [], [], ["直接取得済みデータを優先。Drive再取得を省略"]
+else:
+    all_loaded_races, load_errors, load_diagnostics = load_races_from_google_drive()
 
 # 同一曜日のDrive旧データより、直接取得データを必ず優先する。
 # 条件変更・画面再実行でもsession_stateを保持し、新セッションはGitHubから復元する。
@@ -12061,7 +12065,10 @@ def render_races(day, date):
     st.info(f"指数からの候補 {len(selected)} レース・除外 {len(excluded)} レース（購入確定ではありません）")
     
     try:
-        _, results_dict = read_all_history()
+        if st.session_state.get("history_load_requested", False):
+            _, results_dict = read_all_history()
+        else:
+            results_dict = {}
     except Exception as history_error:
         results_dict = st.session_state.get("last_good_history", ({}, {}))[1]
         st.warning("GitHub履歴の取得に失敗しました。前回取得済みの結果があれば参考表示します（最新ではない可能性があります）: " + str(history_error))
@@ -12920,6 +12927,7 @@ if st.button("📲 出走表＋過去成績＋ウマピア騎手を一括取得"
                 "⚠️ GitHubへの全データ保存に失敗。現セッションでは保持しますが、"
                 "ブラウザを閉じると復元できない可能性があります: " + str(save_exc)
             )
+        st.session_state["history_load_requested"] = False  # 予想表示を先に完了させる
         st.session_state["mobile_fetch_message"] = (
             f"【{mobile_selected_date:%Y/%m/%d}／取得版{MOBILE_FETCH_BUILD}】 "
             f"出走表取得：ダート{len(races)}レース・{len(entries)}頭・"
@@ -13400,6 +13408,14 @@ def result_can_fetch(key, prediction, races, now=None):
 going_restore_overrides(all_loaded_races)
 going_refresh_ui(all_loaded_races)
 
+# GitHub全履歴は大量の通信を伴うため、予想表示の初期描画から切り離す。
+if st.button("📚 GitHub確定予想・結果履歴を読み込む（結果登録・長期成績用）", key="load_history_explicit"):
+    st.session_state["history_load_requested"] = True
+    read_all_history.clear()
+if not st.session_state.get("history_load_requested", False):
+    st.caption("予想表示を優先しています。結果登録・長期成績のGitHub履歴は上のボタンで読み込みます。")
+
+
 st.checkbox("🔬 検証モード：推奨上限を解除して全候補を表示", key="show_all_for_validation")
 tab_labels = ["📅 土曜推奨", "📅 日曜推奨"]
 if special_date is not None:
@@ -13425,7 +13441,11 @@ with t3:
         read_all_history.clear()
         st.rerun()
     try:
-        predictions, results = read_all_history()
+        if not st.session_state.get("history_load_requested", False):
+            st.info("上部の『GitHub確定予想・結果履歴を読み込む』を押すと結果登録を表示します。")
+            predictions, results = {}, {}
+        else:
+            predictions, results = read_all_history()
         if not predictions:
             st.info("保存済みの予想がありません。")
         else:
@@ -13545,7 +13565,11 @@ with t3:
 with t4:
     st.subheader("長期成績：モデル別")
     try:
-        predictions, results = read_all_history()
+        if not st.session_state.get("history_load_requested", False):
+            st.info("上部の履歴読込ボタンを押すと長期成績を集計します。")
+            predictions, results = {}, {}
+        else:
+            predictions, results = read_all_history()
         records = []
         legacy_count = sum(1 for pred in predictions.values() if not pred.get("models") and len(pred.get("top4", [])) == 4)
         st.caption(f"旧形式の確定予想 {legacy_count}件を旧AIとして読み込みました（元のJSONは変更しません）。")
