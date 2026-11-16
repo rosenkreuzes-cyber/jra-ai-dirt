@@ -8906,7 +8906,12 @@ def yc_class_for_run(run,name):
 def yc_evaluate_run(run,name,target_date):
     """当日以前のJRAダート走に限り条件別・年次基準と比較。"""
     date=run.get('date')
-    if isinstance(date,datetime.datetime):date=date.date()
+    if isinstance(date,datetime.datetime):
+        date=date.date()
+    elif not isinstance(date,datetime.date):
+        # 保存済みの過去走は 'YYYY-MM-DD' の文字列で格納されることがある。
+        # 日付を評価時にだけ正規化し、元データは変更しない。
+        date=parse_prior_history_date(date) if date is not None else None
     if not isinstance(date,datetime.date):return None,'過去走日付不明'
     if not isinstance(target_date,datetime.date):return None,'今回の開催日不明'
     if date >= target_date:return None,'今回の開催日以降の成績'
@@ -12599,7 +12604,8 @@ def render_races(day, date):
                                     source_date=parse_prior_history_date(raw_text) if raw_text else None
                                     # この date は既存の採点で参照する値。再解析結果で上書きしない。
                                     normalized_date=(original_date.date() if isinstance(original_date,datetime.datetime)
-                                                     else original_date if isinstance(original_date,datetime.date) else None)
+                                                     else original_date if isinstance(original_date,datetime.date)
+                                                     else parse_prior_history_date(original_date) if original_date is not None else None)
                                     try:
                                         item,reason=yc_evaluate_run(run,score_horse.get('name',''),date)
                                         state='採用' if item else '不採用'
@@ -12651,6 +12657,7 @@ def render_races(day, date):
                                     '採点時採用（照合）':sum(x['採点時採用']=='採用' for x in run_trace),
                                     '監査再評価で採用':sum(x['監査再評価']=='採用' for x in run_trace),
                                     '採点時の保存済み採用件数':sum(len(x.get('year_clock_evidence') or []) for _,x in df.iterrows()),
+                                    '日付正規化成功（元は文字列）':sum(x['日付型']=='str' and x['変換後の日付']!='変換不可' for x in run_trace),
                                     '採点入力の日付が不正':sum(x['変換後の日付']=='変換不可' for x in run_trace),
                                     '元テキストから日付が読めるのに採点入力が不正':sum('採点入力のdateが日付型ではない' in x['日付の異常'] for x in run_trace)})
                                 st.dataframe(trace_df,hide_index=True,use_container_width=True)
