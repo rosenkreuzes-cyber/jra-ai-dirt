@@ -12132,10 +12132,16 @@ def render_races(day, date):
             if not v:return None
             return parse_prior_history_date(str(v))
         def _audit_surface_run(r):
-            d=_audit_key(r.get("距離"))
-            if re.search(r"(?:ダート|ダ)\\s*\\d{3,4}|\\d{3,4}\\s*(?:ダート|ダ)(?![一-龯])",d):
+            """生データの表記を既存の履歴変換器と同じ規則で解釈。"""
+            raw=_audit_key(r.get("距離"))
+            canonical=mobile_history_run_string(r) if r.get("日付") else ""
+            if re.search(r"(?<!\\d)\\d{3,4}\\s*ダ(?![一-龯])",canonical):
                 return "ダート"
-            if re.search(r"芝\\s*\\d{3,4}|\\d{3,4}\\s*芝",d):
+            if re.search(r"(?<!\\d)\\d{3,4}\\s*芝(?![一-龯])",canonical):
+                return "芝"
+            if re.search(r"(?:ダート|ダ)\\s*\\d{3,4}|\\d{3,4}\\s*(?:ダート|ダ)",raw):
+                return "ダート"
+            if re.search(r"芝\\s*\\d{3,4}|\\d{3,4}\\s*芝",raw):
                 return "芝"
             return "不明"
         by_id={}
@@ -12208,6 +12214,17 @@ def render_races(day, date):
             "画面表示レース馬":len(display_horses),
             "取得済みレースの結合ダート":sum(len(h.get("dirt_histories") or []) for _,h in mobile_horses),
             "画面表示レースの結合ダート":sum(len(h.get("dirt_histories") or []) for _,h in display_horses)})
+        if raw_runs:
+            distance_samples={}
+            for sample in raw_runs:
+                if not isinstance(sample,dict):continue
+                val=_audit_key(sample.get("距離"))
+                if val not in distance_samples:
+                    distance_samples[val]=_audit_surface_run(sample)
+                if len(distance_samples)>=25:break
+            st.markdown("**生履歴の距離表記（実データ例）**")
+            st.dataframe(pd.DataFrame([{"距離の原文":k,"判定":v} for k,v in distance_samples.items()]),
+                         hide_index=True,use_container_width=True)
         for heading,rows in (("取得済み出走表（同一データ群での直接照合）",mobile_rows),
                              ("画面表示レース（別データ群の可能性あり）",display_rows)):
             st.markdown("**"+heading+"**")
@@ -12545,8 +12562,110 @@ def render_races(day, date):
                                 run_rows.append({'馬番':num,'馬名':hr.get('name'),'履歴番号':None,
                                     '芝ダート区分':'履歴未取得・未保存（判定不能）',
                                     '中央地方区分':'不明','年次時計採用':'判定不能'})
+                            # 実際の新AI採点に渡された df の根拠を直接照合する。
+                            # 既存の評価関数を参照するだけで、馬・指数・保存データは変更しない。
+                            clock_audit=[]
+                            for _,score_horse in df.iterrows():
+                                raw_parsed=score_horse.get('dirt_histories')
+                                raw_parsed=raw_parsed if isinstance(raw_parsed,list) else []
+                                evidence=score_horse.get('year_clock_evidence')
+                                evidence=evidence if isinstance(evidence,list) else []
+                                clock_audit.append({
+                                    "馬番":score_horse.get("horse_no"),
+                                    "馬名":score_horse.get("name"),
+                                    "実採点指数":score_horse.get("ai_score"),
+                                    "時計スコア":score_horse.get("year_clock_time_score"),
+                                    "採点時ダート履歴数":len(raw_parsed),
+                                    "採点時時計採用数":len(evidence),
+                                    "厳密基準":score_horse.get("year_clock_primary_run_count"),
+                                    "代替基準":score_horse.get("year_clock_fallback_run_count"),
+                                    "時計不採用理由": " / ".join(map(str,score_horse.get("year_clock_unmatched_reasons") or [])),
+                                    "時計根拠なしの採点":("対象外（指数なし）" if score_horse.get("ai_score") is None else
+                                                      "要確認" if not evidence else "根拠あり")})
+                            st.markdown("**実際の新AI採点データ：年次補正時計の採用件数**")
+                            st.dataframe(pd.DataFrame(clock_audit),hide_index=True,use_container_width=True)
+                            st.markdown("**年次補正時計：採点関数へ渡した過去走を1走ずつ追跡**")
+                            run_trace=[]
+                            for _,score_horse in df.iterrows():
+                                hist=score_horse.get('dirt_histories')
+                                hist=hist if isinstance(hist,list) else []
+                                evidence=score_horse.get('year_clock_evidence')
+                                evidence=evidence if isinstance(evidence,list) else []
+                                for index,run in enumerate(hist,1):
+                                    if not isinstance(run,dict):
+                                        continue
+                                    raw_text=str(run.get('source_text') or '')
+                                    original_date=run.get('date')
+                                    source_date=parse_prior_history_date(raw_text) if raw_text else None
+                                    # この date は既存の採点で参照する値。再解析結果で上書きしない。
+                                    normalized_date=(original_date.date() if isinstance(original_date,datetime.datetime)
+                                                     else original_date if isinstance(original_date,datetime.date) else None)
+                                    try:
+                                        item,reason=yc_evaluate_run(run,score_horse.get('name',''),date)
+                                        state='採用' if item else '不採用'
+                                    except Exception as ex:
+                                        item=None
+                                        reason='診断側の評価例外: '+type(ex).__name__+': '+str(ex)[:120]
+                                        state='診断エラー'
+                                    # 採点時の保存済み採用結果と、監査再評価を区別。
+                                    def _match_evidence(ev):
+                                        return (str(ev.get('date'))==str(normalized_date) and
+                                                ev.get('course')==run.get('course') and
+                                                str(ev.get('distance'))==str(run.get('distance')))
+                                    actual_matches=[ev for ev in evidence if isinstance(ev,dict) and _match_evidence(ev)]
+                                    if not normalized_date and source_date:
+                                        problem='元テキストの日付は読めるが、採点入力のdateが日付型ではない'
+                                    elif not normalized_date and not source_date:
+                                        problem='元テキストからも日付を解析できない'
+                                    elif source_date and source_date!=normalized_date:
+                                        problem='元テキストと採点入力の日付が不一致'
+                                    else:
+                                        problem=''
+                                    run_trace.append({
+                                        '馬番':score_horse.get('horse_no'),
+                                        '馬名':score_horse.get('name'),
+                                        '履歴番号':index,
+                                        '元日付（採点入力）':str(original_date) if original_date is not None else 'なし',
+                                        '元テキストの日付':str(source_date or '取得不可'),
+                                        '変換後の日付':str(normalized_date or '変換不可'),
+                                        '日付型':type(original_date).__name__,
+                                        '競馬場':run.get('course') or '不明',
+                                        '距離m':run.get('distance'),
+                                        'クラス（入力）':run.get('class') or run.get('race_class') or '未収録',
+                                        '馬場':run.get('going') or '不明',
+                                        '時計秒':run.get('time'),
+                                        '着順':run.get('rank'),
+                                        '採点時採用':('採用' if actual_matches else '不採用'),
+                                        '監査再評価':state,
+                                        '不採用理由':str(reason or ''),
+                                        '採用時クラス':(item or {}).get('class') or (actual_matches[0].get('class') if actual_matches else ''),
+                                        '基準種別':(item or {}).get('reference_type') or '',
+                                        '基準レース数':(item or {}).get('reference_n'),
+                                        '時計指数':(item or {}).get('year_clock_score'),
+                                        '日付の異常':problem,
+                                        '元テキスト冒頭':raw_text[:160].replace('\\n',' / ')})
+                            if run_trace:
+                                trace_df=pd.DataFrame(run_trace)
+                                st.write({
+                                    '採点へ渡されたダート走':len(run_trace),
+                                    '採点時採用（照合）':sum(x['採点時採用']=='採用' for x in run_trace),
+                                    '監査再評価で採用':sum(x['監査再評価']=='採用' for x in run_trace),
+                                    '採点時の保存済み採用件数':sum(len(x.get('year_clock_evidence') or []) for _,x in df.iterrows()),
+                                    '採点入力の日付が不正':sum(x['変換後の日付']=='変換不可' for x in run_trace),
+                                    '元テキストから日付が読めるのに採点入力が不正':sum('採点入力のdateが日付型ではない' in x['日付の異常'] for x in run_trace)})
+                                st.dataframe(trace_df,hide_index=True,use_container_width=True)
+                                if sum(x['監査再評価']=='採用' for x in run_trace)!=sum(len(x.get('year_clock_evidence') or []) for _,x in df.iterrows()):
+                                    st.warning('採点時の保存済み採用件数と再評価の採用件数が異なります。診断表の元テキスト・日付・対象日を確認してください。')
+                                st.download_button('📥 年次時計・全過去走の追跡CSV',
+                                    data=trace_df.to_csv(index=False).encode('utf-8-sig'),
+                                    file_name='year_clock_run_trace.csv',mime='text/csv',
+                                    key=f'yearclock_trace_{race.get("race_id") or race.get("race_no")}_{date}')
+                            else:
+                                st.info('このレースの新AI採点入力にはダート過去走がありません。')
                             st.dataframe(pd.DataFrame(audit_rows),hide_index=True,use_container_width=True)
-                            st.caption("中央・地方の区分は競馬場名からの暫定判定です。非ダート走は件数のみ表示し、"
+                            st.caption("上の既存監査の芝ダート分類は馬に保存された監査用文字列を使います。"
+                                       "保存済み生履歴の全走区分は画面上部の『過去走直接照合』で確認してください。"
+                                       "中央・地方の区分は競馬場名からの暫定判定です。非ダート走は件数のみ表示し、"
                                        "この一覧では元の芝レース名・時計までは復元しません。"
                                        "過去走の詳細が未収録の場合は『不明』として扱ってください。")
                             if run_rows:
