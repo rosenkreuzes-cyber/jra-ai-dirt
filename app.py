@@ -14036,6 +14036,117 @@ with t3:
         st.error("履歴取得に失敗: " + str(e))
 
 with t4:
+    st.subheader("📊 指数順位・確定結果・3連複4頭BOX検証")
+    st.caption("保存済みの確定予想と確定結果だけを照合します。画面上で再計算した予想は混ぜません。"
+               "事後予想は正式検証から除外し、保存時点が発走前か確認できない履歴は参考扱いです。")
+    try:
+        val_predictions, val_results = read_all_history()
+        date_options = sorted({str(p.get('race_date')) for p in val_predictions.values()
+                               if p.get('race_date')}, reverse=True)
+        selected_dates = st.multiselect('検証対象開催日', date_options,
+                                       default=date_options[:2], key='validation_selected_dates')
+        if st.button('🔄 保存済みの予想・結果を再読込',key='validation_reload_history'):
+            read_all_history.clear()
+            st.rerun()
+        val_rows=[]
+        for val_id,val_pred in val_predictions.items():
+            if str(val_pred.get('race_date')) not in selected_dates:
+                continue
+            model=(val_pred.get('models') or {}).get('新AI')
+            if not isinstance(model,dict):
+                continue
+            score_rows=model.get('scores') or []
+            scored=[]
+            for score in score_rows:
+                if not isinstance(score,dict):continue
+                try:
+                    num=int(score.get('horse_no'))
+                    points=float(score.get('ai_score'))
+                    if np.isfinite(points):scored.append((num,points))
+                except (ValueError,TypeError):continue
+            scored.sort(key=lambda x:(-x[1],x[0]))
+            top4=[]
+            try:top4=[int(x) for x in model.get('top4',[])]
+            except (ValueError,TypeError):pass
+            val_result=val_results.get(val_id)
+            finish=[]
+            if val_result:
+                try:finish=[int(x) for x in val_result.get('top3',[])]
+                except (ValueError,TypeError):pass
+            valid_finish=len(finish)==3 and len(set(finish))==3
+            has_box=len(top4)==4 and len(set(top4))==4
+            unit=int(val_pred.get('bet_unit') or 100)
+            stake=unit*4 if has_box and valid_finish else None
+            hit=bool(valid_finish and has_box and set(finish).issubset(set(top4)))
+            paid=(int(val_result.get('trio_payout_100yen') or 0)*unit//100 if hit else 0) if valid_finish else None
+            saved=val_pred.get('saved_at_utc') or ''
+            retro_flag=('事後' in str(val_pred.get('classification') or '') or
+                        '事後' in str(val_pred.get('model_version') or ''))
+            val_rows.append({
+                'レースID':val_id,'日付':str(val_pred.get('race_date')),
+                '競馬場':val_pred.get('course'),'R':val_pred.get('race_no'),
+                'レース':val_pred.get('race_name'),
+                '指数上位4頭':','.join(str(n) for n,_ in scored[:4]) if len(scored)>=4 else '算出不足',
+                '保存BOX4頭':','.join(map(str,top4)) if has_box else '保存なし',
+                '指数1位':scored[0][0] if scored else None,
+                '指数上位3頭':set(n for n,_ in scored[:3]) if len(scored)>=3 else set(),
+                '指数上位4頭集合':set(n for n,_ in scored[:4]) if len(scored)>=4 else set(),
+                '確定1〜3着':','.join(map(str,finish)) if valid_finish else '未登録',
+                '指数1位3着内':int(scored[0][0] in finish) if valid_finish and scored else None,
+                '指数上位3頭捕捉':len(set(finish)&set(n for n,_ in scored[:3])) if valid_finish and len(scored)>=3 else None,
+                '指数上位4頭捕捉':len(set(finish)&set(n for n,_ in scored[:4])) if valid_finish and len(scored)>=4 else None,
+                'BOX的中':'的中' if hit else '不的中' if valid_finish and has_box else '未評価',
+                '投資額':stake,'払戻額':paid,'損益':paid-stake if stake is not None else None,
+                '払戻（100円）':val_result.get('trio_payout_100yen') if val_result else None,
+                '予想保存日時UTC':saved,'予想種別':'事後（除外）' if retro_flag else '保存済み（時点要確認）',
+                '結果状態':'確定' if valid_finish else '未登録',
+                'BOX対象':bool(model.get('eligible',True)) and has_box,
+            })
+        if not val_rows:
+            st.info('選択日の保存済み新AI予想がありません。予想を保存したレースだけが対象です。')
+        else:
+            val_df=pd.DataFrame(val_rows)
+            st.write({'保存済み新AI予想':len(val_df),
+                      '結果登録済み':int(val_df['結果状態'].eq('確定').sum()),
+                      '結果未登録':int(val_df['結果状態'].eq('未登録').sum()),
+                      '事後判定・除外':int(val_df['予想種別'].eq('事後（除外）').sum())})
+            eligible_df=val_df[(val_df['結果状態']=='確定') &
+                               (val_df['予想種別']!='事後（除外）')]
+            ranked=eligible_df[eligible_df['指数1位3着内'].notna()]
+            rank3=eligible_df[eligible_df['指数上位3頭捕捉'].notna()]
+            rank4=eligible_df[eligible_df['指数上位4頭捕捉'].notna()]
+            bought=eligible_df[(eligible_df['BOX対象']) & eligible_df['投資額'].notna()]
+            stake_total=int(bought['投資額'].sum())
+            paid_total=int(bought['払戻額'].sum())
+            st.markdown('**保存予想と確定結果の照合成績**')
+            st.write({
+                '指数1位3着内率':f"{ranked['指数1位3着内'].mean()*100:.1f}%（{len(ranked)}R）" if len(ranked) else '—',
+                '指数上位3頭の平均捕捉数':f"{rank3['指数上位3頭捕捉'].mean():.2f}頭（{len(rank3)}R）" if len(rank3) else '—',
+                '指数上位4頭の平均捕捉数':f"{rank4['指数上位4頭捕捉'].mean():.2f}頭（{len(rank4)}R）" if len(rank4) else '—',
+                'BOX購入対象':len(bought),
+                'BOX的中':int(bought['BOX的中'].eq('的中').sum()),
+                'BOX的中率':f"{bought['BOX的中'].eq('的中').mean()*100:.1f}%" if len(bought) else '—',
+                '投資総額':stake_total,'払戻総額':paid_total,
+                '回収率':f'{paid_total/stake_total*100:.1f}%' if stake_total else '—',
+                '損益':paid_total-stake_total})
+            columns=['日付','競馬場','R','レース','指数1位','指数上位4頭','保存BOX4頭',
+                     '確定1〜3着','指数1位3着内','指数上位3頭捕捉','指数上位4頭捕捉',
+                     'BOX的中','投資額','払戻額','損益','予想種別','予想保存日時UTC']
+            st.dataframe(val_df[columns],hide_index=True,use_container_width=True)
+            export=val_df.drop(columns=['指数上位3頭','指数上位4頭集合'])
+            st.download_button('📥 指数順位・結果・BOX検証CSV',
+                               export.to_csv(index=False).encode('utf-8-sig'),
+                               file_name='saved_prediction_result_validation.csv',mime='text/csv',
+                               key='saved_prediction_result_validation_csv')
+            if len(eligible_df)==0:
+                st.warning('確定結果と照合できる保存予想がありません。結果登録タブで確定結果を取得・保存してください。')
+            st.caption('3連複4頭BOXは4組×保存時の1組単価で計算。払戻は100円当たりの確定払戻から換算。'
+                       '予想保存日時は表示しますが、発走前保存かを自動保証しません。'
+                       '事後に取得した馬場情報を使った予想は、保存分類に明記されていない場合もあり、正式な事前検証から別途除外してください。')
+    except Exception as exc:
+        st.error('指数・結果照合の集計に失敗しました: '+type(exc).__name__+': '+str(exc)[:240])
+
+with t4:
     st.subheader("長期成績：モデル別")
     try:
         predictions, results = read_all_history()
