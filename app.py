@@ -12726,7 +12726,7 @@ def render_races(day, date):
                                 st.download_button('📥 全除外条件の監査CSV',
                                     gate_df.to_csv(index=False).encode('utf-8-sig'),
                                     file_name='yearclock_gate_audit.csv',mime='text/csv',
-                                    key=f'yearclock_gates_{race.get("race_id") or race.get("race_no")}_{date}')
+                                    key=f'yearclock_gates_{race.get("race_id") or race.get("race_no")}_{date}_{__import__('uuid').uuid4().hex}')
                             else:st.info('診断対象のダート過去走がありません。')
                             if run_trace:
                                 trace_df=pd.DataFrame(run_trace)
@@ -12744,7 +12744,7 @@ def render_races(day, date):
                                 st.download_button('📥 年次時計・全過去走の追跡CSV',
                                     data=trace_df.to_csv(index=False).encode('utf-8-sig'),
                                     file_name='year_clock_run_trace.csv',mime='text/csv',
-                                    key=f'yearclock_trace_{race.get("race_id") or race.get("race_no")}_{date}')
+                                    key=f'yearclock_trace_{race.get("race_id") or race.get("race_no")}_{date}_{__import__('uuid').uuid4().hex}')
                             else:
                                 st.info('このレースの新AI採点入力にはダート過去走がありません。')
                             st.dataframe(pd.DataFrame(audit_rows),hide_index=True,use_container_width=True)
