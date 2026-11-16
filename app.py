@@ -12650,6 +12650,81 @@ def render_races(day, date):
                                         '時計指数':(item or {}).get('year_clock_score'),
                                         '日付の異常':problem,
                                         '元テキスト冒頭':raw_text[:160].replace('\\n',' / ')})
+                            # 各ゲートの監査：本番関数は変更せず、同じ入力を段階別に診断する。
+                            gate_rows=[]
+                            for _,gh in df.iterrows():
+                                for gi,gr in enumerate(gh.get('dirt_histories') or [],1):
+                                    if not isinstance(gr,dict):continue
+                                    raw_date=gr.get('date')
+                                    converted=(raw_date.date() if isinstance(raw_date,datetime.datetime)
+                                               else raw_date if isinstance(raw_date,datetime.date)
+                                               else parse_prior_history_date(raw_date) if raw_date is not None else None)
+                                    target_ok=isinstance(date,datetime.date)
+                                    date_ok=isinstance(converted,datetime.date)
+                                    past_ok=bool(date_ok and target_ok and converted<date)
+                                    sec=gr.get('time')
+                                    try:sec_ok=sec is not None and bool(np.isfinite(float(sec)))
+                                    except (TypeError,ValueError):sec_ok=False
+                                    course=gr.get('course');dist=gr.get('distance');going=gr.get('going')
+                                    course_ok=course in YC_VENUES
+                                    try:dist_ok=bool(dist) and int(dist)>0
+                                    except (TypeError,ValueError):dist_ok=False
+                                    going_ok=going in YC_GOINGS
+                                    normalized_run=dict(gr)
+                                    if date_ok:normalized_run['date']=converted
+                                    cl=None;class_reason='先行条件不成立';ref=None
+                                    if past_ok and sec_ok and course_ok and dist_ok and going_ok:
+                                        try:cl,class_reason=yc_class_for_run(normalized_run,gh.get('name',''))
+                                        except Exception as ex:class_reason='クラス判定例外: '+type(ex).__name__
+                                        if cl:
+                                            try:ref=yc_clock_reference(converted.year,course,dist,going,cl)
+                                            except Exception:ref=None
+                                    try:
+                                        actual_item,actual_reason=yc_evaluate_run(gr,gh.get('name',''),date)
+                                    except Exception as ex:
+                                        actual_item=None;actual_reason='評価例外: '+type(ex).__name__
+                                    try:
+                                        normalized_item,normalized_reason=yc_evaluate_run(normalized_run,gh.get('name',''),date)
+                                    except Exception as ex:
+                                        normalized_item=None;normalized_reason='評価例外: '+type(ex).__name__
+                                    gate_rows.append({
+                                        '馬番':gh.get('horse_no'),'馬名':gh.get('name'),'走':gi,
+                                        '元日付':str(raw_date),'日付型':type(raw_date).__name__,
+                                        '変換後日付':str(converted or '不可'),
+                                        '対象日前':past_ok,'実時計有効':sec_ok,
+                                        '競馬場原文':str(course),'JRA競馬場一致':course_ok,
+                                        '距離原文':str(dist),'距離有効':dist_ok,
+                                        '馬場原文':str(going),'馬場一致':going_ok,
+                                        'クラス判定':cl or '不可','クラス根拠':class_reason,
+                                        '同条件基準件数':ref.get('n') if ref else 0,
+                                        '本番関数の採否':'採用' if actual_item else '不採用',
+                                        '本番関数の理由':actual_reason or '',
+                                        '日付をコピー上だけ正規化した採否':'採用' if normalized_item else '不採用',
+                                        'コピー正規化時の理由':normalized_reason or '',
+                                        '日付型がクラス判定に影響':bool(normalized_item and not actual_item) or
+                                            (actual_reason!=normalized_reason)})
+                            st.markdown("**年次時計の全除外ゲート監査（採点ロジックは変更なし）**")
+                            if gate_rows:
+                                gate_df=pd.DataFrame(gate_rows)
+                                st.write({
+                                    '監査したダート走':len(gate_rows),
+                                    '日付変換成功':int(gate_df['変換後日付'].ne('不可').sum()),
+                                    '対象日前':int(gate_df['対象日前'].sum()),
+                                    '実時計有効':int(gate_df['実時計有効'].sum()),
+                                    'JRA競馬場一致':int(gate_df['JRA競馬場一致'].sum()),
+                                    '距離有効':int(gate_df['距離有効'].sum()),
+                                    '馬場一致':int(gate_df['馬場一致'].sum()),
+                                    'クラス判定可':int(gate_df['クラス判定'].ne('不可').sum()),
+                                    '同条件基準あり':int(gate_df['同条件基準件数'].gt(0).sum()),
+                                    '本番関数採用':int(gate_df['本番関数の採否'].eq('採用').sum()),
+                                    'コピー日付正規化後採用':int(gate_df['日付をコピー上だけ正規化した採否'].eq('採用').sum()),
+                                    '日付型による判定差':int(gate_df['日付型がクラス判定に影響'].sum())})
+                                st.dataframe(gate_df,hide_index=True,use_container_width=True)
+                                st.download_button('📥 全除外条件の監査CSV',
+                                    gate_df.to_csv(index=False).encode('utf-8-sig'),
+                                    file_name='yearclock_gate_audit.csv',mime='text/csv',
+                                    key=f'yearclock_gates_{race.get("race_id") or race.get("race_no")}_{date}')
+                            else:st.info('診断対象のダート過去走がありません。')
                             if run_trace:
                                 trace_df=pd.DataFrame(run_trace)
                                 st.write({
