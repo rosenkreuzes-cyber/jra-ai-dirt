@@ -11339,7 +11339,10 @@ def dual_snapshot(date, race, evaluations, settings):
             top = []
         models[label] = {"top4": top, "eligible": ev["metrics"] is not None,
                          "metrics": ev["metrics"], "reason": ev["reason"],
-                         "scores": [{"horse_no": int(r["horse_no"]), "ai_score": float(r["ai_score"]) if pd.notna(r["ai_score"]) else None}
+                         "scores": [{"horse_no": int(r["horse_no"]),
+                                     "ai_score": float(r["ai_score"]) if pd.notna(r["ai_score"]) else None,
+                                     "pop_rank": int(r["pop_rank"]) if pd.notna(pd.to_numeric(r.get("pop_rank"),errors="coerce")) and float(r["pop_rank"]).is_integer() and 1 <= float(r["pop_rank"]) <= 18 else None,
+                                     "win_odds": float(r["odds"]) if pd.notna(pd.to_numeric(r.get("odds"),errors="coerce")) else None}
                                     for _, r in df.iterrows()]}
     # 新AIの時計不足を旧AI4頭で補填して購入対象にしない。
     primary = models["新AI"]
@@ -14129,6 +14132,106 @@ with t4:
                 '投資総額':stake_total,'払戻総額':paid_total,
                 '回収率':f'{paid_total/stake_total*100:.1f}%' if stake_total else '—',
                 '損益':paid_total-stake_total})
+            # 同一レース・同一確定結果の比較。人気は予想保存時の順位のみ使用。
+            # 過去の保存JSONに人気がなければ事後データで補完しない。
+            comparison_rows=[]
+            comparison_missing=[]
+            for cid,cpred in val_predictions.items():
+                if str(cpred.get('race_date')) not in selected_dates:
+                    continue
+                cm=(cpred.get('models') or {}).get('新AI')
+                cr=val_results.get(cid)
+                if not isinstance(cm,dict) or not isinstance(cr,dict):
+                    continue
+                if '事後' in str(cpred.get('classification') or '') or '事後' in str(cpred.get('model_version') or ''):
+                    continue
+                try:
+                    finish_nums=[int(x) for x in cr.get('top3',[])]
+                    if len(finish_nums)!=3 or len(set(finish_nums))!=3:continue
+                except (ValueError,TypeError):
+                    continue
+                rows=cm.get('scores') or []
+                ai=[]
+                popular=[]
+                for sr in rows:
+                    if not isinstance(sr,dict):continue
+                    try:
+                        n=int(sr['horse_no'])
+                        v=float(sr.get('ai_score'))
+                        if np.isfinite(v):ai.append((n,v))
+                    except (ValueError,TypeError,KeyError):pass
+                    try:
+                        n=int(sr['horse_no'])
+                        rank=float(sr.get('pop_rank'))
+                        if np.isfinite(rank) and rank.is_integer() and 1<=rank<=18:
+                            popular.append((n,int(rank)))
+                    except (ValueError,TypeError,KeyError):pass
+                ai.sort(key=lambda x:(-x[1],x[0]))
+                popular.sort(key=lambda x:(x[1],x[0]))
+                # 1～4番人気が重複・欠落していれば、同条件比較から除外。
+                if len(ai)<4 or len(popular)<4 or [r for _,r in popular[:4]]!=[1,2,3,4]:
+                    comparison_missing.append({
+                        '日付':cpred.get('race_date'),'競馬場':cpred.get('course'),
+                        'R':cpred.get('race_no'),'レースID':cid,
+                        '理由':'保存時の人気1～4位が欠落・重複' if len(ai)>=4 else '保存済み指数が4頭未満',
+                        '保存人気件数':len(popular)})
+                    continue
+                ai4=[n for n,_ in ai[:4]]
+                pop4=[n for n,_ in popular[:4]]
+                actual=set(finish_nums)
+                unit=int(cpred.get('bet_unit') or 100)
+                payout100=int(cr.get('trio_payout_100yen') or 0)
+                ai_hit=actual.issubset(set(ai4))
+                pop_hit=actual.issubset(set(pop4))
+                comparison_rows.append({
+                    '日付':cpred.get('race_date'),'競馬場':cpred.get('course'),
+                    'R':cpred.get('race_no'),'レースID':cid,
+                    '新AI上位4頭':','.join(map(str,ai4)),
+                    '人気上位4頭':','.join(map(str,pop4)),
+                    '確定1～3着':','.join(map(str,finish_nums)),
+                    '新AI捕捉数':len(actual&set(ai4)),
+                    '人気捕捉数':len(actual&set(pop4)),
+                    '新AI的中':int(ai_hit),'人気的中':int(pop_hit),
+                    '新AI投資':4*unit,'人気投資':4*unit,
+                    '新AI払戻':payout100*unit//100 if ai_hit else 0,
+                    '人気払戻':payout100*unit//100 if pop_hit else 0,
+                    '予想保存日時UTC':cpred.get('saved_at_utc') or '',
+                    '予想バージョン':cpred.get('model_version') or ''})
+            st.divider()
+            st.markdown('**⚖️ 同一レース比較：新AI上位4頭 vs 保存時人気上位4頭**')
+            st.caption('双方の4頭が揃う同じ確定レースのみを対象に、各4組を同額購入した仮定で比較。'
+                       '人気順位は発走前の予想保存JSONからのみ取得し、結果確定後の人気を流用しません。'
+                       '過去に保存したJSONへ人気順位がなければ比較対象外です。'
+                       '事後予想を示す保存分類は除外しますが、保存時刻が発走前であることの自動保証はありません。')
+            st.write({'同条件比較可能':len(comparison_rows),
+                      '保存人気不足などで除外':len(comparison_missing)})
+            if comparison_rows:
+                compare_df=pd.DataFrame(comparison_rows)
+                def _compare_stats(prefix):
+                    n=len(compare_df)
+                    investment=int(compare_df[prefix+'投資'].sum())
+                    payout=int(compare_df[prefix+'払戻'].sum())
+                    return {'方式':prefix,'対象レース':n,
+                            '平均捕捉数':round(float(compare_df[prefix+'捕捉数'].mean()),2),
+                            'BOX的中':int(compare_df[prefix+'的中'].sum()),
+                            'BOX的中率':f"{compare_df[prefix+'的中'].mean()*100:.1f}%",
+                            '投資額':investment,'払戻額':payout,
+                            '回収率':f"{payout/investment*100:.1f}%" if investment else '—',
+                            '損益':payout-investment}
+                st.dataframe(pd.DataFrame([_compare_stats('新AI'),_compare_stats('人気')]),
+                             hide_index=True,use_container_width=True)
+                st.dataframe(compare_df,hide_index=True,use_container_width=True)
+                st.download_button('📥 新AI対人気・同条件比較CSV',
+                    compare_df.to_csv(index=False).encode('utf-8-sig'),
+                    file_name='ai_vs_popularity_same_races.csv',mime='text/csv',
+                    key='validation_ai_vs_popularity_csv')
+            else:
+                st.info('保存時の人気1～4位が揃った予想がありません。'
+                        '今回から新規保存する予想には単勝人気順位も記録します。'
+                        '過去47件の人気順位を事後データで埋めることはしません。')
+            if comparison_missing:
+                with st.expander('人気順位不足などで比較対象外のレース'):
+                    st.dataframe(pd.DataFrame(comparison_missing),hide_index=True,use_container_width=True)
             columns=['日付','競馬場','R','レース','指数1位','指数上位4頭','保存BOX4頭',
                      '確定1〜3着','指数1位3着内','指数上位3頭捕捉','指数上位4頭捕捉',
                      'BOX的中','投資額','払戻額','損益','予想種別','予想保存日時UTC']
