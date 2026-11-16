@@ -8918,7 +8918,10 @@ def yc_evaluate_run(run,name,target_date):
     sec=run.get('time'); dist=run.get('distance');going=run.get('going');course=run.get('course')
     if sec is None or not np.isfinite(sec):return None,'過去走の実時計不明'
     if not dist or course not in YC_VENUES or going not in YC_GOINGS:return None,'コース・距離・馬場状態の不足'
-    cl,origin=yc_class_for_run(run,name)
+    # 保存データは文字列日付のまま維持し、クラス照合に渡す走歴だけ正規化する。
+    # yc_class_for_run は date 型を要求するため、ここを通さないと全走が除外される。
+    class_run=run if isinstance(run.get('date'),datetime.date) else dict(run,date=date)
+    cl,origin=yc_class_for_run(class_run,name)
     if cl is None:return None,origin
     ref=yc_clock_reference(date.year,course,dist,going,cl)
     if ref is None:return None,'同条件の対象年より前の参照が4レース未満（代替基準も不適合）'
