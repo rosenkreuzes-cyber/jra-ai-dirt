@@ -14232,6 +14232,119 @@ with t4:
             if comparison_missing:
                 with st.expander('人気順位不足などで比較対象外のレース'):
                     st.dataframe(pd.DataFrame(comparison_missing),hide_index=True,use_container_width=True)
+            # 保存された43件の「本当に何があるか」を読み取り専用で診断する。
+            # JSONの存在/値を直接確認。画面の最新オッズを過去予想へ書き戻さない。
+            with st.expander('🔎 保存予想の人気・単勝オッズ実在診断（読み取り専用）', expanded=True):
+                st.caption('GitHubに保存済みの予想JSONの全馬scoresを直接調査します。'
+                           '人気・オッズの「キーあり」「有効値あり」を分けて数えます。'
+                           '結果登録済みのレースを対象とし、保存ファイルは変更しません。')
+                def _diag_num(value, kind):
+                    if value is None or isinstance(value,bool):return None
+                    try:
+                        v=float(str(value).strip().replace(',','').replace('倍',''))
+                        if not np.isfinite(v):return None
+                        if kind=='rank':
+                            return int(v) if v.is_integer() and 1<=v<=18 else None
+                        return v if v>0 else None
+                    except (ValueError,TypeError):return None
+                diag_rows=[]
+                field_rows=[]
+                for did,dp in sorted(val_predictions.items()):
+                    if str(dp.get('race_date')) not in selected_dates or did not in val_results:
+                        continue
+                    dm=(dp.get('models') or {}).get('新AI')
+                    if not isinstance(dm,dict):continue
+                    ds=dm.get('scores') or []
+                    if not isinstance(ds,list):ds=[]
+                    pop_keys=('pop_rank','人気','popularity','popularity_rank','rank')
+                    odds_keys=('win_odds','odds','オッズ','単勝オッズ','単勝')
+                    rank_key_horses=sum(isinstance(x,dict) and any(k in x for k in pop_keys) for x in ds)
+                    odds_key_horses=sum(isinstance(x,dict) and any(k in x for k in odds_keys) for x in ds)
+                    ranks={}
+                    odds={}
+                    rank_samples=[]
+                    odds_samples=[]
+                    for x in ds:
+                        if not isinstance(x,dict):continue
+                        try:n=int(x.get('horse_no'))
+                        except (ValueError,TypeError):continue
+                        for k in pop_keys:
+                            if k in x:
+                                v=_diag_num(x.get(k),'rank')
+                                if v is not None:
+                                    ranks[n]=v
+                                    if len(rank_samples)<5:rank_samples.append(f'{n}番:{v}位({k})')
+                                    break
+                        for k in odds_keys:
+                            if k in x:
+                                v=_diag_num(x.get(k),'odds')
+                                if v is not None:
+                                    odds[n]=v
+                                    if len(odds_samples)<5:odds_samples.append(f'{n}番:{v:g}倍({k})')
+                                    break
+                    top_rank4=[n for n,r in ranks.items() if r in (1,2,3,4)]
+                    exact4=(len(top_rank4)==4 and sorted(ranks[n] for n in top_rank4)==[1,2,3,4])
+                    # 同一開催日・競馬場・Rの現在ロード中のレース情報は別経路として存在のみ確認。
+                    # 時点不明のため過去人気の代替には使わない。
+                    matching=[]
+                    for loaded in all_loaded_races:
+                        try:
+                            ld=loaded.get('race_date')
+                            ld=ld.isoformat() if hasattr(ld,'isoformat') else str(ld)
+                            if (ld==str(dp.get('race_date')) and
+                                str(loaded.get('course'))==str(dp.get('course')) and
+                                int(loaded.get('race_no'))==int(dp.get('race_no'))):
+                                matching.append(loaded)
+                        except (ValueError,TypeError):pass
+                    other_fields=[k for k in dp.keys() if any(t in str(k).lower() for t in
+                                  ('odds','pop','人気','オッズ','entry','horse','snapshot','source'))]
+                    other_model_fields=[k for k in dm.keys() if any(t in str(k).lower() for t in
+                                        ('odds','pop','人気','オッズ','entry','horse','snapshot','source'))]
+                    state=('保存人気1～4位が揃う' if exact4 else
+                           '人気の一部あり' if ranks else
+                           '人気キーのみ・有効値なし' if rank_key_horses else '人気キーなし')
+                    diag_rows.append({
+                        '日付':dp.get('race_date'),'競馬場':dp.get('course'),
+                        'R':dp.get('race_no'),'レースID':did,
+                        '保存馬数':len(ds),
+                        '人気キーあり馬数':rank_key_horses,
+                        '有効人気馬数':len(ranks),
+                        '人気1～4位完全': 'はい' if exact4 else 'いいえ',
+                        'オッズキーあり馬数':odds_key_horses,
+                        '有効オッズ馬数':len(odds),
+                        '保存状態':state,
+                        '人気の実値例': ' / '.join(rank_samples),
+                        '単勝オッズ実値例':' / '.join(odds_samples),
+                        '保存時刻UTC':dp.get('saved_at_utc') or '',
+                        '保存モデル版':dp.get('model_version') or '',
+                        '現在読込レース一致数':len(matching),
+                        '予想トップ階層の関連キー':','.join(map(str,other_fields)),
+                        '新AIモデルの関連キー':','.join(map(str,other_model_fields)),
+                        'scoresの実際のキー一覧':','.join(sorted({str(k) for x in ds if isinstance(x,dict) for k in x.keys()}))
+                    })
+                    field_rows.append({'レースID':did,'状態':state,'保存人気の馬番→順位':str(ranks),
+                                       '保存単勝の馬番→オッズ':str(odds)})
+                if diag_rows:
+                    dd=pd.DataFrame(diag_rows)
+                    st.write({
+                        '診断対象・結果登録済み':len(dd),
+                        '保存人気1～4位が揃う':int(dd['人気1～4位完全'].eq('はい').sum()),
+                        '保存人気が一部でもある':int(dd['有効人気馬数'].gt(0).sum()),
+                        '保存単勝オッズが一部でもある':int(dd['有効オッズ馬数'].gt(0).sum()),
+                        '人気キーなし':int(dd['保存状態'].eq('人気キーなし').sum()),
+                        '現在読込レースが一致':int(dd['現在読込レース一致数'].gt(0).sum())
+                    })
+                    st.dataframe(dd,hide_index=True,use_container_width=True)
+                    st.download_button('📥 保存人気・単勝オッズ診断CSV',
+                        dd.to_csv(index=False).encode('utf-8-sig'),
+                        file_name='saved_popularity_odds_diagnostic.csv',mime='text/csv',
+                        key='saved_popularity_odds_diagnostic_csv')
+                    with st.expander('馬番ごとの保存値（詳細）'):
+                        st.dataframe(pd.DataFrame(field_rows),hide_index=True,use_container_width=True)
+                    st.caption('「現在読込レース一致」は同じ開催日の出走表が手元にあるという意味だけです。'
+                               'その人気・オッズが予想保存時点の値であることは保証されません。')
+                else:
+                    st.info('選択日の結果登録済み新AI保存予想がありません。')
             columns=['日付','競馬場','R','レース','指数1位','指数上位4頭','保存BOX4頭',
                      '確定1〜3着','指数1位3着内','指数上位3頭捕捉','指数上位4頭捕捉',
                      'BOX的中','投資額','払戻額','損益','予想種別','予想保存日時UTC']
