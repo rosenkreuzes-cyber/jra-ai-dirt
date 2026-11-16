@@ -12112,79 +12112,127 @@ def render_races(day, date):
     # The original records in GitHub are not modified by this filter.
     source_races = [r for r in all_loaded_races if r.get("day_label") == day]
     mismatches = [r for r in source_races if r.get("race_date") != date]
-    # 保存済み過去走の経路監査。取得・再計算・保存処理は変更しない。
-    with st.expander("🔬 保存済み過去走｜読込→日付→馬場区分→時計採用の経路診断", expanded=False):
-        st.caption("診断専用です。取得・予想・指数・順位・買い目・保存内容は変更しません。"
-                   "「保存済み件数」は画面に読み込まれた保存データを意味し、GitHub上の全件数を保証しません。")
-        def _audit_date(value):
-            if isinstance(value, datetime.datetime):return value.date()
-            if isinstance(value, datetime.date):return value
-            if value is None:return None
-            return parse_prior_history_date(str(value))
-        def _audit_surface(value):
-            txt=clean_text(value)
-            if re.search(r"(?:ダート|ダ)\\s*\\d{3,4}|\\d{3,4}\\s*(?:ダート|ダ)",txt):
+    # 保存済みの生履歴と馬に結合済みのダート履歴を、馬IDを優先して直接照合する。
+    # 監査専用：データ・指数・順位・保存先を一切変更しない。
+    with st.expander("🔬 過去走直接照合｜保存1,842件と馬別ダート431件", expanded=False):
+        st.caption("取得済み生履歴（セッション）と各馬のパース済ダートを比較します。"
+                   "出走表121件と表示馬134頭は対象範囲が異なる可能性があるため、別集計します。"
+                   "この診断では取得・採点・保存は行いません。")
+        raw_entries=st.session_state.get("mobile_entries") or []
+        raw_runs=st.session_state.get("mobile_histories") or []
+        saved_races=st.session_state.get("mobile_scraped_races") or []
+        if not isinstance(raw_entries,list):raw_entries=[]
+        if not isinstance(raw_runs,list):raw_runs=[]
+        if not isinstance(saved_races,list):saved_races=[]
+        def _audit_key(v):
+            return unicodedata.normalize("NFKC",str(v or "")).strip()
+        def _audit_day(v):
+            if isinstance(v,datetime.datetime):return v.date()
+            if isinstance(v,datetime.date):return v
+            if not v:return None
+            return parse_prior_history_date(str(v))
+        def _audit_surface_run(r):
+            d=_audit_key(r.get("距離"))
+            if re.search(r"(?:ダート|ダ)\\s*\\d{3,4}|\\d{3,4}\\s*(?:ダート|ダ)(?![一-龯])",d):
                 return "ダート"
-            if re.search(r"芝\\s*\\d{3,4}|\\d{3,4}\\s*芝",txt):
+            if re.search(r"芝\\s*\\d{3,4}|\\d{3,4}\\s*芝",d):
                 return "芝"
             return "不明"
-        # セッション内の生データは履歴が別配列に保存される場合があるため、別に確認する。
-        raw_entries=st.session_state.get("mobile_entries") or st.session_state.get("mobile_scraped_entries") or []
-        raw_runs=st.session_state.get("mobile_histories") or st.session_state.get("mobile_scraped_histories") or []
-        st.write({"表示対象レース数":len(source_races),
-                  "表示対象馬数":sum(len(r.get("horses") or []) for r in source_races),
-                  "セッション出走表件数":len(raw_entries) if isinstance(raw_entries,list) else "型不一致",
-                  "セッション過去走件数":len(raw_runs) if isinstance(raw_runs,list) else "型不一致"})
-        route_rows=[]
-        sample_rows=[]
-        for ar in source_races:
-            for ah in ar.get("horses") or []:
-                texts=ah.get("audit_all_history_texts")
-                parsed=ah.get("dirt_histories")
-                texts=texts if isinstance(texts,list) else []
+        by_id={}
+        for r in raw_runs:
+            if not isinstance(r,dict):continue
+            hid=_audit_key(r.get("馬ID"))
+            if hid:by_id.setdefault(hid,[]).append(r)
+        entry_by_id={}
+        entry_by_name={}
+        for e in raw_entries:
+            if not isinstance(e,dict):continue
+            hid=_audit_key(e.get("馬ID"))
+            if hid:entry_by_id[hid]=e
+            name=_audit_key(e.get("馬名"))
+            if name:entry_by_name.setdefault(name,[]).append(e)
+        mobile_horses=[(r,h) for r in saved_races for h in (r.get("horses") or [])]
+        display_horses=[(r,h) for r in source_races for h in (r.get("horses") or [])]
+        def _audit_rows(pairs,group):
+            output=[]
+            examples=[]
+            for race,h in pairs:
+                hid=_audit_key(h.get("horse_id") or h.get("馬ID"))
+                name=_audit_key(h.get("name") or h.get("馬名"))
+                candidates=entry_by_name.get(name,[])
+                if not hid and len(candidates)==1:
+                    hid=_audit_key(candidates[0].get("馬ID"))
+                raw=by_id.get(hid,[]) if hid else []
+                cutoff=race.get("race_date")
+                if isinstance(cutoff,datetime.datetime):cutoff=cutoff.date()
+                if not isinstance(cutoff,datetime.date):cutoff=None
+                before=[x for x in raw if _audit_day(x.get("日付")) and
+                        (cutoff is None or _audit_day(x.get("日付"))<cutoff)]
+                latest=sorted(before,key=lambda x:_audit_day(x.get("日付")),reverse=True)[:4]
+                raw_dirt=[x for x in latest if _audit_surface_run(x)=="ダート"]
+                parsed=h.get("dirt_histories")
                 parsed=parsed if isinstance(parsed,list) else []
-                parsed_dates=[_audit_date(x.get("date")) for x in parsed if isinstance(x,dict)]
-                raw_dates=[_audit_date(t) for t in texts]
-                surfaces=[_audit_surface(t) for t in texts]
-                accepted=ah.get("year_clock_evidence") or []
-                # 採点はコピーで実行されるため、元の馬辞書には根拠がない場合がある。
-                route_rows.append({"競馬場":ar.get("course"),"R":ar.get("race_no"),
-                    "馬番":ah.get("horse_no"),"馬名":ah.get("name"),
-                    "元履歴文字列":len(texts),"日付判定可":sum(x is not None for x in raw_dates),
-                    "日付判定不可":sum(x is None for x in raw_dates),
-                    "芝":surfaces.count("芝"),"ダート":surfaces.count("ダート"),
-                    "区分不明":surfaces.count("不明"),
-                    "パース済ダート":len(parsed),
-                    "パース済日付可":sum(x is not None for x in parsed_dates),
-                    "時計根拠（元馬辞書）":len(accepted),
-                    "履歴数フィールド":ah.get("history_count"),
-                    "ダート数フィールド":ah.get("dirt_runs"),
-                    "保存済み履歴の型":type(ah.get("audit_all_history_texts")).__name__,
-                    "馬データキー（先頭）":", ".join(list(ah.keys())[:12])})
-                for i,t in enumerate(texts[:4],1):
-                    sample_rows.append({"競馬場":ar.get("course"),"R":ar.get("race_no"),
-                        "馬番":ah.get("horse_no"),"馬名":ah.get("name"),
-                        "履歴順":i,"日付判定":str(_audit_date(t) or "不明"),
-                        "芝ダート":_audit_surface(t),
-                        "元履歴先頭":clean_text(t).replace("\\n"," / ")[:220]})
-        if route_rows:
-            route_df=pd.DataFrame(route_rows)
-            st.dataframe(route_df,hide_index=True,use_container_width=True)
-            st.write({"元履歴総件数":int(route_df["元履歴文字列"].sum()),
-                "日付判定可":int(route_df["日付判定可"].sum()),
-                "日付判定不可":int(route_df["日付判定不可"].sum()),
-                "パース済ダート総数":int(route_df["パース済ダート"].sum()),
-                "元履歴0件の馬":int((route_df["元履歴文字列"]==0).sum())})
-            if not route_df["元履歴文字列"].sum():
-                st.error("表示レースの馬辞書に過去走文字列がありません。"
-                         "GitHub保存済み履歴の有無ではなく、復元→馬辞書への結合経路を調べる必要があります。")
-            elif route_df["日付判定可"].sum()==0:
-                st.error("履歴文字列はありますが、日付を一件も解析できていません。日付形式を確認してください。")
-        if sample_rows:
-            st.markdown("**元履歴の実例（各馬最大4走）**")
-            st.dataframe(pd.DataFrame(sample_rows),hide_index=True,use_container_width=True)
-        else:
-            st.info("元履歴の実例がありません。履歴が保存されていないか、表示馬に結合されていません。")
+                parsed_dates=sum(bool(_audit_day(x.get("date"))) for x in parsed if isinstance(x,dict))
+                # 生履歴→既存パーサーを監査目的だけで適用（元辞書は変更しない）。
+                replay=[parse_dirt_run(mobile_history_run_string(x)) for x in latest]
+                replay=[x for x in replay if x]
+                def _fingerprint(x):
+                    return (str(x.get("date") or ""),_audit_key(x.get("course")),
+                            str(x.get("distance") or ""))
+                parsed_set={_fingerprint(x) for x in parsed if isinstance(x,dict)}
+                replay_set={_fingerprint(x) for x in replay if isinstance(x,dict)}
+                if not hid:status="馬ID未照合"
+                elif not raw:status="生履歴なし"
+                elif parsed_set==replay_set:status="照合一致"
+                else:status="照合不一致"
+                output.append({"対象":group,"競馬場":race.get("course"),"R":race.get("race_no"),
+                    "馬番":h.get("horse_no"),"馬名":name,"馬ID":hid or "未照合",
+                    "生履歴全件":len(raw),"発走前履歴":len(before),"直近4走":len(latest),
+                    "直近4走芝":sum(_audit_surface_run(x)=="芝" for x in latest),
+                    "直近4走ダート":len(raw_dirt),
+                    "直近4走不明":sum(_audit_surface_run(x)=="不明" for x in latest),
+                    "再パース済ダート":len(replay),"馬に結合済ダート":len(parsed),
+                    "結合済日付有効":parsed_dates,"照合結果":status,
+                    "時計根拠（元馬辞書）":len(h.get("year_clock_evidence") or [])})
+                if len(examples)<30 and (status!="照合一致" or name in ("アルスマグナ","ソリッドベーシス")):
+                    for x in latest[:4]:
+                        examples.append({"対象":group,"馬名":name,"馬ID":hid,
+                            "生履歴日付":x.get("日付"),"開催":x.get("開催"),
+                            "距離":x.get("距離"),"着順":x.get("着順"),
+                            "区分":_audit_surface_run(x)})
+            return output,examples
+        mobile_rows,mobile_examples=_audit_rows(mobile_horses,"取得済み出走表")
+        display_rows,display_examples=_audit_rows(display_horses,"画面表示レース")
+        st.write({"セッション生履歴":len(raw_runs),"生履歴に馬IDあり":sum(bool(_audit_key(x.get("馬ID"))) for x in raw_runs if isinstance(x,dict)),
+            "セッション出走表":len(raw_entries),"取得済みレース馬":len(mobile_horses),
+            "画面表示レース馬":len(display_horses),
+            "取得済みレースの結合ダート":sum(len(h.get("dirt_histories") or []) for _,h in mobile_horses),
+            "画面表示レースの結合ダート":sum(len(h.get("dirt_histories") or []) for _,h in display_horses)})
+        for heading,rows in (("取得済み出走表（同一データ群での直接照合）",mobile_rows),
+                             ("画面表示レース（別データ群の可能性あり）",display_rows)):
+            st.markdown("**"+heading+"**")
+            if rows:
+                rdf=pd.DataFrame(rows)
+                st.write({"対象馬数":len(rows),
+                    "馬ID照合可能":int((rdf["馬ID"]!="未照合").sum()),
+                    "生履歴全件（馬ごと合算）":int(rdf["生履歴全件"].sum()),
+                    "直近4走ダート":int(rdf["直近4走ダート"].sum()),
+                    "再パース済ダート":int(rdf["再パース済ダート"].sum()),
+                    "結合済ダート":int(rdf["馬に結合済ダート"].sum()),
+                    "照合一致":int((rdf["照合結果"]=="照合一致").sum()),
+                    "照合不一致":int((rdf["照合結果"]=="照合不一致").sum()),
+                    "馬ID未照合":int((rdf["照合結果"]=="馬ID未照合").sum()),
+                    "生履歴なし":int((rdf["照合結果"]=="生履歴なし").sum())})
+                st.dataframe(rdf,hide_index=True,use_container_width=True)
+            else:
+                st.info("対象馬がありません")
+        examples=mobile_examples+display_examples
+        if examples:
+            st.markdown("**照合不一致・重点馬の元データ例（最大60行）**")
+            st.dataframe(pd.DataFrame(examples[:60]),hide_index=True,use_container_width=True)
+        st.caption("照合は日付・競馬場・距離の組で比較します。"
+                   "同条件の複数走や日付形式の差異がある場合は追加確認が必要です。"
+                   "時計根拠欄は元馬辞書に保存された件数であり、採点内部の使用件数を保証しません。")
     # Source audit: show the actual races parsed from the chosen day's workbook.
     with st.expander("🔎 読み込み元のレース一覧（確認用）", expanded=True):
         st.caption("ここはGitHubの保存履歴ではなく、選択日のスプレッドシートから取得した内容です。")
