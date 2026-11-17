@@ -13857,6 +13857,20 @@ with t4:
                     continue
                 ai4={n for n,_ in scores[:4]}
                 pop4={n for n,_ in pops[:4]}
+                # C: 確定後の最終1番人気を固定し、保存済み新AI指数順に
+                # 重複を除いて3頭追加。4頭BOX（4点）のまま比較する。
+                pop1=pops[0][0]
+                hybrid_order=[pop1]
+                for n,_ in scores:
+                    if n not in hybrid_order:
+                        hybrid_order.append(n)
+                    if len(hybrid_order)==4:
+                        break
+                if len(hybrid_order)!=4:
+                    ref_missing.append({'レースID':rk,'日付':rp.get('race_date'),
+                                        '理由':'C方式の4頭が揃いません'})
+                    continue
+                hybrid4=set(hybrid_order)
                 actual=set(finish)
                 unit=int(rp.get('bet_unit') or 100)
                 payout100=int(rr.get('trio_payout_100yen') or 0)
@@ -13864,13 +13878,17 @@ with t4:
                     'R':rp.get('race_no'),'レースID':rk,
                     '新AI上位4頭':','.join(str(n) for n,_ in scores[:4]),
                     '最終人気上位4頭':','.join(str(n) for n,_ in pops[:4]),
+                    'C方式4頭':','.join(map(str,hybrid_order)),
                     '確定1～3着':','.join(map(str,finish)),
                     '新AI捕捉数':len(ai4&actual),'最終人気捕捉数':len(pop4&actual),
+                    'C方式捕捉数':len(hybrid4&actual),
                     '新AI的中':int(actual.issubset(ai4)),
                     '最終人気的中':int(actual.issubset(pop4)),
+                    'C方式的中':int(actual.issubset(hybrid4)),
                     '投資額（各方式）':4*unit,
                     '新AI払戻':payout100*unit//100 if actual.issubset(ai4) else 0,
                     '最終人気払戻':payout100*unit//100 if actual.issubset(pop4) else 0,
+                    'C方式払戻':payout100*unit//100 if actual.issubset(hybrid4) else 0,
                     '最終人気取得日時UTC':pop_info.get('fetched_at_utc',''),
                     '予想保存日時UTC':rp.get('saved_at_utc','')})
             st.write({'参考比較可能':len(ref_rows),'取得不足などで比較対象外':len(ref_missing)})
@@ -13878,7 +13896,7 @@ with t4:
                 rdf=pd.DataFrame(ref_rows)
                 stake=int(rdf['投資額（各方式）'].sum())
                 ref_stats=[]
-                for name in ('新AI','最終人気'):
+                for name in ('新AI','最終人気','C方式'):
                     paid=int(rdf[name+'払戻'].sum())
                     ref_stats.append({'方式':name,'同条件レース数':len(rdf),
                         '平均捕捉数':round(float(rdf[name+'捕捉数'].mean()),2),
@@ -13887,6 +13905,10 @@ with t4:
                         '投資額':stake,'払戻額':paid,
                         '回収率':f'{paid/stake*100:.1f}%' if stake else '—',
                         '損益':paid-stake})
+                st.caption('A＝新AI指数上位4頭、B＝確定後の最終人気上位4頭、'
+                           'C＝確定後の最終1番人気＋保存済み新AI指数上位から重複を除く3頭。'
+                           'すべて同じレース・4点BOX・同じ購入単価で集計。'
+                           'Cは事後最終人気を使った参考検証であり、発走前に実行できた買い方を示すものではありません。')
                 st.dataframe(pd.DataFrame(ref_stats),hide_index=True,use_container_width=True)
                 # 保存済み指数順位と確定後最終人気順位の順位別3着内率。
                 # 既存の43レースの参考比較と同じレース集合を使い、欠損順位は母数から除外する。
