@@ -13888,6 +13888,89 @@ with t4:
                         '回収率':f'{paid/stake*100:.1f}%' if stake else '—',
                         '損益':paid-stake})
                 st.dataframe(pd.DataFrame(ref_stats),hide_index=True,use_container_width=True)
+                # 保存済み指数順位と確定後最終人気順位の順位別3着内率。
+                # 既存の43レースの参考比較と同じレース集合を使い、欠損順位は母数から除外する。
+                rank_rows=[]
+                rank_detail=[]
+                paired_race_ids=set(rdf['レースID'].astype(str))
+                for rk,rp,rr in ref_candidates:
+                    if str(rk) not in paired_race_ids:
+                        continue
+                    try:
+                        actual={int(n) for n in rr.get('top3',[])}
+                    except (ValueError,TypeError):
+                        continue
+                    if len(actual)!=3:
+                        continue
+                    model=(rp.get('models') or {}).get('新AI') or {}
+                    ai_scores=[]
+                    for sr in model.get('scores') or []:
+                        if not isinstance(sr,dict):
+                            continue
+                        try:
+                            n=int(sr['horse_no']); v=float(sr['ai_score'])
+                            if 1<=n<=18 and np.isfinite(v):ai_scores.append((n,v))
+                        except (KeyError,ValueError,TypeError):
+                            continue
+                    ai_scores.sort(key=lambda x:(-x[1],x[0]))
+                    raw_pop=(rr.get('reference_final_popularity') or {}).get('horse_popularity') or {}
+                    final_pop=[]
+                    for n,r in raw_pop.items():
+                        try:
+                            n=int(n);r=int(r)
+                            if 1<=n<=18 and 1<=r<=18:final_pop.append((n,r))
+                        except (ValueError,TypeError):
+                            continue
+                    final_pop.sort(key=lambda x:(x[1],x[0]))
+                    for method,ranked in (('新AI',[(n,i) for i,(n,_) in enumerate(ai_scores,1)]),
+                                          ('最終人気',final_pop)):
+                        by_rank={}
+                        for n,r in ranked:
+                            if r<=10:by_rank.setdefault(r,[]).append(n)
+                        for rank in range(1,11):
+                            horses=by_rank.get(rank,[])
+                            if len(horses)!=1:
+                                continue  # 欠損または重複人気は順位別母数に含めない
+                            n=horses[0]
+                            rank_detail.append({'レースID':rk,'日付':rp.get('race_date'),
+                                '競馬場':rp.get('course'),'R':rp.get('race_no'),
+                                '方式':method,'順位':rank,'馬番':n,
+                                '3着以内':int(n in actual)})
+                rank_df=pd.DataFrame(rank_detail)
+                st.markdown('**📈 順位別3着内率（1〜10位）**')
+                st.caption('上の参考比較と同じレースを使用。各順位の3着内率＝その順位の馬が3着以内に入った件数÷その順位が確認できたレース数。'
+                           '最終人気は確定後の値です。人気同順位の重複や欠損は、その順位の母数から除外します。'
+                           '指数同点は馬番の小さい順で順位付けしています。')
+                if not rank_df.empty:
+                    for method in ('新AI','最終人気'):
+                        part=rank_df[rank_df['方式']==method]
+                        for rank in range(1,11):
+                            sub=part[part['順位']==rank]
+                            n=len(sub);hit=int(sub['3着以内'].sum())
+                            rank_rows.append({'順位':rank,'方式':method,'対象レース数':n,
+                                '3着以内頭数':hit,'3着内率':f'{hit/n*100:.1f}%' if n else '—'})
+                    st.dataframe(pd.DataFrame(rank_rows),hide_index=True,use_container_width=True)
+                    cumulative=[]
+                    for top in (4,7,10):
+                        for method in ('新AI','最終人気'):
+                            part=rank_df[(rank_df['方式']==method)&(rank_df['順位']<=top)]
+                            # 全順位1..topが揃うレースのみ累積比較に使う
+                            counts=part.groupby('レースID')['順位'].nunique()
+                            complete=set(counts[counts==top].index)
+                            subset=part[part['レースID'].isin(complete)]
+                            n=len(complete);captured=int(subset['3着以内'].sum())
+                            cumulative.append({'上位範囲':f'1〜{top}位','方式':method,
+                                '全順位が揃うレース数':n,'3着以内捕捉頭数':captured,
+                                '1レース平均捕捉数':round(captured/n,2) if n else None,
+                                '3着以内馬の捕捉率':f'{captured/(3*n)*100:.1f}%' if n else '—'})
+                    st.markdown('**累積捕捉数（上位4・7・10頭）**')
+                    st.dataframe(pd.DataFrame(cumulative),hide_index=True,use_container_width=True)
+                    st.download_button('📥 順位別3着内率・明細CSV',
+                        rank_df.to_csv(index=False).encode('utf-8-sig'),
+                        file_name='ai_vs_final_popularity_rank_1_to_10.csv',
+                        mime='text/csv',key='rank_1_to_10_comparison_csv')
+                else:
+                    st.info('順位別に照合できるデータがありません。')
                 st.dataframe(rdf,hide_index=True,use_container_width=True)
                 st.download_button('📥 最終人気との参考比較CSV',
                     rdf.to_csv(index=False).encode('utf-8-sig'),
