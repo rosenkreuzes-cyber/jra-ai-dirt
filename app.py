@@ -8938,7 +8938,7 @@ LEGACY_NEW_WEIGHTS = {"time": .25, "last3f": .20, "margin": .20,
 # 新AI: 年次補正時計55%、距離15%、馬場10%、騎手相性20%。
 # 上がり3F・着差は独立した加点を廃止。時計と重複させない。
 NEW_WEIGHTS = {"time": .55, "distance": .15, "going": .10, "jockey": .20}
-NEW_AI_VERSION = "YEARCLOCK55_DISTANCE15_GOING10_JOCKEY20_UMAPIA_LIVEGOING_20261115v1"
+NEW_AI_VERSION = "YEARCLOCK55_DISTANCE15_GOING10_JOCKEY20_UMAPIA_LIVEGOING_GOINGALIAS_20261121v2"
 
 def going_normalize(value):
     value = unicodedata.normalize("NFKC", str(value or "")).strip()
@@ -9135,7 +9135,7 @@ def _jm_horse_running_style(horse, target_date):
 
 
 def _jm_jockey_score(horse,target_date,style_db):
-    """ウマピアの今回騎手タイプ×馬の脚質を優先し、未取得時のみ同一騎手実績を代替利用。
+    """過去の同一騎手実績を維持し、乗り替わりは馬自身の脚質×今回騎手の脚質で採点。
 
     外部騎手履歴が揃えば好走時の過去騎手名が無くても評価できる。
     この類似度は検証前の研究指標であり、騎手の腕前・勝率ではない。
@@ -9185,17 +9185,18 @@ def _jm_jockey_score(horse,target_date,style_db):
         rank=r.get('rank'); field=r.get('field')
         if isinstance(rank,(int,float)) and isinstance(field,(int,float)) and field>1 and 1<=rank<=field:
             same.append(float(100*(field-rank)/(field-1)))
+    if same:
+        # 従来どおり同騎手との実績を優先。サンプル3走の中立事前値で縮約。
+        score=(150+sum(same))/(3+len(same))
+        details.update(jockey_scoring_method='今回騎手との過去ダート実績（従来評価）',
+                       jockey_scoring_kind='same_pair',
+                       jockey_evidence_runs=len(same),
+                       jockey_good_rider=now if any(v>=75 for v in same) else None)
+        return round(float(np.clip(score,0,100)),2),details
+
     # 乗り替わりの評価。『好走時の騎手の名前と履歴』は条件にしない。
     if not rider_info:
-        # ウマピアのタイプが未取得の場合だけ、過去の同一騎手実績を代替根拠として使う。
-        if same:
-            score=(150+sum(same))/(3+len(same))
-            details.update(jockey_scoring_method='ウマピア未照合・今回騎手との過去ダート実績による代替評価',
-                           jockey_scoring_kind='same_pair_fallback',
-                           jockey_evidence_runs=len(same),
-                           jockey_good_rider=now if any(v>=75 for v in same) else None)
-            return round(float(np.clip(score,0,100)),2),details
-        details['jockey_scoring_method']='ウマピア騎手タイプ未取得・相性を判定できず（指数計算上のみ中立50点）'
+        details['jockey_scoring_method']='人馬コンビ実績なし・ウマピアの当該騎手タイプ未確認（中立50点）'
         return None,details
     if own['position'] is None:
         details['jockey_scoring_method']=f"ウマピア：{rider_info['type']}／馬の過去通過順位を確認できず（中立50点）"
@@ -9470,13 +9471,6 @@ def parse_sheet_rows(rows, day_label, sheet_name=""):
             "relative_score": relative_score,
             "dirt_score": dirt_score,
             "dirt_histories": [r for r in (parse_dirt_run(h) for h in valid_histories) if r],
-            "_history_diagnostic": {
-                "source": "Google Drive/Excel", "sheet": sheet_name,
-                "columns": [{"column_index": i + 1, "header": "過去走列", "raw": cells[i] if i < len(cells) else ""} for i in previous_indices],
-                "accepted": list(valid_histories), "cutoff": str(cutoff),
-                "horse_no_source": "仮番号" if inferred_number else "元シート馬番",
-                "warning": "所有馬の照合は未実施（Excel同一行を採用）",
-            },
         })
     finish()
     return races
@@ -9710,59 +9704,19 @@ def jm_restore_profiles_github(target_date):
 
 
 def jm_public_umapia_index(soup):
-    """一覧の氏名と騎手IDを抽出。姓名の空白や付記を吸収する。"""
+    """公開騎手一覧の各リンクから氏名と内部IDを取得（年のURLで固定IDを推測しない）。"""
     choices = {}
     for a in soup.find_all('a', href=True):
-        path=urllib.parse.urlsplit(urllib.parse.urljoin('https://umapia.jp',a['href'])).path
-        m=re.fullmatch(r'/search/jockeys/(\d{1,8})/?',path)
-        if not m:continue
-        label=a.get_text(' ',strip=True)
-        # 一覧のリンクに騎乗数等が混ざる場合、名前だけを使う。
-        label=re.split(r'[（(【\[\d]',label,1)[0].strip()
-        nm=_jm_rider_name(label)
-        if nm:choices.setdefault(nm,set()).add(m.group(1))
-    found={nm:next(iter(ids)) for nm,ids in choices.items() if len(ids)==1}
-    if not found:raise RuntimeError('ウマピアの騎手リンクが見つかりません（ページ変更の可能性）')
+        m = re.fullmatch(r'/search/jockeys/(\d{1,8})/?', urllib.parse.urlsplit(a['href']).path)
+        if not m:
+            continue
+        nm = _jm_rider_name(a.get_text(' ', strip=True))
+        if nm:
+            choices.setdefault(nm, set()).add(m.group(1))
+    found = {nm: next(iter(ids)) for nm, ids in choices.items() if len(ids) == 1}
+    if not found:
+        raise RuntimeError('ウマピアの騎手リンクが見つかりません（ページ変更の可能性）')
     return found
-
-
-def jm_public_match_ids(names,year):
-    """ウマピアの正式姓名と出馬表の略称を安全に照合する。
-
-    例: 河原田→河原田菜々、柴田裕→柴田裕一郎、菊沢→菊沢一樹。
-    同じ略称に複数の正式名が該当する場合は推測せず未照合にする。
-    """
-    requested=list(dict.fromkeys(_jm_rider_name(n) for n in names if _jm_rider_name(n)))
-    all_profiles={}
-    errors=[]
-    # 当年の全ページを優先。過去年の結果は当年で見つからない場合だけ補完。
-    for y in range(int(year),max(2019,int(year)-6)-1,-1):
-        try:
-            year_index=jm_public_index_cached(y)
-        except Exception as exc:
-            errors.append(f'{y}年一覧: {type(exc).__name__}: {str(exc)[:100]}')
-            continue
-        for full_name,jid in year_index.items():
-            all_profiles.setdefault(_jm_rider_name(full_name),set()).add(str(jid))
-        if all(n in all_profiles for n in requested):
-            break
-    matched={}
-    for short in requested:
-        # 完全一致を先に評価し、他の騎手への誤照合を防ぐ。
-        exact=all_profiles.get(short,set())
-        if len(exact)==1:
-            matched[short]=next(iter(exact))
-            continue
-        # 日本人騎手の短縮名は姓名の先頭部分としてのみ照合する。
-        # 例: 石川→石川裕紀人、和田陽→和田陽希。
-        if re.fullmatch(r'[一-龯々ぁ-ゖァ-ヺー]{2,12}',short):
-            candidates={(full,next(iter(ids))) for full,ids in all_profiles.items()
-                        if full.startswith(short) and len(ids)==1}
-            if len(candidates)==1:
-                matched[short]=next(iter(candidates))[1]
-            elif len(candidates)>1:
-                errors.append(short+': 略称に複数候補 '+','.join(sorted(x[0] for x in candidates)[:5]))
-    return matched,errors
 
 
 def jm_public_umapia_rides(soup, name):
@@ -9851,7 +9805,7 @@ def jm_public_next_page(soup,url):
 def jm_public_index_cached(year):
     url=f'https://umapia.jp/search/jockeys?year={int(year)}'
     profiles={}
-    for _ in range(12):
+    for _ in range(6):
         try:
             soup=jm_public_get_soup(url)
             for name,jid in jm_public_umapia_index(soup).items():
@@ -9906,8 +9860,11 @@ def jm_public_enrich(races, target_date, selected_rid=None, max_riders=JM_PUBLIC
     errors=[]
     if len(missing)>len(requested):
         errors.append(f'当日騎乗する騎手{len(missing)-len(requested)}名は取得上限で未取得')
-    index,index_errors=jm_public_match_ids(requested,target_date.year)
-    errors.extend(index_errors)
+    try:
+        index=jm_public_index_cached(target_date.year)
+    except Exception as exc:
+        index={}
+        errors.append('ウマピア一覧: '+str(exc)[:150])
     profiles=dict(old)
     available=[(nm,index[nm]) for nm in requested if nm in index]
     absent=[nm for nm in requested if nm not in index]
@@ -9938,7 +9895,7 @@ def jm_public_enrich(races, target_date, selected_rid=None, max_riders=JM_PUBLIC
     st.session_state.setdefault('jm_external_profiles',{})[target_date.isoformat()]=profiles
     typed=_jm_style_database([],target_date)
     st.session_state['jm_external_diagnostics']={
-       'date':target_date.isoformat(),'requested':len(requested),'force_refresh':bool(force_refresh),'matched_index':len(available),'unmatched_names':absent,
+       'date':target_date.isoformat(),'requested':len(requested),'force_refresh':bool(force_refresh),'matched_index':len(available),
        'current_jockeys':len(current_names),
        'current_jockeys_with_rides':sum(nm in typed for nm in current_names),
        'prior_ride_jockeys':len(profiles),'prior_rides':sum(len(p['rides']) for p in profiles.values()),
@@ -10628,7 +10585,7 @@ def mobile_horse_histories(soup, horse_id, target_date, limit=None):
     dist_re = re.compile(r"^(?:ダート|ダ|芝|障害|障)\s*\d{3,4}\s*m?$", re.I)
     time_re = re.compile(r"^\d{1,2}:\d{2}\.\d$")
     final_re = re.compile(r"^\d{2}\.\d$")
-    going_set = {"良", "稍重", "重", "不良"}
+    going_set = {"良", "稍重", "重", "不良", "稍", "不"}
 
     def looks_like(value, key):
         v = norm(value)
@@ -10639,7 +10596,7 @@ def mobile_horse_histories(soup, horse_id, target_date, limit=None):
         if key == "タイム":
             return bool(time_re.fullmatch(v))
         if key == "馬場":
-            return v in going_set
+            return going_normalize(v) is not None
         if key == "着順":
             return bool(re.fullmatch(r"(?:[1-9]|1[0-8])", v))
         if key == "頭数":
@@ -10658,8 +10615,12 @@ def mobile_horse_histories(soup, horse_id, target_date, limit=None):
             return None
         if result.get("上り") and not looks_like(result["上り"], "上り"):
             result.pop("上り", None)
-        if result.get("馬場") and not looks_like(result["馬場"], "馬場"):
-            result.pop("馬場", None)
+        if result.get("馬場"):
+            normalized = going_normalize(result["馬場"])
+            if normalized is None:
+                result.pop("馬場", None)
+            else:
+                result["馬場"] = normalized
         return result
 
     def verified_fallback(vals):
@@ -10678,7 +10639,7 @@ def mobile_horse_histories(soup, horse_id, target_date, limit=None):
         if len(time_idxs) != 1:
             return None
         ti = time_idxs[0]
-        going_values = [norm(v) for v in vals[di+1:ti] if norm(v) in going_set]
+        going_values = [going_normalize(v) for v in vals[di+1:ti] if going_normalize(v) is not None]
         result = {
             "日付": vals[0], "開催": vals[1], "頭数": vals[di-8],
             "着順": vals[di-3], "距離": vals[di], "タイム": vals[ti],
@@ -10733,6 +10694,7 @@ def mobile_horse_histories(soup, horse_id, target_date, limit=None):
                 excluded_today += 1
                 continue
             row["日付"] = run_date.isoformat()
+            row["馬場"] = going_normalize(row.get("馬場")) or ""
             row["馬ID"] = horse_id
             # テーブル位置が変わっても騎手リンクで補完可能。騎手名を推測しない。
             jockey_link = tr.select_one('a[href*="/jockey/"], a[href*="jockey_id="]')
@@ -10788,7 +10750,7 @@ def mobile_history_run_string(r):
     last3f = unicodedata.normalize("NFKC", r.get("上り", ""))
     margin = unicodedata.normalize("NFKC", r.get("着差", ""))
     margin_text = f"({margin})" if re.fullmatch(r"[+-]?\d+(?:\.\d+)?", margin) else ""
-    going = unicodedata.normalize("NFKC", r.get("馬場", ""))
+    going = going_normalize(r.get("馬場")) or ""
     course = re.sub(r"[^一-龥ぁ-んァ-ン]", "", r.get("開催", ""))
     venue = next((v for v in COURSES if v in course), "")
     return "\n".join([r["日付"].replace("-", "/"), venue, field_text, rank_text,
@@ -10836,14 +10798,104 @@ def mobile_horse_from_runs(entry, runs, target_date):
         "jockey_full_dirt_histories":rider_history,
         "jockey_past_rides_found":sum(bool(_jm_name(v.get('jockey'))) for v in rider_history),
         "jockey_corner_rides_found":sum(bool(_jm_name(v.get('jockey'))) and v.get('corner_pos') is not None for v in rider_history),
-        "_history_diagnostic": {
-            "source": "直接取得", "horse_id": str(entry.get("馬ID", "")),
-            "accepted": list(texts), "cutoff": str(target_date),
-            "horse_no_source": "出走表馬番", "total_before": len(ordered),
-            "warning": "出走表馬IDで取得した過去走。元サイト側の正確性は別途確認が必要",
-        },
     }
 
+
+
+def mobile_repair_race_histories(target_date, race_id, force_all=False):
+    """保存済みの対象レースを、実際の競走成績ページに再照合して復元する。
+
+    正常に再取得できた馬だけ更新。失敗や未検証の行で既存の履歴を消さない。
+    発走後の修復を発走前の確定予想と偽らない（確定保存側で時刻確認）。
+    """
+    races = st.session_state.get('mobile_scraped_races') or []
+    entries = st.session_state.get('mobile_entries') or []
+    all_histories = st.session_state.get('mobile_histories') or []
+    race = next((r for r in races
+                 if str(r.get('netkeiba_race_id')) == str(race_id)
+                 and r.get('race_date') == target_date), None)
+    if race is None:
+        raise RuntimeError('その日付・レースIDの直接取得データが見つかりません。日付を復元してください。')
+    if re.search(r'新馬|メイクデビュー', str(race.get('race_title',''))):
+        raise RuntimeError('新馬戦は過去走がないため、修復対象外です。')
+    entry_by_num = {int(e['馬番']): e for e in entries
+                    if str(e.get('レースID')) == str(race_id) and e.get('馬番') is not None}
+    wanted = []
+    for h in race.get('horses') or []:
+        if (force_all or h.get('year_clock_time_score') is None
+                or not h.get('dirt_histories')
+                or any(x.get('going') is None for x in (h.get('dirt_histories') or []))):
+            hid = str(h.get('horse_id') or entry_by_num.get(int(h['horse_no']),{}).get('馬ID') or '')
+            if re.fullmatch(r'\d{8,12}',hid):
+                e = dict(entry_by_num.get(int(h['horse_no'])) or {})
+                e.update({'馬番':int(h['horse_no']),'馬名':h.get('name') or e.get('馬名',''),
+                          '馬ID':hid, '騎手':h.get('jockey') or e.get('騎手'),
+                          '人気':h.get('pop_rank'), 'オッズ':h.get('odds')})
+                wanted.append((h,hid,e))
+    result = {'date':target_date.isoformat(),'race':race.get('race_name',''), 'requested':len(wanted),
+              'repaired':0,'clock_restored':0,'warnings':[],'details':[]}
+    if not wanted:
+        result['warnings'].append('該当馬がありません。すべて採点済み、または馬IDが不明です。')
+        return result
+
+    # 古いセッションの履歴は触らず、新たに検証できた馬のレコードだけ置換する。
+    new_by_id = {}
+    for h,hid,entry in wanted:
+        try:
+            soup = mobile_get_soup(f'https://db.netkeiba.com/horse/result/{hid}/',tries=2)
+            rows, skip_today, skip_undated = mobile_horse_histories(soup,hid,target_date)
+            if not rows:
+                raise RuntimeError('発走前の有効な過去成績が見つかりません')
+            for row in rows:
+                row['馬名'] = entry['馬名']
+            rebuilt = mobile_horse_from_runs(entry,rows,target_date)
+            if not rebuilt.get('dirt_histories'):
+                raise RuntimeError('直近4走に解析可能なダート成績がありません（旧データを維持）')
+            # オッズや騎手は直近の今回出走表から継承し、過去走だけ復元する。
+            for key in ('time_index','last3f_index','history_count','dirt_runs',
+                        'relative_score','dirt_score','dirt_histories',
+                        'jockey_full_dirt_histories','jockey_past_rides_found',
+                        'jockey_corner_rides_found'):
+                h[key] = rebuilt[key]
+            if not h.get('jockey') and rebuilt.get('jockey'):
+                h['jockey'] = rebuilt['jockey']
+            new_by_id[hid] = rows
+            result['repaired'] += 1
+            result['details'].append(f"{entry['馬番']}番 {entry['馬名']}：過去走{len(rows)}件再取得"
+                                     f"（直近ダート{len(rebuilt['dirt_histories'])}走）")
+        except Exception as exc:
+            result['warnings'].append(f"{entry['馬番']}番 {entry['馬名']}：{type(exc).__name__}: {str(exc)[:150]}")
+
+    if new_by_id:
+        kept=[row for row in all_histories if str(row.get('馬ID')) not in new_by_id]
+        for rows in new_by_id.values():
+            kept.extend(rows)
+        kept.sort(key=lambda r: (str(r.get('馬ID','')),str(r.get('日付',''))), reverse=True)
+        st.session_state['mobile_histories'] = kept
+        pool = [h for r in races for h in (r.get('horses') or [])]
+        for rec in races:
+            dirt_model(rec['horses'],rec.get('target_distance'),going_effective(rec),
+                       rec.get('race_date'),jockey_reference_horses=pool)
+        result['clock_restored'] = sum(
+            int(h.get('year_clock_run_count') or 0)>0 for h,hid,e in wanted if hid in new_by_id)
+        result['still_missing'] = [int(h['horse_no']) for h in (race.get('horses') or [])
+                                   if h.get('year_clock_time_score') is None]
+        meta=st.session_state.get('mobile_scrape_meta') or {}
+        meta.setdefault('original_fetched_at',meta.get('fetched_at'))
+        now=datetime.datetime.now(TRIO_JST).isoformat(timespec='seconds')
+        meta['history_repaired_at']=now
+        meta['fetched_at']=now   # 保存の新旧判定。元の初回取得日時は別欄に保持する。
+        meta['past_runs']=len(kept)
+        st.session_state['mobile_scrape_meta']=meta
+        st.session_state.setdefault('mobile_diagnostics',[]).append({
+            'レースID':str(race_id),'処理結果':'過去走再取得・指数再計算',
+            '取得頭数':result['repaired'],
+            '理由':f"{result['repaired']}/{result['requested']}頭更新、年次時計有り{result['clock_restored']}頭",
+            '取得日時JST':now})
+    else:
+        result['still_missing'] = [int(h['horse_no']) for h in race.get('horses',[])
+                                   if h.get('year_clock_time_score') is None]
+    return result
 
 def mobile_fetch_date(target_date, min_race=6, max_race=12):
     """レース一覧・出走表・過去成績を取得して、アプリ既存形式に変換。"""
@@ -11075,7 +11127,7 @@ def calculate_ai_indices(horses_data):
 
 
 # --- GitHub Private repository persistence ---
-APP_VERSION = "dual-model-5.4-result-import-20261115"
+APP_VERSION = "dual-model-5.5-history-going-repair-openfield-20261121"
 
 def score_old_model(horses):
     data = []
@@ -11168,19 +11220,12 @@ def screen_scored_race_old(race, df):
             "top_avg_runs": round(avg_runs, 1)}, None, df
 
 
-def yc_unassessed_horses(df, top_seven_only=True):
-    """時計評価できない馬番を抽出。人気が確定しなければ全頭を点検する。"""
+def yc_unassessed_horses(df):
+    """人気やオッズによる足切りなし。全出走馬について時計評価の欠損を確認。"""
     if df is None or df.empty:
         return []
-    eligible=df
-    if top_seven_only and 'pop_rank' in df.columns:
-        popularity=pd.to_numeric(df['pop_rank'],errors='coerce')
-        # 1〜7番人気を全て確実に特定できる場合だけ対象を7頭に絞る。
-        first_seven=df.loc[popularity.le(7) & popularity.ge(1)]
-        if set(popularity.loc[first_seven.index].astype(int))==set(range(1,8)) and len(first_seven)==7:
-            eligible=first_seven
-    values=pd.to_numeric(eligible['ai_score'],errors='coerce')
-    return [int(n) for n in eligible.loc[values.isna(),'horse_no'].tolist()]
+    values = pd.to_numeric(df['ai_score'], errors='coerce')
+    return [int(n) for n in df.loc[values.isna(), 'horse_no'].tolist()]
 
 
 # 新AI用スクリーニング（指数差ギャップ撤廃 ＆ 上位馬の指数・競合度を反映したグラデーション評価）
@@ -11195,7 +11240,7 @@ def screen_scored_race_new(race, df):
         return None, "出走馬6頭未満", df
     missing=yc_unassessed_horses(df)
     if missing:
-        return None, "選考対象外：人気上位7頭候補の年次時計を評価できない馬あり（馬番" + ",".join(map(str,missing)) + "）", df
+        return None, "選考対象外：出走馬に年次時計の根拠がない馬あり（全馬確認・馬番" + ",".join(map(str,missing)) + "）", df
     coverage = float(df["history_count"].gt(0).mean() * 100)
     dirt_coverage = float(df["dirt_runs"].gt(0).mean() * 100)
     if coverage < min_coverage:
@@ -11236,6 +11281,7 @@ def dual_snapshot(date, race, evaluations, settings):
         df = ev["df"]
         top = [int(x) for x in df.head(4)["horse_no"]] if df["ai_score"].notna().sum() >= 4 else []
         if label == "新AI" and yc_unassessed_horses(df):
+            # 欠損馬を最下位と決めつけず、全馬に比較可能な時計根拠があるまで固定しない。
             top = []
         models[label] = {"top4": top, "eligible": ev["metrics"] is not None,
                          "metrics": ev["metrics"], "reason": ev["reason"],
@@ -11881,65 +11927,14 @@ def win_apply_snapshots_to_races(snapshots, races, entries):
 mobile_try_autorestore()
 all_loaded_races, load_errors, load_diagnostics = load_races_from_google_drive()
 
-# 日付別GitHubアーカイブを土曜・日曜それぞれ独立して復元する。
-# mobile_scraped_races は既存の取得・オッズ保存処理が使う「現在の1日分」のまま維持し、
-# 他曜日の復元は表示用の別キャッシュに格納する（既存の取得/計算/結果処理を変更しない）。
-def mobile_weekend_display_races():
-    current = st.session_state.get("mobile_scraped_races") or []
-    meta = st.session_state.get("mobile_scrape_meta") or {}
-    try:
-        anchor = datetime.date.fromisoformat(str(meta.get("date", ""))[:10])
-    except (ValueError, TypeError):
-        return list(current), []
-    # 土曜日を起点にすると、土曜を後から再取得しても翌日の日曜を失わない。
-    saturday = anchor - datetime.timedelta(days=(anchor.weekday() - 5) % 7)
-    if anchor.weekday() == 6:
-        saturday = anchor - datetime.timedelta(days=1)
-    sunday = saturday + datetime.timedelta(days=1)
-    wanted = ((saturday, "土曜日開催"), (sunday, "日曜日開催"))
-    cached = st.session_state.setdefault("_mobile_weekend_display_cache", {})
-    notices = []
-    output = []
-    for date, day_label in wanted:
-        date_key = date.isoformat()
-        if str(meta.get("date")) == date_key and current:
-            # 現在の取得結果が最優先。日付別キャッシュも最新状態に更新する。
-            output.extend(current)
-            cached[date_key] = {"races": current, "source": "現在の直接取得"}
-            continue
-        if date_key not in cached:
-            try:
-                saved = mobile_read_github(date)
-                if saved:
-                    races = saved.get("mobile_scraped_races") or []
-                    if not races or any(r.get("race_date") != date for r in races):
-                        raise ValueError("保存レースの開催日が一致しません")
-                    # ここでは既存の予想やオッズを再計算・変更しない。
-                    cached[date_key] = {"races": races, "source": "GitHub日付別保存"}
-                else:
-                    cached[date_key] = {"races": [], "source": "保存なし"}
-            except Exception as exc:
-                # 読み込みエラーを古いDriveデータで黙って隠さない。
-                notices.append(f"{date_key} のGitHub復元に失敗: {type(exc).__name__}: {exc}")
-                cached[date_key] = {"races": [], "source": "復元失敗"}
-        entry = cached[date_key]
-        if entry["races"]:
-            output.extend(entry["races"])
-            notices.append(f"{day_label} {date_key}: {len(entry['races'])}レースを{entry['source']}から復元")
-        elif entry["source"] == "保存なし":
-            notices.append(f"{day_label} {date_key}: GitHub日付別保存なし（Driveデータを使用）")
-    return output, notices
-
-# 同一曜日のDrive旧データより、日付別の直接取得データを必ず優先する。
-# 現在の取得データはsession_stateのまま維持し、もう一方の曜日は表示用だけ復元する。
-mobile_saved, mobile_restore_notices = mobile_weekend_display_races()
+# 同一曜日のDrive旧データより、直接取得データを必ず優先する。
+# 条件変更・画面再実行でもsession_stateを保持し、新セッションはGitHubから復元する。
+mobile_saved = st.session_state.get("mobile_scraped_races", [])
 if mobile_saved:
     mobile_days = {r.get("day_label") for r in mobile_saved}
     all_loaded_races = [r for r in all_loaded_races if r.get("day_label") not in mobile_days] + mobile_saved
-    load_diagnostics.extend(mobile_restore_notices)
-    load_diagnostics.append(f"直接取得の表示対象：{len(mobile_saved)}ダートレース（土日合計）")
-else:
-    load_diagnostics.extend(mobile_restore_notices)
+    load_diagnostics.append(f"スマホ直接取得：{len(mobile_saved)}ダートレース / "
+                            f"{st.session_state.get('mobile_scrape_meta',{}).get('fetched_at','')} JST")
 
 with st.sidebar.expander("📡 データ取得診断", expanded=bool(load_errors)):
     excluded_summary = summarize_history_exclusions(all_loaded_races)
@@ -12007,59 +12002,6 @@ with st.sidebar.expander("📅 更新データの開催日確認", expanded=True
 st.sidebar.caption("日付の手入力は不要です。Google Driveの内容を更新したら『最新データを再取得』を押してください。")
 
 
-def render_history_input_diagnostic(races, key_prefix="history_audit"):
-    """採点に渡した直近4走の入力を、再取得せず閲覧・CSV保存する。"""
-    with st.expander("🔎 指数計算に使用した馬番・馬名・過去走の診断（再取得なし）", expanded=False):
-        st.caption("取得済みデータだけを表示します。指数の再計算・オッズ更新・再取得は行いません。過去走の所有馬を自動証明する機能ではありません。")
-        options = {f"{r.get('race_date')} {r.get('race_name')} [{r.get('sheet_name') or '直接取得'}]": r for r in races}
-        if not options:
-            st.info("診断できる取得済みレースがありません。")
-            return
-        choice = st.selectbox("診断するレース", list(options), key=key_prefix + "_race")
-        race = options[choice]
-        records = []
-        for horse in sorted(race.get("horses") or [], key=lambda x: x.get("horse_no", 99)):
-            diag = horse.get("_history_diagnostic") or {}
-            accepted = diag.get("accepted") or []
-            raw_columns = diag.get("columns") or []
-            flags = []
-            if not diag:
-                flags.append("取得時の原文未保存")
-            if len(accepted) != 4:
-                flags.append(f"有効過去走{len(accepted)}件")
-            if len(raw_columns) > 4:
-                flags.append(f"過去走候補列{len(raw_columns)}列")
-            if not horse.get("horse_no_verified", True):
-                flags.append("馬番仮設定")
-            if len(set(accepted)) != len(accepted):
-                flags.append("同一履歴の重複疑い")
-            records.append({
-                "馬番": horse.get("horse_no"), "馬名": horse.get("name"),
-                "馬ID": diag.get("horse_id", horse.get("horse_id", "")),
-                "取得元": diag.get("source", "不明"),
-                "馬番の根拠": diag.get("horse_no_source", "不明"),
-                "候補列数": len(raw_columns) if raw_columns else "不明",
-                "有効過去走数": len(accepted) if diag else horse.get("history_count"),
-                "ダート走数": horse.get("dirt_runs"),
-                **{f"{i+1}走前（計算入力）": accepted[i] if i < len(accepted) else "" for i in range(4)},
-                "5走目以降・余分な列": "\n---\n".join(accepted[4:]),
-                "診断": " / ".join(flags) if flags else "形式上の異常なし（所有馬照合は未実施）",
-            })
-        df = pd.DataFrame(records)
-        st.dataframe(df, use_container_width=True, hide_index=True)
-        st.download_button("📥 このレースの計算入力をCSV保存", df.to_csv(index=False).encode("utf-8-sig"),
-                           file_name=f"history_input_audit_{str(race.get('race_date'))}_{race.get('course')}_{race.get('race_no')}R.csv",
-                           mime="text/csv", key=key_prefix + "_download")
-        with st.expander("元の過去走候補列（Excel取得のみ）"):
-            for horse in sorted(race.get("horses") or [], key=lambda x: x.get("horse_no", 99)):
-                diag = horse.get("_history_diagnostic") or {}
-                st.markdown(f"**{horse.get('horse_no')}番 {horse.get('name')}**")
-                for c in diag.get("columns") or []:
-                    st.text(f"列{c.get('column_index')}: {c.get('header')}\n{c.get('raw')}")
-                if not diag.get("columns"):
-                    st.caption("元の列情報は保存されていません。")
-
-
 def render_races(day, date):
     # Never treat a race from a different date or an unverified surface as eligible.
     # The original records in GitHub are not modified by this filter.
@@ -12070,7 +12012,6 @@ def render_races(day, date):
         st.caption("ここはGitHubの保存履歴ではなく、選択日のスプレッドシートから取得した内容です。")
         st.dataframe(pd.DataFrame([{"開催日": str(r.get("race_date") or "不明"), "競馬場": r.get("course"), "R": r.get("race_no"), "レース名": r.get("race_name"), "ダート判定": bool(r.get("is_dirt_race")), "元シート": r.get("sheet_name")} for r in source_races]), hide_index=True, use_container_width=True)
         st.caption("レースの芝・ダート判定は読み込み元のコース情報に従います。特定のレース番号を日付だけで除外しません。")
-    render_history_input_diagnostic(source_races, key_prefix="drive_history_audit_" + str(day))
     unverified = [r for r in source_races if r.get("horse_numbers_unverified")]
     if unverified:
         st.warning(f"{len(unverified)}レースでExcelの馬番が空欄です。出走順の仮番号で指数を参考計算しますが、実際の馬番との一致が確認できないため、買い目と予想の確定保存は停止します。")
@@ -12126,6 +12067,53 @@ def render_races(day, date):
                 for reason in last_report['errors'][:20]:st.write(reason)
     if datetime.datetime.now(TRIO_JST).date()>date and (last_report or st.session_state.get('_jm_day_profile_metadata',{}).get(date.isoformat(),{}).get('post_event_reanalysis')):
         st.caption('過去日付の騎手データを後日再取得した参考解析です。発走前に保存された予想の検証成績には加えません。')
+    # 年次時計が欠損した馬を直すため、候補から外れたレースもここで選択できる。
+    with st.expander('🛠 過去走・年次補正時計を修復（予想確定前に確認）'):
+        saved_for_day=[r for r in (st.session_state.get('mobile_scraped_races') or [])
+                       if r.get('race_date')==date and r.get('is_dirt_race')]
+        options={str(r.get('netkeiba_race_id')):r for r in saved_for_day if r.get('netkeiba_race_id')}
+        if not options:
+            st.caption('この開催日の直接取得データがありません。直接取得データまたはGitHub保存分を復元してください。')
+        else:
+            choice=st.selectbox('修復するレース',list(options),
+                                format_func=lambda rid:options[rid].get('race_name',rid),
+                                key='repair_race_'+date.isoformat())
+            target=options[choice]
+            miss=[int(h['horse_no']) for h in target.get('horses',[])
+                  if h.get('year_clock_time_score') is None]
+            st.caption('年次補正時計の未評価馬番：'+(', '.join(map(str,miss)) if miss else 'なし')+
+                       '。人気の順位にかかわらず、全馬が比較対象です。')
+            do_all=st.checkbox('参考：このレースの全馬の過去走を再検証',value=False,
+                               key='repair_all_'+date.isoformat())
+            if st.button('過去走を再取得して年次補正時計を再計算',
+                         key='repair_histories_'+date.isoformat(),use_container_width=True):
+                with st.spinner('対象馬の競走成績を照合・復元中...'):
+                    try:
+                        report=mobile_repair_race_histories(date,choice,force_all=do_all)
+                        if report.get('repaired'):
+                            try:
+                                report['save_path']=mobile_save_github()
+                            except Exception as exc:
+                                report['warnings'].append('復元データのGitHub保存失敗：'+str(exc)[:180])
+                        st.session_state['last_history_repair_report']=report
+                        st.rerun()
+                    except Exception as exc:
+                        st.error('修復中断：'+type(exc).__name__+' '+str(exc)[:250])
+        report=st.session_state.get('last_history_repair_report')
+        if report and report.get('date')==date.isoformat():
+            st.info(f"{report.get('race')}: 再取得成功 {report.get('repaired',0)}/{report.get('requested',0)}頭。"
+                    f" 時計算出可能 {report.get('clock_restored',0)}頭。"
+                    f" 未評価馬番：{report.get('still_missing',[])}")
+            if report.get('save_path'):
+                st.caption('GitHub保存：'+report['save_path'])
+            for m in report.get('warnings',[]):
+                st.warning(m)
+            if report.get('details'):
+                st.caption('各馬の再取得結果')
+                for line in report['details']:
+                    st.write(line)
+    if datetime.datetime.now(TRIO_JST).date()>date:
+        st.caption('過去開催日の時計再計算は事後検証用です。発走前の確定予想として新規保存しません。')
     selected, excluded = choose_dual(day)
     # Always show source races even if the model screens them out.
     source_dirt = [r for r in source_races if r.get("is_dirt_race")]
@@ -12339,61 +12327,45 @@ def render_races(day, date):
         pre_start = save_timing == "発走前取得"
         if not pre_start:
             st.caption(f"確定保存不可：{save_timing}。結果を知った後のデータを事前予想に混ぜません。")
-        # 保存できない理由を明示し、GitHubへの確定書き込み後に読み戻して検証する。
-        save_reasons = []
-        if not verified or detected_date != date:
-            save_reasons.append("開催日が一致しません")
+        # 年次時計の欠損を空欄のまま確定保存しない。発走後の事後データも禁止。
+        save_reasons=[]
+        if not verified or detected_date!=date:
+            save_reasons.append('開催日不一致')
         if not pre_start:
-            save_reasons.append("発走前の取得ではありません（" + save_timing + "）")
-        if not race.get("is_dirt_race") or race.get("surface_conflict"):
-            save_reasons.append("ダート競走の照合ができません")
-        if race.get("horse_numbers_unverified", False):
-            save_reasons.append("実際の馬番を確認できません")
+            save_reasons.append('発走前ではありません（'+save_timing+'）')
+        if not race.get('is_dirt_race') or race.get('surface_conflict'):
+            save_reasons.append('ダート競走として照合できません')
+        if race.get('horse_numbers_unverified',False):
+            save_reasons.append('馬番未検証')
+        missing_all=yc_unassessed_horses(evaluations['新AI']['df'])
+        if missing_all:
+            save_reasons.append('全出走馬の年次時計評価が揃いません（馬番'+','.join(map(str,missing_all))+'）')
         try:
-            save_preview = dual_snapshot(date, race, evaluations, settings)
-            for model_name in ("旧AI", "新AI"):
-                model_data = save_preview.get("models", {}).get(model_name, {})
-                if len(model_data.get("scores", [])) != len(evaluations[model_name]["df"]):
-                    save_reasons.append(model_name + "の全頭指数が揃いません")
-                if len(model_data.get("top4", [])) != 4:
-                    save_reasons.append(model_name + "の選定4頭が揃いません")
-        except Exception as preview_exc:
-            save_preview = None
-            save_reasons.append("保存データ生成失敗: " + str(preview_exc)[:180])
-        save_path = f"predictions/{date.year}/{r_key}.json"
+            rec=dual_snapshot(date,race,evaluations,settings)
+            for label in ('旧AI','新AI'):
+                if len(rec.get('models',{}).get(label,{}).get('top4',[]))!=4:
+                    save_reasons.append(label+'の根拠付き4頭が確定できません')
+        except Exception as exc:
+            rec=None
+            save_reasons.append('保存用データ生成失敗：'+str(exc)[:150])
         if save_reasons:
-            st.warning("確定保存できない理由：" + "／".join(save_reasons))
-        save_status_key = "confirmed_save_status_" + r_key
-        if st.button("💾 旧AI・新AIの予想を同時に確定保存", key="save_" + r_key,
-                     disabled=bool(save_reasons)):
+            st.warning('確定保存できない理由：'+'／'.join(save_reasons))
+            if missing_all:
+                st.caption('上の「過去走・年次補正時計を修復」で対象レースを選び、過去走の取得と時計基準の根拠を確認してください。'
+                           '基準不足が残る場合は推測値で埋めず、事前確定を止めます。')
+        if st.button('💾 旧AI・新AIの予想を同時に確定保存',
+                     key='save_'+race_key(date,race), disabled=bool(save_reasons)):
+            path=f"predictions/{date.year}/{rec['race_id']}.json"
             try:
-                if put_record(save_path, save_preview):
-                    stored, _ = get_record(save_path)
-                    if not stored or stored.get("race_id") != r_key or stored.get("models") != save_preview.get("models"):
-                        raise RuntimeError("GitHubへの保存後の読み戻し照合に失敗しました")
-                    st.session_state[save_status_key] = "保存・照合完了：" + str(stored.get("saved_at_utc", "")) + " UTC"
-                    st.success("旧AI・新AIの全頭指数、選定4頭、設定をGitHubに保存し、読み戻し確認しました。")
+                if put_record(path,rec):
+                    stored,_=get_record(path)
+                    if not stored or stored.get('models')!=rec.get('models'):
+                        raise RuntimeError('GitHub読み戻しで保存内容を照合できません')
+                    st.success('両モデルの4頭・指数・根拠を保存し、照合しました。')
                 else:
-                    stored, _ = get_record(save_path)
-                    if stored:
-                        st.session_state[save_status_key] = "既存の確定予想あり：" + str(stored.get("saved_at_utc", "")) + " UTC（上書きなし）"
-                    st.info("すでに確定予想が保存されています。発走前の記録を保護するため上書きしません。")
+                    st.warning('このレースはすでに保存済みです。既存の発走前記録を上書きしません。')
             except Exception as e:
-                st.session_state[save_status_key] = "保存未確認：" + str(e)[:250]
-                st.error("保存失敗または保存確認不可：" + str(e))
-        if st.session_state.get(save_status_key):
-            st.caption("確定保存状態：" + st.session_state[save_status_key])
-        if st.button("🔎 GitHubの確定予想を照合", key="verify_saved_" + r_key):
-            try:
-                stored, _ = get_record(save_path)
-                if stored:
-                    st.success("保存確認済：" + str(stored.get("saved_at_utc", "")) + " UTC")
-                    st.caption("新AI指数 " + str(len(stored.get("models", {}).get("新AI", {}).get("scores", []))) +
-                               "頭／選定4頭 " + str(stored.get("models", {}).get("新AI", {}).get("top4", [])))
-                else:
-                    st.warning("GitHubに確定予想がありません。発走前であれば保存ボタンから登録してください。")
-            except Exception as exc:
-                st.error("保存確認失敗：" + str(exc)[:250])
+                st.error('保存失敗：'+str(e))
         # Retrospective snapshots are deliberately isolated from pre-race history.
         # They never overwrite an existing prediction or affect official ROI.
         if r_key in results_dict:
@@ -12955,7 +12927,7 @@ if st.session_state.get("mobile_persist_status"):
     (st.warning if message.startswith("⚠️") else st.success)(message)
 
 with st.expander("🏇 ウマピア｜騎手タイプの照合・再取得", expanded=False):
-    st.caption("ウマピアの開催日前の騎乗履歴から位置取りタイプを算出し、馬の脚質と優先照合します。未取得時のみ同一騎手の過去実績を代替利用します。")
+    st.caption("ウマピアの開催日前の騎乗履歴から位置取りタイプを算出。人馬コンビ実績がない場合に馬の脚質と照合します。")
     public_races=st.session_state.get('mobile_scraped_races') or []
     available_races={str(r.get('netkeiba_race_id')):r for r in public_races if r.get('netkeiba_race_id')}
     if available_races:
@@ -13127,11 +13099,6 @@ if st.session_state.get("mobile_fetch_message"):
                          hide_index=True, use_container_width=True)
 
 st.divider()
-# 直接取得済みデータも再取得せず診断できるようにする。
-_mobile_audit_races = st.session_state.get("mobile_scraped_races") or []
-if _mobile_audit_races:
-    render_history_input_diagnostic(_mobile_audit_races, key_prefix="mobile_history_audit")
-
 st.subheader("🏇 単勝・3連複オッズ／人気を一括取得・更新")
 st.caption("現在表示中のレースを対象に単勝・3連複を同時更新します。"
            "出走表と過去走は再取得せず保持し、更新に失敗した市場データも前回分を消しません。"
