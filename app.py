@@ -8938,7 +8938,7 @@ LEGACY_NEW_WEIGHTS = {"time": .25, "last3f": .20, "margin": .20,
 # 新AI: 年次補正時計55%、距離15%、馬場10%、騎手相性20%。
 # 上がり3F・着差は独立した加点を廃止。時計と重複させない。
 NEW_WEIGHTS = {"time": .55, "distance": .15, "going": .10, "jockey": .20}
-NEW_AI_VERSION = "YEARCLOCK55_DISTANCE15_GOING10_JOCKEY20_UMAPIA_LIVEGOING_GOINGALIAS_20261121v2"
+NEW_AI_VERSION = "YEARCLOCK55_JRA_DIRT_LAST4_FROM_FULL_HISTORY_20261121v3"
 
 def going_normalize(value):
     value = unicodedata.normalize("NFKC", str(value or "")).strip()
@@ -9228,8 +9228,37 @@ def dirt_model(horses, target_distance=None, target_going=None, target_date=None
     for horse in horses:
         horse['ai_score_before_yearclock']=horse.get('ai_score')
         horse['time_score_before_yearclock']=horse.get('time_score')
+        # 旧版の保存済みバックアップにも対応する。全履歴は既に騎手解析用に保持済み。
+        # year_clock_historiesがない旧データでも、全騎手履歴からJRAダートを復元。
+        history_candidates = (horse.get('year_clock_histories') or
+                              horse.get('jockey_full_dirt_histories') or
+                              horse.get('dirt_histories') or [])
+        # 保存済みのJSONから直接再解析する経路ではdateが文字列のことがある。
+        central_dirt=[]
+        for run in history_candidates:
+            if not isinstance(run,dict) or run.get('course') not in YC_VENUES:
+                continue
+            run_date=run.get('date')
+            if isinstance(run_date,str):
+                try: run_date=datetime.date.fromisoformat(run_date[:10])
+                except ValueError: continue
+            if isinstance(run_date,datetime.date) and isinstance(target_date,datetime.date) and run_date<target_date:
+                central_dirt.append({**run,'date':run_date})
+        central_dirt.sort(key=lambda r:r['date'],reverse=True)
+        # 原データに重複があっても同じ過去走を二重採点しない。
+        unique_dirt=[];seen_dirt=set()
+        for past_run in central_dirt:
+            key=(past_run.get('race_id') or '',past_run.get('date'),past_run.get('course'),
+                 past_run.get('distance'),past_run.get('time'))
+            if key in seen_dirt:continue
+            seen_dirt.add(key);unique_dirt.append(past_run)
+        clock_runs=unique_dirt[:4]
+        horse['year_clock_jra_dirt_total']=max(int(horse.get('year_clock_jra_dirt_total') or 0),len(unique_dirt))
+        horse['year_clock_jra_dirt_examined']=len(clock_runs)
+        horse['year_clock_last_jra_dirt_date']=(clock_runs[0]['date'].isoformat() if clock_runs else None)
+        horse['year_clock_history_scope']='過去のJRAダート直近4走（芝・地方は時計比較から除外）'
         evaluations=[];reasons=[]
-        for past_run in horse.get('dirt_histories',[]):
+        for past_run in clock_runs:
             item,reason=yc_evaluate_run(past_run,horse.get('name',''),target_date)
             if item:evaluations.append(item)
             elif reason:reasons.append(reason)
@@ -9249,7 +9278,8 @@ def dirt_model(horses, target_distance=None, target_going=None, target_date=None
         horse['year_clock_primary_run_count']=sum(z.get('reference_type')=='厳密基準' for z in evaluations)
         horse['year_clock_fallback_run_count']=sum(z.get('reference_type')=='代替基準' for z in evaluations)
         horse['year_clock_reference_state']=('厳密基準あり' if horse['year_clock_primary_run_count']
-                                            else ('代替基準のみ' if evaluations else '基準不足'))
+                                            else ('代替基準のみ' if evaluations else
+                                                  ('参照基準・クラス情報不足' if clock_runs else 'JRAダート過去走なし')))
         horse['year_clock_adv_sec1000_mean']=(round(float(np.mean([z['adv_sec1000'] for z in evaluations])),3) if evaluations else None)
         horse['year_clock_adv_sec1000_best']=(round(float(max(z['adv_sec1000'] for z in evaluations)),3) if evaluations else None)
         horse['year_clock_unmatched_reasons']=list(dict.fromkeys(reasons))
@@ -10769,6 +10799,11 @@ def mobile_horse_from_runs(entry, runs, target_date):
     latest = ordered[:4]
     texts = [mobile_history_run_string(r) for r in latest]
     rider_history = [v for v in (parse_dirt_run(mobile_history_run_string(r)) for r in ordered) if v]
+    # 年次補正時計だけは、地方・芝で直近4走が埋まっても中央ダート実績を失わない。
+    # 能力評価の比較窓は従来同様4走。対象を「直近4レース」ではなく
+    # 「発走前の全走歴から抽出した直近4件のJRAダート走」にする。
+    jra_dirt_all = [r for r in rider_history if r.get('course') in COURSES]
+    jra_dirt_clock = jra_dirt_all[:4]
     time_score, last3f_score = parse_horse_history(texts[0] if texts else "")
     scores = []
     dirt_runs = 0
@@ -10795,6 +10830,8 @@ def mobile_horse_from_runs(entry, runs, target_date):
         "relative_score":relative,
         "dirt_score":sum(dirt_scores)/len(dirt_scores) if dirt_scores else None,
         "dirt_histories":[v for v in (parse_dirt_run(txt) for txt in texts) if v],
+        "year_clock_histories": jra_dirt_clock,
+        "year_clock_jra_dirt_total": len(jra_dirt_all),
         "jockey_full_dirt_histories":rider_history,
         "jockey_past_rides_found":sum(bool(_jm_name(v.get('jockey'))) for v in rider_history),
         "jockey_corner_rides_found":sum(bool(_jm_name(v.get('jockey'))) and v.get('corner_pos') is not None for v in rider_history),
@@ -10849,11 +10886,15 @@ def mobile_repair_race_histories(target_date, race_id, force_all=False):
             for row in rows:
                 row['馬名'] = entry['馬名']
             rebuilt = mobile_horse_from_runs(entry,rows,target_date)
-            if not rebuilt.get('dirt_histories'):
-                raise RuntimeError('直近4走に解析可能なダート成績がありません（旧データを維持）')
+            # 全成績の取得と、年次時計を評価できることは別。
+            # 芝専業馬・地方転入馬の取得成功を「修復失敗」と誤表示しない。
+            # JRAダート経験ゼロなら時計は未評価のまま、理由を明示する。
+            if not rebuilt.get('history_count'):
+                raise RuntimeError('解析可能な過去走が0件（旧データを維持）')
             # オッズや騎手は直近の今回出走表から継承し、過去走だけ復元する。
             for key in ('time_index','last3f_index','history_count','dirt_runs',
                         'relative_score','dirt_score','dirt_histories',
+                        'year_clock_histories','year_clock_jra_dirt_total',
                         'jockey_full_dirt_histories','jockey_past_rides_found',
                         'jockey_corner_rides_found'):
                 h[key] = rebuilt[key]
@@ -10862,7 +10903,8 @@ def mobile_repair_race_histories(target_date, race_id, force_all=False):
             new_by_id[hid] = rows
             result['repaired'] += 1
             result['details'].append(f"{entry['馬番']}番 {entry['馬名']}：過去走{len(rows)}件再取得"
-                                     f"（直近ダート{len(rebuilt['dirt_histories'])}走）")
+                                     f"／年次時計候補JRAダート{len(rebuilt['year_clock_histories'])}走"
+                                     + ("" if rebuilt['year_clock_histories'] else "（時計は採点対象外、芝・地方走と区別）"))
         except Exception as exc:
             result['warnings'].append(f"{entry['馬番']}番 {entry['馬名']}：{type(exc).__name__}: {str(exc)[:150]}")
 
@@ -11127,7 +11169,7 @@ def calculate_ai_indices(horses_data):
 
 
 # --- GitHub Private repository persistence ---
-APP_VERSION = "dual-model-5.5-history-going-repair-openfield-20261121"
+APP_VERSION = "dual-model-5.5-jra-dirt-4-from-full-history-20261121"
 
 def score_old_model(horses):
     data = []
@@ -11754,7 +11796,7 @@ def mobile_apply_restored_state(state):
     # JSON復元後の過去走日付は文字列。再評価前にdateへ変換しないと年次時計が欠損する。
     for race in restored_races:
         for h in (race.get('horses') or []):
-            for key in ('dirt_histories','jockey_full_dirt_histories'):
+            for key in ('dirt_histories','jockey_full_dirt_histories','year_clock_histories'):
                 for run in (h.get(key) or []):
                     d=run.get('date')
                     if isinstance(d,str):
@@ -12083,6 +12125,17 @@ def render_races(day, date):
                   if h.get('year_clock_time_score') is None]
             st.caption('年次補正時計の未評価馬番：'+(', '.join(map(str,miss)) if miss else 'なし')+
                        '。人気の順位にかかわらず、全馬が比較対象です。')
+            if miss:
+                states=[]
+                for h in target.get('horses',[]):
+                    if h.get('year_clock_time_score') is None:
+                        reasons='／'.join(map(str,h.get('year_clock_unmatched_reasons') or []))
+                        states.append(f"{h.get('horse_no')}番 {h.get('name')}: "
+                                      f"中央ダート{h.get('year_clock_jra_dirt_total', '未確認')}走・"
+                                      f"{h.get('year_clock_reference_state') or '未評価'}"
+                                      + (f"（{reasons}）" if reasons else ''))
+                with st.expander('未評価の理由（過去走未取得と芝・地方履歴を区別）'):
+                    for msg in states:st.write(msg)
             do_all=st.checkbox('参考：このレースの全馬の過去走を再検証',value=False,
                                key='repair_all_'+date.isoformat())
             if st.button('過去走を再取得して年次補正時計を再計算',
@@ -12190,7 +12243,7 @@ def render_races(day, date):
                     st.write("馬番未確認：買い目は表示しません。指数は参考値です。")
                 else:
                     st.markdown("3連複4点： " + green_combo_html(list(itertools.combinations(top, 3)), placed_set), unsafe_allow_html=True)
-                cols = [c for c in ["horse_no", "name", "ai_score", "ai_score_before_yearclock", "ai_score_yearclock25_before", "distance_score", "going_score_applied", "going_matched_runs", "going_evaluation_reason", "jockey", "jockey_score", "jockey_score_applied", "jockey_type", "horse_running_style", "jockey_scoring_method", "jockey_similarity", "jockey_evidence_runs", "evidence_coverage", "time_score", "time_score_before_yearclock", "year_clock_run_count", "year_clock_primary_run_count", "year_clock_fallback_run_count", "year_clock_reference_state", "year_clock_adv_sec1000_mean", "idx_rank"] if c in df.columns]
+                cols = [c for c in ["horse_no", "name", "ai_score", "ai_score_before_yearclock", "ai_score_yearclock25_before", "distance_score", "going_score_applied", "going_matched_runs", "going_evaluation_reason", "jockey", "jockey_score", "jockey_score_applied", "jockey_type", "horse_running_style", "jockey_scoring_method", "jockey_similarity", "jockey_evidence_runs", "evidence_coverage", "time_score", "time_score_before_yearclock", "year_clock_jra_dirt_total", "year_clock_jra_dirt_examined", "year_clock_last_jra_dirt_date", "year_clock_run_count", "year_clock_primary_run_count", "year_clock_fallback_run_count", "year_clock_reference_state", "year_clock_unmatched_reasons", "year_clock_adv_sec1000_mean", "idx_rank"] if c in df.columns]
                 if label == "旧AI":
                     cols = [c for c in cols if c in {"horse_no","name","jockey","ai_score","idx_rank"}]
                 display_df = df[cols].copy()
@@ -12215,6 +12268,10 @@ def render_races(day, date):
                     "evidence_coverage": "評価根拠充足率",
                     "time_score": "年次補正走破タイム",
                     "time_score_before_yearclock": "旧走破タイム",
+                    "year_clock_jra_dirt_total": "JRAダート実績（全履歴）",
+                    "year_clock_jra_dirt_examined": "時計検査対象走数",
+                    "year_clock_last_jra_dirt_date": "最終JRAダート実績日",
+                    "year_clock_unmatched_reasons": "時計未算出の理由",
                     "year_clock_run_count": "時計根拠走数",
                     "year_clock_primary_run_count": "厳密時計走数",
                     "year_clock_fallback_run_count": "代替時計走数",
@@ -12227,7 +12284,7 @@ def render_races(day, date):
                                                    "going_score_applied", "jockey_score", "jockey_score_applied", "jockey_similarity", "evidence_coverage",
                                                    "time_score", "time_score_before_yearclock"] if c in display_df.columns]
                 three_decimal_columns = [c for c in ["year_clock_adv_sec1000_mean"] if c in display_df.columns]
-                integer_columns = [c for c in ["horse_no", "jockey_evidence_runs", "going_matched_runs", "year_clock_run_count", "year_clock_primary_run_count", "year_clock_fallback_run_count", "idx_rank"] if c in display_df.columns]
+                integer_columns = [c for c in ["horse_no", "jockey_evidence_runs", "going_matched_runs", "year_clock_run_count", "year_clock_jra_dirt_total", "year_clock_jra_dirt_examined", "year_clock_primary_run_count", "year_clock_fallback_run_count", "idx_rank"] if c in display_df.columns]
 
                 def _fmt_num(v, digits):
                     if pd.isna(v):
@@ -12254,6 +12311,9 @@ def render_races(day, date):
                 for c in integer_columns:
                     display_df[c] = display_df[c].map(_fmt_int)
                 display_df = display_df.rename(columns=jp_col_map)
+                if '時計未算出の理由' in display_df.columns:
+                    display_df['時計未算出の理由']=display_df['時計未算出の理由'].map(
+                        lambda v: '／'.join(map(str,v)) if isinstance(v,list) and v else '—')
                 if '騎手タイプ' in display_df.columns:
                     display_df['騎手タイプ']=display_df['騎手タイプ'].fillna('ウマピア未照合')
                 styled = green_placed_rows(display_df, placed_set, number_col='馬番')
