@@ -53,7 +53,8 @@ with st.sidebar:
     min_confidence = st.slider("推奨最低評価点（的中確率ではありません）", 40, 95, 90, 5)
     max_recommendations = st.slider("1日あたりの指数候補表示上限（購入数ではありません）", 1, 5, 5)
     min_top_history = st.slider("上位4頭の最低過去走数", 1, 4, 4)
-    min_top_dirt = st.slider("上位4頭の最低ダート経験馬数", 2, 4, 4)
+    min_top_dirt = st.slider("上位4頭の最低ダート経験馬数（旧AI）／能力根拠数（新AI）", 2, 4, 4)
+    st.caption('新AIはダート年次時計と芝→ダート暫定根拠を区別し、どちらも能力根拠として数えます。ダート実績と混同しません。')
     bet_unit = st.number_input("1点あたりの金額 (円)", min_value=100, max_value=10000, value=100, step=100, key="box_unit")
     if st.button("🔄 Google Driveデータを更新（直接取得は保持）"):
         # 過去走と3連複の直接取得済みデータは消さない。
@@ -8938,7 +8939,7 @@ LEGACY_NEW_WEIGHTS = {"time": .25, "last3f": .20, "margin": .20,
 # 新AI: 年次補正時計55%、距離15%、馬場10%、騎手相性20%。
 # 上がり3F・着差は独立した加点を廃止。時計と重複させない。
 NEW_WEIGHTS = {"time": .55, "distance": .15, "going": .10, "jockey": .20}
-NEW_AI_VERSION = "YEARCLOCK55_JRA_DIRT_LAST4_FROM_FULL_HISTORY_20261121v3"
+NEW_AI_VERSION = "YEARCLOCK55_PLUS_TURF_TO_DIRT_EXPLORATORY_20261121v1"
 
 def going_normalize(value):
     value = unicodedata.normalize("NFKC", str(value or "")).strip()
@@ -8952,6 +8953,128 @@ def going_finish(run):
             1 < field <= 18 and 1 <= rank <= field):
         return (field-rank)/(field-1)
     return None
+
+
+# 芝→ダート挑戦の試験評価（芝時計をダートの年次時計に換算しない）。
+# 使用できるのは発走日より前の、JRA芝の着順・着差・クラス・距離だけ。
+# 指数は3着内確率ではない。未使用期間で4頭BOX的中率と回収率を検証する。
+TURF_TRANSFER_VERSION = "TURF_TO_DIRT_EXPLORATORY_V1_20261121"
+TURF_CLASS_SCORE = {"新馬":30., "未勝利":34., "1勝":40., "2勝":50.,
+                    "3勝":60., "OP":70., "G3":77., "G2":83., "G1":90.}
+
+
+def turf_transfer_from_rows(rows, target_date):
+    """netkeiba既存の全走履歴からJRA芝走を抽出。日付の後出しを禁止。"""
+    result = []
+    for r in rows or []:
+        if not isinstance(r, dict):
+            continue
+        surface = unicodedata.normalize("NFKC", str(r.get('距離') or ''))
+        sm = re.fullmatch(r'\s*芝\s*(\d{3,4})\s*(?:m|メートル)?\s*', surface)
+        if not sm:
+            continue
+        venue = str(r.get('開催') or '')
+        course = next((v for v in COURSES if v in venue), None)
+        if not course:  # 地方芝・海外芝はJRA芝と混同しない。
+            continue
+        d = str(r.get('日付') or '')[:10].replace('/', '-').replace('.', '-')
+        try:
+            day = datetime.date.fromisoformat(d)
+        except ValueError:
+            continue
+        if not isinstance(target_date, datetime.date) or day >= target_date:
+            continue
+        rank_m = re.fullmatch(r'\s*(\d{1,2})\s*',str(r.get('着順') or ''))
+        field_m = re.fullmatch(r'\s*(\d{1,2})\s*',str(r.get('頭数') or ''))
+        if not rank_m or not field_m:
+            continue
+        rank, field = int(rank_m.group(1)), int(field_m.group(1))
+        if not (2 <= field <= 18 and 1 <= rank <= field):
+            continue
+        margin_text = str(r.get('着差') or '').strip()
+        margin = float(margin_text) if re.fullmatch(r'[+-]?\d+(?:\.\d+)?',margin_text) else None
+        title = clean_text(r.get('レース名') or '')
+        result.append({'date':day.isoformat(), 'course':course, 'distance':int(sm.group(1)),
+                       'rank':rank,'field':field, 'margin':margin,
+                       'class':yc_explicit_class(title), 'race_name':title,
+                       'race_id':str(r.get('過去レースID') or '')})
+    result.sort(key=lambda r:r['date'], reverse=True)
+    seen=set(); unique=[]
+    for r in result:
+        key=(r['date'],r['course'],r['distance'],r['rank'],r['field'],r['race_id'])
+        if key not in seen:
+            seen.add(key);unique.append(r)
+    return unique[:4]
+
+
+def turf_transfer_from_excel(histories, target_date):
+    """Excelの前走〜4走前から同じ形式へ変換。走数の根拠はある分だけ。"""
+    rows=[]
+    for txt in histories or []:
+        t=clean_text(txt)
+        surface=re.search(r'(?<!\d)(?:芝\s*(\d{3,4})|(\d{3,4})\s*芝)', t)
+        if not surface:
+            continue
+        day=parse_prior_history_date(t)
+        if not day or not isinstance(target_date,datetime.date) or day >= target_date:
+            continue
+        venue=next((v for v in COURSES if re.search(r'(?:^|\n)\s*'+v+r'\s*(?:\n|$)',t)),None)
+        if not venue:
+            continue
+        rank=re.search(r'(?<!\d)(\d{1,2})着',t)
+        field=re.search(r'(?<!\d)(\d{1,2})頭',t)
+        if not rank or not field or not (2<=int(field.group(1))<=18 and 1<=int(rank.group(1))<=int(field.group(1))):
+            continue
+        margin=re.search(r'[（(]\s*([+-]?\d+(?:\.\d+)?)\s*[）)]',t)
+        rows.append({'date':day.isoformat(),'course':venue,'distance':int(surface.group(1) or surface.group(2)),
+                     'rank':int(rank.group(1)),'field':int(field.group(1)),
+                     'margin':float(margin.group(1)) if margin else None,
+                     'class':yc_explicit_class(t),'race_name':'Excel過去走','race_id':''})
+    return sorted(rows,key=lambda r:r['date'],reverse=True)[:4]
+
+
+def turf_transfer_assessment(history, target_distance, target_date):
+    """芝実績の観測値を保守的に50点へ縮約。ダート時計や確率を作らない。"""
+    if not target_distance or not isinstance(target_date,datetime.date):
+        return None
+    valid=[]
+    for r in history or []:
+        try:
+            d=datetime.date.fromisoformat(str(r['date'])[:10])
+            dist=int(r['distance']); rank=int(r['rank']); field=int(r['field'])
+            if d >= target_date or not (2<=field<=18 and 1<=rank<=field) or not (800<=dist<=3600):
+                continue
+            if r.get('course') not in COURSES:
+                continue
+        except (KeyError,TypeError,ValueError):
+            continue
+        # Recent runs are more informative but even 1 valid race remains limited evidence.
+        days=(target_date-d).days
+        w=max(.20, .5**(days/365.0))
+        finish=100.*(field-rank)/(field-1)
+        margin=r.get('margin')
+        margin_score=(max(0.,100.-22.*max(0.,float(margin))) if isinstance(margin,(int,float)) else 50.)
+        cl=r.get('class')
+        class_score=TURF_CLASS_SCORE.get(cl,50.) # unknown class gets no prestige bonus
+        ability=.60*finish+.25*margin_score+.15*class_score
+        distance_score=100.*max(0.,1.-abs(dist-int(target_distance))/1000.)
+        valid.append({'date':d.isoformat(),'distance':dist,'rank':rank,'field':field,
+                      'margin':margin,'class':cl or '不明','ability':round(ability,2),
+                      'distance_fit':round(distance_score,2),'weight':w})
+    if not valid:
+        return None
+    valid.sort(key=lambda x:x['date'],reverse=True)
+    valid=valid[:4]
+    total=sum(x['weight'] for x in valid)
+    raw=sum(x['weight']*x['ability'] for x in valid)/total
+    fit=sum(x['weight']*x['distance_fit'] for x in valid)/total
+    # Empirical correlation has NOT been calibrated: cap shrinkage at .78 and 80 points.
+    shrink=min(.78,.30+.12*len(valid))
+    proxy=max(20.,min(80.,50.+shrink*(raw-50.)))
+    return {'proxy':round(proxy,2),'turf_distance_score':round(fit,2),
+            'run_count':len(valid), 'confidence':('限定的' if len(valid)<=2 else '暫定'),
+            'evidence':valid,'version':TURF_TRANSFER_VERSION,
+            'reason':f'JRA芝{len(valid)}走・距離近似・着順・着差・明示クラスから暫定比較（ダート時計換算なし）'}
 
 
 def dirt_model_before_yearclock(horses, target_distance=None, target_going=None):
@@ -9283,6 +9406,23 @@ def dirt_model(horses, target_distance=None, target_going=None, target_date=None
         horse['year_clock_adv_sec1000_mean']=(round(float(np.mean([z['adv_sec1000'] for z in evaluations])),3) if evaluations else None)
         horse['year_clock_adv_sec1000_best']=(round(float(max(z['adv_sec1000'] for z in evaluations)),3) if evaluations else None)
         horse['year_clock_unmatched_reasons']=list(dict.fromkeys(reasons))
+        # 芝→ダートの暫定能力は、JRAダート実績が本当に0走の馬だけに適用。
+        # ダート経験があるのに基準不足の馬へ、芝の高得点で穴埋めしない。
+        transfer = (turf_transfer_assessment(horse.get('turf_transfer_histories') or [],
+                                             target_distance,target_date)
+                    if not unique_dirt and time_value is None else None)
+        horse['turf_transfer_score'] = transfer['proxy'] if transfer else None
+        horse['turf_transfer_distance_score'] = transfer['turf_distance_score'] if transfer else None
+        horse['turf_transfer_run_count'] = transfer['run_count'] if transfer else 0
+        horse['turf_transfer_confidence'] = transfer['confidence'] if transfer else None
+        horse['turf_transfer_evidence'] = transfer['evidence'] if transfer else []
+        horse['turf_transfer_reason'] = transfer['reason'] if transfer else None
+        horse['ability_evidence_type'] = ('JRAダート年次補正時計' if time_value is not None
+                                          else ('芝→ダート暫定評価' if transfer else '能力根拠不足'))
+        if transfer:
+            horse['year_clock_reference_state'] = '芝→ダート暫定評価（ダート年次時計は未算出）'
+            # 距離15%も芝の近距離実績から算出。ただし馬場10%はダート根拠なしで中立。
+            horse['distance_score'] = transfer['turf_distance_score']
         jockey_val,j_details=_jm_jockey_score(horse,target_date,style_db)
         horse.update(j_details)
         horse['jockey_score']=jockey_val
@@ -9293,17 +9433,23 @@ def dirt_model(horses, target_distance=None, target_going=None, target_date=None
         values={k:horse.get(k+'_score') for k in NEW_WEIGHTS}
         present=[k for k,val in values.items() if val is not None and np.isfinite(val)]
         coverage=sum(NEW_WEIGHTS[k] for k in present)
-        horse['evidence_coverage']=round(100*coverage,1)
+        # 芝暫定能力は時計の実測ではないため、時計55%より低い根拠充足度で表示。
+        horse['evidence_coverage']=round(100*(coverage + (.55*.65 if transfer else 0.)),1)
         horse['jockey_score_used_neutral']=jockey_val is None
-        # 時計55%は必須。分からない時計を他の要素の高得点で補完しない。
-        if time_value is None:
+        # 通常は年次時計55%必須。芝初挑戦のみ「芝暫定代理指標」55%の別ルート。
+        # time_score/year_clock_time_scoreは絶対に補完せずNoneのまま保存する。
+        comparison_time = time_value if time_value is not None else horse.get('turf_transfer_score')
+        if comparison_time is None:
             horse['ai_score']=None
-            horse['new_ai_missing_reason']='年次補正時計の根拠不足'
+            horse['new_ai_missing_reason']='JRAダート・JRA芝ともに比較可能な能力根拠なし'
         else:
-            # 不明な適性・騎手には中立50点を使用。20%を他項目に再配分しない。
-            horse['ai_score']=round(sum(NEW_WEIGHTS[k]*float(values[k] if k in present else 50.0)
+            used=dict(values)
+            used['time']=comparison_time
+            horse['ai_score']=round(sum(NEW_WEIGHTS[k]*float(used[k] if used[k] is not None and np.isfinite(used[k]) else 50.)
                                          for k in NEW_WEIGHTS),2)
-            horse['new_ai_missing_reason']='' if coverage==1.0 else '一部要素は中立50点で暫定評価'
+            horse['new_ai_missing_reason']=(
+                '芝→ダート暫定値：JRAダート時計未算出・的中率未検証' if transfer else
+                ('' if coverage==1.0 else '一部要素は中立50点で暫定評価'))
         horse['year_clock_model_version']=YC_VERSION
         horse['new_ai_model_version']=NEW_AI_VERSION
     return horses
@@ -9501,6 +9647,7 @@ def parse_sheet_rows(rows, day_label, sheet_name=""):
             "relative_score": relative_score,
             "dirt_score": dirt_score,
             "dirt_histories": [r for r in (parse_dirt_run(h) for h in valid_histories) if r],
+            "turf_transfer_histories": turf_transfer_from_excel(valid_histories, cutoff),
         })
     finish()
     return races
@@ -10832,6 +10979,7 @@ def mobile_horse_from_runs(entry, runs, target_date):
         "dirt_histories":[v for v in (parse_dirt_run(txt) for txt in texts) if v],
         "year_clock_histories": jra_dirt_clock,
         "year_clock_jra_dirt_total": len(jra_dirt_all),
+        "turf_transfer_histories": turf_transfer_from_rows(ordered, target_date),
         "jockey_full_dirt_histories":rider_history,
         "jockey_past_rides_found":sum(bool(_jm_name(v.get('jockey'))) for v in rider_history),
         "jockey_corner_rides_found":sum(bool(_jm_name(v.get('jockey'))) and v.get('corner_pos') is not None for v in rider_history),
@@ -10859,8 +11007,8 @@ def mobile_repair_race_histories(target_date, race_id, force_all=False):
                     if str(e.get('レースID')) == str(race_id) and e.get('馬番') is not None}
     wanted = []
     for h in race.get('horses') or []:
-        if (force_all or h.get('year_clock_time_score') is None
-                or not h.get('dirt_histories')
+        if (force_all or (h.get('year_clock_time_score') is None and h.get('turf_transfer_score') is None)
+                or (not h.get('dirt_histories') and not h.get('turf_transfer_score'))
                 or any(x.get('going') is None for x in (h.get('dirt_histories') or []))):
             hid = str(h.get('horse_id') or entry_by_num.get(int(h['horse_no']),{}).get('馬ID') or '')
             if re.fullmatch(r'\d{8,12}',hid):
@@ -10895,8 +11043,8 @@ def mobile_repair_race_histories(target_date, race_id, force_all=False):
             for key in ('time_index','last3f_index','history_count','dirt_runs',
                         'relative_score','dirt_score','dirt_histories',
                         'year_clock_histories','year_clock_jra_dirt_total',
-                        'jockey_full_dirt_histories','jockey_past_rides_found',
-                        'jockey_corner_rides_found'):
+                        'turf_transfer_histories',
+                        'jockey_full_dirt_histories','jockey_past_rides_found','jockey_corner_rides_found'):
                 h[key] = rebuilt[key]
             if not h.get('jockey') and rebuilt.get('jockey'):
                 h['jockey'] = rebuilt['jockey']
@@ -10904,7 +11052,7 @@ def mobile_repair_race_histories(target_date, race_id, force_all=False):
             result['repaired'] += 1
             result['details'].append(f"{entry['馬番']}番 {entry['馬名']}：過去走{len(rows)}件再取得"
                                      f"／年次時計候補JRAダート{len(rebuilt['year_clock_histories'])}走"
-                                     + ("" if rebuilt['year_clock_histories'] else "（時計は採点対象外、芝・地方走と区別）"))
+                                     + (f"／JRA芝候補{len(rebuilt.get('turf_transfer_histories') or [])}走（別評価）" if not rebuilt['year_clock_histories'] else ""))
         except Exception as exc:
             result['warnings'].append(f"{entry['馬番']}番 {entry['馬名']}：{type(exc).__name__}: {str(exc)[:150]}")
 
@@ -11169,7 +11317,7 @@ def calculate_ai_indices(horses_data):
 
 
 # --- GitHub Private repository persistence ---
-APP_VERSION = "dual-model-5.5-jra-dirt-4-from-full-history-20261121"
+APP_VERSION = "dual-model-5.6-turf-transfer-exploratory-20261121"
 
 def score_old_model(horses):
     data = []
@@ -11263,7 +11411,7 @@ def screen_scored_race_old(race, df):
 
 
 def yc_unassessed_horses(df):
-    """人気やオッズによる足切りなし。全出走馬について時計評価の欠損を確認。"""
+    """人気足切りなし。ダート時計または芝転向の暫定評価が無い馬を検出。"""
     if df is None or df.empty:
         return []
     values = pd.to_numeric(df['ai_score'], errors='coerce')
@@ -11282,7 +11430,7 @@ def screen_scored_race_new(race, df):
         return None, "出走馬6頭未満", df
     missing=yc_unassessed_horses(df)
     if missing:
-        return None, "選考対象外：出走馬に年次時計の根拠がない馬あり（全馬確認・馬番" + ",".join(map(str,missing)) + "）", df
+        return None, "選考対象外：ダート時計・芝転向のどちらも根拠がない馬（馬番" + ",".join(map(str,missing)) + "）", df
     coverage = float(df["history_count"].gt(0).mean() * 100)
     dirt_coverage = float(df["dirt_runs"].gt(0).mean() * 100)
     if coverage < min_coverage:
@@ -11295,9 +11443,13 @@ def screen_scored_race_new(race, df):
     if top["history_count"].lt(min_top_history).any():
         return None, "上位4頭の過去走数不足", df
     top_dirt = int(top["dirt_runs"].gt(0).sum())
-    if top_dirt < min_top_dirt:
-        return None, "上位4頭のダート経験不足", df
-    
+    # 新AIではダート時計のある馬と芝→ダート暫定評価のある馬を
+    # 「能力根拠あり」として選考。実際のダート経験頭数は別数値のまま表示。
+    supported_top=int(top['ability_evidence_type'].isin(('JRAダート年次補正時計','芝→ダート暫定評価')).sum())
+    transfer_top=int(top['ability_evidence_type'].eq('芝→ダート暫定評価').sum())
+    if supported_top < min_top_dirt:
+        return None, f"上位4頭の有効能力根拠が不足 ({supported_top}/4)", df
+
     avg_runs = float(top["history_count"].mean())
     
     # 新AIの評価点バランス調整：
@@ -11305,15 +11457,23 @@ def screen_scored_race_new(race, df):
     top_scores_mean = float(top["ai_score"].mean()) if "ai_score" in top.columns and top["ai_score"].notna().all() else 70.0
     score_level = np.clip((top_scores_mean - 50.0) / 30.0 * 100.0, 40.0, 100.0)
     
-    quality = min(100., 0.25 * coverage + 0.20 * dirt_coverage +
+    # ダート経験と芝転向暫定根拠は別。レース評価の20%枠は「能力根拠保有率」。
+    # 暫定根拠は一部割引し、決してダート実績として数えない。
+    ability_support = 100. * (df['ability_evidence_type'].eq('JRAダート年次補正時計').sum()
+                              + .65 * df['ability_evidence_type'].eq('芝→ダート暫定評価').sum()) / len(df)
+    dirt_clock_top=int(top['ability_evidence_type'].eq('JRAダート年次補正時計').sum())
+    top_support = (dirt_clock_top + .65 * transfer_top) / 4 * 100.
+    quality = min(100., 0.25 * coverage + 0.20 * ability_support +
                   0.20 * min(100., avg_runs / 4 * 100) +
-                  0.15 * (top_dirt / 4 * 100) +
+                  0.15 * min(100.,top_support) +
                   0.20 * score_level)
     
     if quality < min_confidence:
         return None, f"評価点不足 ({quality:.0f})", df
     return {"score": round(quality), "gap": 0.0, "coverage": round(coverage),
             "dirt_coverage": round(dirt_coverage), "top_dirt": top_dirt,
+            "top_turf_transfer":transfer_top,"top_dirt_clock":dirt_clock_top,
+            "top_ability_supported":supported_top,
             "top_avg_runs": round(avg_runs, 1)}, None, df
 
 
@@ -11327,7 +11487,10 @@ def dual_snapshot(date, race, evaluations, settings):
             top = []
         models[label] = {"top4": top, "eligible": ev["metrics"] is not None,
                          "metrics": ev["metrics"], "reason": ev["reason"],
-                         "scores": [{"horse_no": int(r["horse_no"]), "ai_score": float(r["ai_score"]) if pd.notna(r["ai_score"]) else None}
+                         "scores": [{"horse_no": int(r["horse_no"]), "ai_score": float(r["ai_score"]) if pd.notna(r["ai_score"]) else None,
+                                     "evidence_type":(r.get('ability_evidence_type','能力根拠不足') if label=='新AI' else '旧AI'),
+                                     "turf_transfer_score": (float(r['turf_transfer_score']) if label=='新AI' and pd.notna(r.get('turf_transfer_score')) else None),
+                                     "turf_transfer_runs":(int(r.get('turf_transfer_run_count') or 0) if label=='新AI' else 0)}
                                     for _, r in df.iterrows()]}
     # 新AIの時計不足を旧AI4頭で補填して購入対象にしない。
     primary = models["新AI"]
@@ -11776,6 +11939,29 @@ def mobile_rehydrate_jockey_from_saved(races, entries, histories):
     return restored
 
 
+def mobile_rehydrate_turf_from_saved(races, histories):
+    """古い保存データの全過去走から、発走前の芝転向根拠を再構築。"""
+    by_horse={}
+    for r in histories or []:
+        hid=str(r.get('馬ID') or '')
+        if hid:by_horse.setdefault(hid,[]).append(r)
+    restored=0
+    for race in races or []:
+        target=race.get('race_date')
+        if isinstance(target,str):
+            try:target=datetime.date.fromisoformat(target[:10])
+            except ValueError:continue
+        if not isinstance(target,datetime.date):continue
+        for h in race.get('horses') or []:
+            hid=str(h.get('horse_id') or '')
+            if not hid or hid not in by_horse:continue
+            turf=turf_transfer_from_rows(by_horse[hid],target)
+            if turf:
+                h['turf_transfer_histories']=turf
+                restored+=1
+    return restored
+
+
 def mobile_apply_restored_state(state):
     # 公開騎手履歴を先に戻す。アプリ再起動後もタイプ比較を欠損させない。
     saved_external=state.get('jm_external_profiles') or {}
@@ -11787,6 +11973,7 @@ def mobile_apply_restored_state(state):
     if isinstance(state.get('jm_external_diagnostics'),dict):
         st.session_state['jm_external_diagnostics']=state['jm_external_diagnostics']
     mobile_rehydrate_jockey_from_saved(state.get('mobile_scraped_races'),state.get('mobile_entries'),state.get('mobile_histories'))
+    mobile_rehydrate_turf_from_saved(state.get('mobile_scraped_races'),state.get('mobile_histories'))
     for key, val in state.items():
         if key in ("mobile_scraped_races", "mobile_entries", "mobile_histories", "mobile_diagnostics",
                    "mobile_scrape_meta", "trio_market_snapshots", "trio_market_errors", "trio_market_diagnostics",
@@ -12066,6 +12253,8 @@ def render_races(day, date):
     if mismatches:
         st.error(f"{day}: 開催日が不一致のレースが{len(mismatches)}件あります。確定保存を停止しました。")
         return
+    # 保存済み履歴から芝転向データを再構築。取得済みの過去走は再通信不要。
+    mobile_rehydrate_turf_from_saved(source_races, st.session_state.get('mobile_histories') or [])
     # レース自体が旧版の保存データでも、開催日で紐づく騎手分析を復元してから採点。
     jm_restore_profiles_github(date)
     day_jockeys=[_jm_rider_name(h.get('jockey')) for rr in source_races for h in rr.get('horses',[])]
@@ -12123,8 +12312,8 @@ def render_races(day, date):
             target=options[choice]
             miss=[int(h['horse_no']) for h in target.get('horses',[])
                   if h.get('year_clock_time_score') is None]
-            st.caption('年次補正時計の未評価馬番：'+(', '.join(map(str,miss)) if miss else 'なし')+
-                       '。人気の順位にかかわらず、全馬が比較対象です。')
+            st.caption('ダート年次補正時計がない馬番：'+(', '.join(map(str,miss)) if miss else 'なし')+
+                       '。JRA芝実績だけの馬は別欄の「芝→ダート暫定評価」で比較します。')
             if miss:
                 states=[]
                 for h in target.get('horses',[]):
@@ -12133,6 +12322,7 @@ def render_races(day, date):
                         states.append(f"{h.get('horse_no')}番 {h.get('name')}: "
                                       f"中央ダート{h.get('year_clock_jra_dirt_total', '未確認')}走・"
                                       f"{h.get('year_clock_reference_state') or '未評価'}"
+                                      + (f"／芝暫定{h['turf_transfer_score']:.2f}点（{h.get('turf_transfer_run_count',0)}走）" if h.get('turf_transfer_score') is not None else '')
                                       + (f"（{reasons}）" if reasons else ''))
                 with st.expander('未評価の理由（過去走未取得と芝・地方履歴を区別）'):
                     for msg in states:st.write(msg)
@@ -12182,8 +12372,38 @@ def render_races(day, date):
     with st.expander("除外レースと理由"):
         for name, reason in excluded:
             st.write(name, "：", reason)
+    # 芝転向馬が多いレースは推奨評価90点に届かなくても分析できる。
+    # この表示は推奨・買い目確定・ROI集計には使わず、未検証の探索結果と区別。
+    research=[]
+    for rr in source_dirt:
+        if not any(h.get('turf_transfer_histories') for h in rr.get('horses',[])):
+            continue
+        rd=model_frames(rr)['新AI']
+        transfers=rd[rd.get('ability_evidence_type',pd.Series(dtype=object)).eq('芝→ダート暫定評価')]
+        if not transfers.empty:
+            research.append((rr,rd,transfers))
+    if research:
+        with st.expander(f"🧪 芝→ダート挑戦馬の試験評価（{len(research)}レース・推奨判定と別）", expanded=True):
+            st.caption('単勝人気は能力評価に未使用。芝での好走がダートでも再現する保証はありません。'
+                       'レースの評価点90に届かなくても参考比較できますが、ここから予想は自動保存されません。')
+            for rr,rd,transfers in research:
+                st.markdown('**'+rr.get('race_name','対象レース')+'**')
+                ranking=rd[['horse_no','name','ai_score','idx_rank','ability_evidence_type']].head(4)
+                st.caption('暫定混合上位4頭：'+', '.join(f"{int(row.horse_no)}番{row.name}" for row in ranking.itertuples(index=False)))
+                details=[]
+                for _,h in transfers.iterrows():
+                    details.append({'馬番':int(h['horse_no']),'馬名':h['name'],
+                                    '単勝人気（採点に未使用）':h.get('pop_rank'),
+                                    '新AI順位':int(h['idx_rank']),
+                                    '新AI比較指数':round(float(h['ai_score']),2),
+                                    '芝暫定指数':h.get('turf_transfer_score'),
+                                    '芝根拠走数':int(h.get('turf_transfer_run_count') or 0),
+                                    '根拠区分':h.get('turf_transfer_confidence'),
+                                    '今回条件':f"{rr.get('course')}ダ{rr.get('target_distance')}m"})
+                st.dataframe(pd.DataFrame(details),hide_index=True,use_container_width=True)
+                st.caption('ダート年次時計を算出したことにはしません。暫定指数と通常指数は別の根拠体系です。')
     if not selected:
-        st.warning("推奨対象レースはありません。")
+        st.warning("推奨対象レースはありません。試験評価がある場合は上記を確認してください。")
         return
     for race, evaluations in selected:
         st.subheader("🏇 " + race["race_name"])
@@ -12235,15 +12455,15 @@ def render_races(day, date):
                 top = sorted(int(x) for x in df.head(4)["horse_no"])
                 if label == "新AI" and ev.get('metrics') is None and yc_unassessed_horses(df):
                     top = []
-                    st.warning("選考対象外：評価に必要な年次補正時計の基準が不足しています。"
-                               "代替基準にも適合しない馬を除外して4頭を繰り上げ選出しません。")
+                    st.warning("選考対象外：ダート時計も芝転向の暫定根拠もない馬がいます。"
+                               "根拠のない馬を最下位にして4頭を繰り上げ選出しません。")
                 if not top:
-                    st.write("新AI：時計根拠不足のため買い目は出しません。")
+                    st.write("新AI：能力根拠不足のため買い目は出しません。")
                 elif race.get("horse_numbers_unverified"):
                     st.write("馬番未確認：買い目は表示しません。指数は参考値です。")
                 else:
                     st.markdown("3連複4点： " + green_combo_html(list(itertools.combinations(top, 3)), placed_set), unsafe_allow_html=True)
-                cols = [c for c in ["horse_no", "name", "ai_score", "ai_score_before_yearclock", "ai_score_yearclock25_before", "distance_score", "going_score_applied", "going_matched_runs", "going_evaluation_reason", "jockey", "jockey_score", "jockey_score_applied", "jockey_type", "horse_running_style", "jockey_scoring_method", "jockey_similarity", "jockey_evidence_runs", "evidence_coverage", "time_score", "time_score_before_yearclock", "year_clock_jra_dirt_total", "year_clock_jra_dirt_examined", "year_clock_last_jra_dirt_date", "year_clock_run_count", "year_clock_primary_run_count", "year_clock_fallback_run_count", "year_clock_reference_state", "year_clock_unmatched_reasons", "year_clock_adv_sec1000_mean", "idx_rank"] if c in df.columns]
+                cols = [c for c in ["horse_no", "name", "ai_score", "ability_evidence_type", "turf_transfer_score", "turf_transfer_run_count", "turf_transfer_confidence", "turf_transfer_reason", "ai_score_before_yearclock", "ai_score_yearclock25_before", "distance_score", "going_score_applied", "going_matched_runs", "going_evaluation_reason", "jockey", "jockey_score", "jockey_score_applied", "jockey_type", "horse_running_style", "jockey_scoring_method", "jockey_similarity", "jockey_evidence_runs", "evidence_coverage", "time_score", "time_score_before_yearclock", "year_clock_jra_dirt_total", "year_clock_jra_dirt_examined", "year_clock_last_jra_dirt_date", "year_clock_run_count", "year_clock_primary_run_count", "year_clock_fallback_run_count", "year_clock_reference_state", "year_clock_unmatched_reasons", "year_clock_adv_sec1000_mean", "idx_rank"] if c in df.columns]
                 if label == "旧AI":
                     cols = [c for c in cols if c in {"horse_no","name","jockey","ai_score","idx_rank"}]
                 display_df = df[cols].copy()
@@ -12251,6 +12471,11 @@ def render_races(day, date):
                     "horse_no": "馬番",
                     "name": "馬名",
                     "ai_score": label + "指数",
+                    "ability_evidence_type": "能力根拠区分",
+                    "turf_transfer_score": "芝→ダート暫定指数（時計ではない）",
+                    "turf_transfer_run_count": "JRA芝根拠走数",
+                    "turf_transfer_confidence": "芝転向根拠の充足度",
+                    "turf_transfer_reason": "芝転向の根拠",
                     "ai_score_before_yearclock": "旧AI指数",
                     "ai_score_yearclock25_before": "旧年次時計25%指数",
                     "distance_score": "距離適性",
@@ -12282,9 +12507,9 @@ def render_races(day, date):
                 one_decimal_columns = []
                 two_decimal_columns = [c for c in ["ai_score", "ai_score_before_yearclock", "ai_score_yearclock25_before", "distance_score",
                                                    "going_score_applied", "jockey_score", "jockey_score_applied", "jockey_similarity", "evidence_coverage",
-                                                   "time_score", "time_score_before_yearclock"] if c in display_df.columns]
+                                                   "time_score", "time_score_before_yearclock", "turf_transfer_score"] if c in display_df.columns]
                 three_decimal_columns = [c for c in ["year_clock_adv_sec1000_mean"] if c in display_df.columns]
-                integer_columns = [c for c in ["horse_no", "jockey_evidence_runs", "going_matched_runs", "year_clock_run_count", "year_clock_jra_dirt_total", "year_clock_jra_dirt_examined", "year_clock_primary_run_count", "year_clock_fallback_run_count", "idx_rank"] if c in display_df.columns]
+                integer_columns = [c for c in ["horse_no", "jockey_evidence_runs", "going_matched_runs", "year_clock_run_count", "year_clock_jra_dirt_total", "year_clock_jra_dirt_examined", "year_clock_primary_run_count", "year_clock_fallback_run_count", "turf_transfer_run_count", "idx_rank"] if c in display_df.columns]
 
                 def _fmt_num(v, digits):
                     if pd.isna(v):
@@ -12320,8 +12545,9 @@ def render_races(day, date):
                 if label == "旧AI":
                     st.caption("旧AIの指数には騎手相性を使いません。騎手相性は下の新AIで確認できます。")
                 if label == "新AI":
-                    st.caption("新AIは年次補正走破タイム55%、距離適性15%、馬場適性10%、騎手相性20%。"
-                               "騎手相性・馬場適性が不明な場合は、それぞれ中立50点です。")
+                    st.caption("新AIはダート年次補正時計55%・距離15%・馬場10%・騎手20%。"
+                               "JRAダート未経験馬のみ、55%の時計枠を芝実績の暫定能力に置換（時計換算ではない）。"
+                               "芝転向評価は未検証で、馬場は中立50点。指数は的中確率ではありません。")
                     confirmed_going=going_effective(race)
                     st.caption(f"今回のダート馬場：{confirmed_going or '未確認'}"
                                + (f" ｜ {race.get('going_source') or '読み込み元'}"
@@ -12369,6 +12595,20 @@ def render_races(day, date):
                             st.dataframe(pd.DataFrame(evidence_rows),hide_index=True,use_container_width=True)
                         else:
                             st.warning("同条件の基準時計に照合できた過去走はありません。時計は採点していません。")
+                        turf_rows=[]
+                        for _,hr in df.iterrows():
+                            for obs in hr.get('turf_transfer_evidence') or []:
+                                turf_rows.append({'馬番':int(hr['horse_no']),'馬名':hr.get('name'),
+                                                  '過去芝走日':obs['date'],'距離m':obs['distance'],
+                                                  '着順':obs['rank'],'頭数':obs['field'],
+                                                  '着差秒':obs.get('margin'),'クラス':obs.get('class'),
+                                                  '芝内能力':obs.get('ability'),'今回距離への近さ':obs.get('distance_fit'),
+                                                  '備考':'JRAダート時計ではない'})
+                        if turf_rows:
+                            st.markdown('**芝→ダート初挑戦の暫定評価根拠（発走前の芝成績だけ）**')
+                            st.dataframe(pd.DataFrame(turf_rows),hide_index=True,use_container_width=True)
+                            st.caption('芝とダートの時計を直接換算せず、着順・着差・明示クラス・距離適合を使う仮説。'
+                                       '新AIの4頭BOXに影響するため、従来版との的中率・回収率比較が必要です。')
                         missing = [{"馬番":int(hr['horse_no']),"馬名":hr.get('name'),
                                     "非採用理由":" / ".join(hr.get('year_clock_unmatched_reasons') or [])}
                                    for _,hr in df.iterrows() if hr.get('year_clock_unmatched_reasons')]
@@ -12387,7 +12627,7 @@ def render_races(day, date):
         pre_start = save_timing == "発走前取得"
         if not pre_start:
             st.caption(f"確定保存不可：{save_timing}。結果を知った後のデータを事前予想に混ぜません。")
-        # 年次時計の欠損を空欄のまま確定保存しない。発走後の事後データも禁止。
+        # ダート時計か、実測芝走に基づく暫定評価が全馬に必要。発走後の事前保存は禁止。
         save_reasons=[]
         if not verified or detected_date!=date:
             save_reasons.append('開催日不一致')
@@ -12399,7 +12639,7 @@ def render_races(day, date):
             save_reasons.append('馬番未検証')
         missing_all=yc_unassessed_horses(evaluations['新AI']['df'])
         if missing_all:
-            save_reasons.append('全出走馬の年次時計評価が揃いません（馬番'+','.join(map(str,missing_all))+'）')
+            save_reasons.append('全出走馬の能力根拠が不足（ダート時計・芝暫定ともなし：馬番'+','.join(map(str,missing_all))+'）')
         try:
             rec=dual_snapshot(date,race,evaluations,settings)
             for label in ('旧AI','新AI'):
@@ -12411,8 +12651,8 @@ def render_races(day, date):
         if save_reasons:
             st.warning('確定保存できない理由：'+'／'.join(save_reasons))
             if missing_all:
-                st.caption('上の「過去走・年次補正時計を修復」で対象レースを選び、過去走の取得と時計基準の根拠を確認してください。'
-                           '基準不足が残る場合は推測値で埋めず、事前確定を止めます。')
+                st.caption('過去走を照合してください。JRA芝の有効な実績があれば別系統で暫定評価します。'
+                           '両方の根拠が無い場合、推測値では埋めず事前確定を止めます。')
         if st.button('💾 旧AI・新AIの予想を同時に確定保存',
                      key='save_'+race_key(date,race), disabled=bool(save_reasons)):
             path=f"predictions/{date.year}/{rec['race_id']}.json"
