@@ -9922,7 +9922,7 @@ def mobile_get_soup(url, session=None, tries=3):
 # ※当年累計成績は発走前の過去時点を再現できないため能力点に使用しない。
 # ※騎手タイプは4角位置からの傾向であり手腕や因果効果ではない。
 # ====================================================================
-JM_PUBLIC_VERSION = "umapia-rides-style-20261121-v4"
+JM_PUBLIC_VERSION = "umapia-rides-style-20261122-v5-index-complete"
 JM_PUBLIC_MAX_RIDERS = 160   # 当日の現役騎手を最優先。従来の18人制限を廃止。
 
 # 開催日ごとにウマピアの「開催前騎乗のみ」の診断用履歴を分離保存する。
@@ -10126,20 +10126,25 @@ def jm_public_next_page(soup,url):
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def jm_public_index_cached(year):
+    """全ページのリンクを照合する。途中失敗した一覧を成功扱いでキャッシュしない。"""
     url=f'https://umapia.jp/search/jockeys?year={int(year)}'
     profiles={}
-    for _ in range(6):
-        try:
-            soup=jm_public_get_soup(url)
-            for name,jid in jm_public_umapia_index(soup).items():
-                profiles.setdefault(name,set()).add(jid)
-            url=jm_public_next_page(soup,url)
-        except Exception:
-            if not profiles:
-                raise
+    visited=set()
+    for _ in range(60):
+        if not url or url in visited:
             break
-        if not url:
-            break
+        visited.add(url)
+        soup=jm_public_get_soup(url)
+        for name,jid in jm_public_umapia_index(soup).items():
+            profiles.setdefault(name,set()).add(jid)
+        url=jm_public_next_page(soup,url)
+    else:
+        if url:
+            raise RuntimeError('ウマピア一覧が60ページを超えました。未完了一覧は使用しません')
+    if url and url in visited:
+        raise RuntimeError('ウマピア一覧に循環ページがあり、完全取得できません')
+    if not profiles:
+        raise RuntimeError('ウマピアの騎手一覧を取得できません')
     return {nm:next(iter(ids)) for nm,ids in profiles.items() if len(ids)==1}
 
 
@@ -10183,16 +10188,31 @@ def jm_public_enrich(races, target_date, selected_rid=None, max_riders=JM_PUBLIC
     errors=[]
     if len(missing)>len(requested):
         errors.append(f'当日騎乗する騎手{len(missing)-len(requested)}名は取得上限で未取得')
+    # 手動再取得では不完全な旧キャッシュを再利用しない。
+    if force_refresh:
+        jm_public_index_cached.clear()
+        jm_public_rides_cached.clear()
     try:
         index=jm_public_index_cached(target_date.year)
     except Exception as exc:
         index={}
         errors.append('ウマピア一覧: '+str(exc)[:150])
     profiles=dict(old)
+    # 過去に実ページで照合できたIDは一覧障害時にも再利用する。
+    # 名前だけからIDを推測したり、他の騎手へ割り当てたりしない。
+    known_ids={}
+    for nm,profile in old.items():
+        if not isinstance(profile,dict):
+            continue
+        rid=str(profile.get('jockey_id') or '')
+        if re.fullmatch(r'\d{1,8}',rid) and 'ウマピア' in str(profile.get('source') or ''):
+            known_ids[_jm_name(nm)]=rid
+    for nm,rid in known_ids.items():
+        index.setdefault(nm,rid)
     available=[(nm,index[nm]) for nm in requested if nm in index]
     absent=[nm for nm in requested if nm not in index]
     if absent:
-        errors.append('騎手ID不明: '+','.join(absent[:14]))
+        errors.append('騎手ID未照合（一覧の不足・表記差など）: '+','.join(absent[:14]))
     def retrieve(item):
         nm,rid=item
         try:
