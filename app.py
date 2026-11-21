@@ -11472,7 +11472,7 @@ def calculate_ai_indices(horses_data):
 
 
 # --- GitHub Private repository persistence ---
-APP_VERSION = "dual-model-5.7-jockey-id-recovery-20261121"
+APP_VERSION = "dual-model-5.8-evidence-aware-snapshot-20261121"
 
 def score_old_model(horses):
     data = []
@@ -11637,11 +11637,13 @@ def dual_snapshot(date, race, evaluations, settings):
     for label, ev in evaluations.items():
         df = ev["df"]
         top = [int(x) for x in df.head(4)["horse_no"]] if df["ai_score"].notna().sum() >= 4 else []
-        if label == "新AI" and yc_unassessed_horses(df):
-            # 欠損馬を最下位と決めつけず、全馬に比較可能な時計根拠があるまで固定しない。
-            top = []
+        # 能力根拠がない馬がいても、算出済み指数の上位4頭を固定保存する。
+        # 未評価馬を低能力と断定したわけではないことを保存記録にも明示する。
+        missing_evidence = yc_unassessed_horses(df) if label == "新AI" else []
         models[label] = {"top4": top, "eligible": ev["metrics"] is not None,
                          "metrics": ev["metrics"], "reason": ev["reason"],
+                         "unassessed_horse_numbers": missing_evidence,
+                         "comparison_complete": not bool(missing_evidence),
                          "scores": [{"horse_no": int(r["horse_no"]), "ai_score": float(r["ai_score"]) if pd.notna(r["ai_score"]) else None,
                                      "evidence_type":(r.get('ability_evidence_type','能力根拠不足') if label=='新AI' else '旧AI'),
                                      "turf_transfer_score": (float(r['turf_transfer_score']) if label=='新AI' and pd.notna(r.get('turf_transfer_score')) else None),
@@ -12816,20 +12818,20 @@ def render_races(day, date):
             save_reasons.append('馬番未検証')
         missing_all=yc_unassessed_horses(evaluations['新AI']['df'])
         if missing_all:
-            save_reasons.append('全出走馬の能力根拠が不足（ダート時計・芝暫定ともなし：馬番'+','.join(map(str,missing_all))+'）')
+            st.warning('能力根拠不足の馬番：'+','.join(map(str,missing_all))+
+                       '。未評価馬との能力比較は不完全です。欠損を埋めず、この状態を記録して保存します。')
         try:
             rec=dual_snapshot(date,race,evaluations,settings)
             for label in ('旧AI','新AI'):
                 if len(rec.get('models',{}).get(label,{}).get('top4',[]))!=4:
-                    save_reasons.append(label+'の根拠付き4頭が確定できません')
+                    save_reasons.append(label+'の指数算出済み4頭が揃いません')
         except Exception as exc:
             rec=None
             save_reasons.append('保存用データ生成失敗：'+str(exc)[:150])
         if save_reasons:
             st.warning('確定保存できない理由：'+'／'.join(save_reasons))
             if missing_all:
-                st.caption('過去走を照合してください。JRA芝の有効な実績があれば別系統で暫定評価します。'
-                           '両方の根拠が無い場合、推測値では埋めず事前確定を止めます。')
+                st.caption('能力根拠の欠落は保存記録に残ります。出走馬の評価不足は引き続き確認してください。')
         if st.button('💾 旧AI・新AIの予想を同時に確定保存',
                      key='save_'+race_key(date,race), disabled=bool(save_reasons)):
             path=f"predictions/{date.year}/{rec['race_id']}.json"
