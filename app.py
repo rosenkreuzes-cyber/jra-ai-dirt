@@ -9143,6 +9143,11 @@ def _jm_name(value):
     v = re.sub(r"[（(](?:替|乗替|減量)[）)]$", "", v)
     v = re.sub(r"\s+", "", v)
     v = v.replace("·", ".").replace("・", ".")
+    # netkeiba等では外国人騎手のイニシャルの句点が省かれることがある。
+    # MデムーロとCデムーロを「デムーロ」にまとめず、必ず区別して保存する。
+    v = re.sub(r"^([A-Za-z]{1,3})(?=[一-龯々ぁ-ゖァ-ヺー])", r"\1.", v)
+    verified_short = {"M.デム": "M.デムーロ", "C.デム": "C.デムーロ"}
+    v = verified_short.get(v, v)
     # 略称とフル表記の同一性が確認できた騎手だけ対応づける。
     if v.casefold() in {"c.ルメール", "cルメール", "ルメール"}:
         return "ルメール"
@@ -9155,6 +9160,66 @@ def _jm_rider_name(value):
     if name in {"未定", "騎手未定", "騎手なし", "取消", "除外", "未取得", "データ不足"}:
         return ""
     return name if re.fullmatch(r"(?:[A-Za-z]{1,3}\.){0,2}[一-龯々ぁ-ゖァ-ヺー]{2,18}", name) else ""
+
+
+def _jm_rider_from_jockey_cell(value):
+    """騎手専用セル内の氏名を抽出。斤量や乗替表記を名前に混ぜない。
+
+    姓のみの「デムーロ」はM/Cの別を確定できないため採用しない。
+    行全体や馬名欄は解析対象にせず、騎手欄・騎手リンクに限定する。
+    """
+    direct = _jm_rider_name(value)
+    if direct and direct not in {"デムーロ", "デム"}:
+        return direct
+    raw = unicodedata.normalize("NFKC", html.unescape(str(value or "")))
+    raw = re.sub(r"[\u200b\u200e\u200f]", "", raw)
+    raw = re.sub(r"^(?:騎手|騎手名|乗替|乗り替わり)\s*[:：]?\s*", "", raw)
+    raw = re.sub(r"(?<=[一-龯々])\s+(?=[一-龯々])", "", raw)
+    # 斤量・騎乗変更などを含むテーブルセルから、名前だけを取り出す。
+    # Unicode日本語と英字イニシャルの組み合わせのみ受理する。
+    pattern = r"(?<![A-Za-z一-龯々ぁ-ゖァ-ヺー])(?:[A-Za-z]{1,3}\.?)?[一-龯々ぁ-ゖァ-ヺー]{2,18}(?![A-Za-z一-龯々ぁ-ゖァ-ヺー])"
+    forbidden = {"騎手", "騎手名", "斤量", "乗替", "乗り替わり", "替", "未定", "取消", "除外",
+                 "未取得", "調教師", "デムーロ", "デム", "騎乗", "負担重量"}
+    candidates = []
+    for match in re.finditer(pattern, raw):
+        name = _jm_rider_name(match.group(0))
+        if name and name not in forbidden and name not in candidates:
+            candidates.append(name)
+    return candidates[0] if len(candidates)==1 else ""
+
+
+def mobile_jockey_from_shutuba_row(tr, jockey_column_index=None, header_column_count=None):
+    """出馬表1行の明示された騎手列・リンクだけを使用する。馬番や馬名からは推測しない。"""
+    # 最も強い根拠は騎手プロフィールへのリンク。名前と斤量の混在にも対応。
+    links = tr.select('a[href*="/jockey/"], a[href*="jockey_id="]')
+    candidates = []
+    for a in links:
+        for val in (a.get_text(" ", strip=True), a.get('title'), a.get('aria-label')):
+            name = _jm_rider_from_jockey_cell(val)
+            if name and name not in candidates:
+                candidates.append(name)
+    if len(candidates)==1:
+        return candidates[0], "騎手リンク"
+    if len(candidates)>1:
+        return "", "騎手リンクの名前が複数・要確認"
+
+    # サイト更新で騎手リンクが外れても専用セルを解析する。
+    nodes = tr.select('td.Jockey, td[class*="Jockey"], td[class*="jockey"], td[class*="Kishu"], td[class*="kishu"]')
+    if jockey_column_index is not None and header_column_count is not None:
+        cells = tr.find_all('td', recursive=False)
+        # 列数が違う行は別構造なのでヘッダー位置を当てはめない。
+        if len(cells)==header_column_count and cells[jockey_column_index] not in nodes:
+            nodes.append(cells[jockey_column_index])
+    for node in nodes:
+        for val in (node.get_text(" ",strip=True),node.get('title'),node.get('aria-label'),node.get('data-jockey')):
+            name=_jm_rider_from_jockey_cell(val)
+            if name and name not in candidates:
+                candidates.append(name)
+    if len(candidates)==1:
+        return candidates[0], "騎手専用セル"
+    if len(candidates)>1:
+        return "", "騎手専用セルの名前が複数・要確認"
+    return "", "騎手欄から氏名を識別できません"
 
 
 def _jm_corner(value, field):
@@ -9776,7 +9841,7 @@ def mobile_get_soup(url, session=None, tries=3):
 # ※当年累計成績は発走前の過去時点を再現できないため能力点に使用しない。
 # ※騎手タイプは4角位置からの傾向であり手腕や因果効果ではない。
 # ====================================================================
-JM_PUBLIC_VERSION = "umapia-rides-style-20261115-v3"
+JM_PUBLIC_VERSION = "umapia-rides-style-20261121-v4"
 JM_PUBLIC_MAX_RIDERS = 160   # 当日の現役騎手を最優先。従来の18人制限を廃止。
 
 # 開催日ごとにウマピアの「開催前騎乗のみ」の診断用履歴を分離保存する。
@@ -10681,6 +10746,17 @@ def mobile_parse_shutuba(soup, rid, target_date):
     entrants = []
     problems = []
     rows = table.select("tbody tr") or table.select("tr")
+    # 見出しに騎手欄がある場合、classのないセルも列番号で照合する。
+    jockey_col_index=None
+    jockey_header_cell_count=None
+    for head in table.select('thead tr'):
+        cols=head.find_all(['td','th'],recursive=False)
+        header_names=[re.sub(r"\s+","",x.get_text(" ",strip=True)) for x in cols]
+        indices=[i for i,nm in enumerate(header_names) if nm in ('騎手','騎手名','騎手(斤量)','騎手（斤量）')]
+        if len(indices)==1 and len(cols)>=8:
+            jockey_col_index=indices[0]
+            jockey_header_cell_count=len(cols)
+            break
     for tr in rows:
         horse_link = tr.select_one('a[href*="/horse/"]')
         if horse_link is None:
@@ -10714,15 +10790,13 @@ def mobile_parse_shutuba(soup, rid, target_date):
                 if m:
                     popularity = mobile_number(m.group(1))
                     break
-        j_link = tr.select_one('a[href*="/jockey/"], a[href*="jockey_id="]')
-        j_cell = tr.select_one('td.Jockey, td[class*="Jockey"]')
-        jockey_now = _jm_rider_name(mobile_visible_text(j_link)) or _jm_rider_name(mobile_visible_text(j_cell))
+        jockey_now, jockey_source = mobile_jockey_from_shutuba_row(tr,jockey_col_index,jockey_header_cell_count)
         if not jockey_now:
-            problems.append(f"騎手名未取得:{name}")
+            problems.append(f"騎手名未取得:{horse_number}番 {name}（{jockey_source}）")
         entrants.append({
             "レースID":rid, "開催日":target_date.isoformat(), "馬番":horse_number,
             "馬名":name, "馬ID":horse_id, "オッズ":odds, "人気":popularity,
-            "騎手":_jm_name(jockey_now),
+            "騎手":jockey_now, "騎手取得元":jockey_source,
         })
     if not entrants:
         raise RuntimeError("出走表から有効な馬番・馬名・馬IDを取得できません")
@@ -11317,7 +11391,7 @@ def calculate_ai_indices(horses_data):
 
 
 # --- GitHub Private repository persistence ---
-APP_VERSION = "dual-model-5.6-turf-transfer-exploratory-20261121"
+APP_VERSION = "dual-model-5.6-jockey-name-recovery-20261121"
 
 def score_old_model(horses):
     data = []
@@ -11906,7 +11980,13 @@ def mobile_rehydrate_jockey_from_saved(races, entries, histories):
         for h in race.get("horses") or []:
             e = entry_map.get((str(race.get("netkeiba_race_id")),str(h.get("horse_no"))),{})
             new_name = _jm_rider_name(e.get("騎手"))
-            if not _jm_rider_name(h.get("jockey")) and new_name:
+            existing_name = _jm_rider_name(h.get("jockey"))
+            if not new_name and existing_name and e:
+                e["騎手"] = existing_name
+                e["騎手取得元"] = e.get("騎手取得元") or "保存済み出走馬情報"
+                new_name = existing_name
+                restored += 1
+            if not existing_name and new_name:
                 h["jockey"] = new_name
                 restored += 1
             hid = str(h.get("horse_id") or e.get("馬ID") or "")
@@ -12053,8 +12133,10 @@ def mobile_refresh_jockey_data(races, entries, histories, target_date):
             fresh_map={(str(e['馬番']),str(e['馬ID'])):e for e in fresh}
             for e in missing:
                 f=fresh_map.get((str(e['馬番']),str(e['馬ID'])))
-                if f and f.get('騎手'):
-                    e['騎手']=f['騎手'];updated_now+=1
+                if f and _jm_rider_name(f.get('騎手')):
+                    e['騎手']=_jm_rider_name(f['騎手'])
+                    e['騎手取得元']=f.get('騎手取得元') or 'netkeiba出馬表・再取得'
+                    updated_now+=1
         except Exception as ex:
             log.append(f'{rid} 出走表騎手取得不可: {type(ex).__name__}: {str(ex)[:85]}')
     # 騎手名があっても通過順位が不足する場合は補完対象。
@@ -12101,9 +12183,23 @@ def mobile_refresh_jockey_data(races, entries, histories, target_date):
                     changed = True
                 updated_past += int(changed)
     mobile_rehydrate_jockey_from_saved(races,entries,histories)
+    # 欠損頭数を再評価し、一覧に古い「騎手名未取得」を残さない。
+    for race in races:
+        rid=str(race.get('netkeiba_race_id') or '')
+        race['jockey_missing_horses'] = [f"{e.get('馬番')}番 {e.get('馬名')}" for e in entries
+                                          if str(e.get('レースID'))==rid and not _jm_rider_name(e.get('騎手'))]
     pool=[h for race in races for h in (race.get('horses') or [])]
     for race in races:
         dirt_model(race['horses'],race.get('target_distance'),going_effective(race),race.get('race_date'),jockey_reference_horses=pool)
+    # 新たに氏名を復元できた騎手は、ウマピアのタイプ未照合をそのままにしない。
+    # 公開ページが取得不可なら中立50点を維持し、失敗理由だけ診断に残す。
+    if updated_now:
+        try:
+            jm_public_enrich(races,target_date,force_refresh=False)
+            external=st.session_state.get('jm_external_diagnostics') or {}
+            log.extend('ウマピア: '+str(x)[:125] for x in (external.get('errors') or [])[:12])
+        except Exception as ex:
+            log.append('ウマピア騎手タイプ再照合不可: '+type(ex).__name__+': '+str(ex)[:125])
     # 発走後の取得は実戦当時の根拠と見なさず、監査用に記録する。
     stats={'今回騎手取得':sum(bool(e.get('騎手')) for e in entries),'出走馬':len(entries),
            '過去走騎手取得':sum(bool(x.get('騎手')) for x in histories),'過去走':len(histories),
@@ -13267,8 +13363,8 @@ with st.expander("🏇 騎手取得・分析の診断／不足分の再取得", 
     if not saved_races:
         st.info('騎手の自動取得と乗り替わり判定には、上のスマホ直接取得で出走表・過去走を取得してください。Google DriveのExcelに騎手列がなければ補完できません。')
     else:
-        current=sum(bool(_jm_name(r.get('騎手'))) for r in entries)
-        past=sum(bool(_jm_name(r.get('騎手'))) for r in histories)
+        current=sum(bool(_jm_rider_name(r.get('騎手'))) for r in entries)
+        past=sum(bool(_jm_rider_name(r.get('騎手'))) for r in histories)
         passage=sum(bool(_jm_rider_name(r.get('騎手'))) and
                     _jm_corner(r.get('通過'),mobile_number(r.get('頭数'))) is not None for r in histories)
         all_horses=[h for race in saved_races for h in race.get('horses',[])]
@@ -13279,6 +13375,19 @@ with st.expander("🏇 騎手取得・分析の診断／不足分の再取得", 
         style_db=_jm_style_database(all_horses,target_date)
         st.write(f'今回の騎手名：**{current} / {len(entries)}頭** ｜ 過去走の騎手名：**{past} / {len(histories)}走** ｜ '
                  f'騎手名と4角位置が揃った過去走：**{passage}走** ｜ タイプ判定可能：**{len(style_db)}騎手**')
+        current_missing=[]
+        entry_index={(str(e.get('レースID')),str(e.get('馬番'))):e for e in entries}
+        for race in saved_races:
+            rid=str(race.get('netkeiba_race_id') or '')
+            for horse in race.get('horses') or []:
+                e=entry_index.get((rid,str(horse.get('horse_no'))),{})
+                if not _jm_rider_name(e.get('騎手')) and not _jm_rider_name(horse.get('jockey')):
+                    current_missing.append({"レース":race.get('race_name'),"馬番":horse.get('horse_no'),
+                                            "馬名":horse.get('name'),"状態":"出馬表の騎手名未取得",
+                                            "取得状況":e.get('騎手取得元') or '騎手欄を識別できず'})
+        if current_missing:
+            st.warning(f'今回騎手名の欠損：{len(current_missing)}頭。騎手名とレース・馬番を照合して再取得してください。')
+            st.dataframe(pd.DataFrame(current_missing),hide_index=True,use_container_width=True)
         if current<len(entries) or past<len(histories):
             st.warning('騎手データが不足しています。現在の新AIでは評価不能な騎手を中立50点として扱っています。')
         else:
@@ -13308,6 +13417,16 @@ with st.expander("🏇 騎手取得・分析の診断／不足分の再取得", 
                         stats,errors=mobile_refresh_jockey_data(saved_races,entries,histories,target_date)
                     meta=st.session_state.get('mobile_scrape_meta') or {}
                     meta.update(jockey_refresh_stats=stats,jockey_refresh_at=stats['更新日時JST'])
+                    meta['jockey_now_present']=stats['今回騎手取得']
+                    meta['jockey_now_total']=stats['出走馬']
+                    meta['jockey_past_present']=stats['過去走騎手取得']
+                    meta['jockey_past_total']=stats['過去走']
+                    # 上部の一括取得メッセージも古い78/85を表示し続けないよう再集計。
+                    previous_message=st.session_state.get('mobile_fetch_message') or ''
+                    if previous_message:
+                        st.session_state['mobile_fetch_message']=re.sub(
+                            r'騎手名\d+/\d+頭',
+                            f"騎手名{stats['今回騎手取得']}/{stats['出走馬']}頭",previous_message)
                     meta['fetched_at']=stats['更新日時JST']
                     st.session_state['mobile_scrape_meta']=meta
                     if errors:
