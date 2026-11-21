@@ -9188,10 +9188,73 @@ def _jm_rider_from_jockey_cell(value):
     return candidates[0] if len(candidates)==1 else ""
 
 
+
+# 出走表が「原」「幸」のように騎手名を1文字省略した場合でも、
+# 同じ行にある騎手プロフィールIDから正式氏名を照合する。
+# IDのない1文字だけからは騎手を推定しない。
+_JM_CONFIRMED_JOCKEY_IDS = {
+    "01184": "原優介",  # netkeiba騎手プロフィールで確認済み
+    "00732": "幸英明",  # netkeiba騎手プロフィールで確認済み
+}
+_JM_JOCKEY_ID_NAME_CACHE = {}
+
+
+def _jm_jockey_profile_name(jockey_id, displayed=""):
+    """明示的な騎手IDに対応するプロフィール氏名を取得し、表示名と突合する。"""
+    jockey_id = str(jockey_id or "")
+    if not re.fullmatch(r"\d{5,6}", jockey_id):
+        return ""
+    name = _JM_CONFIRMED_JOCKEY_IDS.get(jockey_id, "")
+    if not name:
+        if jockey_id in _JM_JOCKEY_ID_NAME_CACHE:
+            name = _JM_JOCKEY_ID_NAME_CACHE[jockey_id]
+        else:
+            # 過去の全馬は再取得せず、今回氏名が欠損した騎手だけ公式プロフィールを参照。
+            # ページ取得に失敗した場合には推測せず未取得のままとする。
+            name = ""
+            try:
+                soup = mobile_get_soup(f"https://db.netkeiba.com/jockey/{jockey_id}/", tries=1)
+                for node in soup.select(".db_head_name h1, .db_head_name h2, h1"):
+                    raw = unicodedata.normalize("NFKC",node.get_text(" ",strip=True))
+                    raw = re.split(r"[（(]",raw, maxsplit=1)[0].strip()
+                    raw = re.sub(r"\s+", "", raw)
+                    candidate = _jm_rider_name(raw)
+                    if candidate:
+                        name = candidate
+                        break
+            except Exception:
+                pass
+            if name:
+                _JM_JOCKEY_ID_NAME_CACHE[jockey_id] = name
+    if not name:
+        return ""
+    # 出走表の短縮名を確認。無関係なプロフィールIDを組み合わせない。
+    disp = unicodedata.normalize("NFKC",str(displayed or "")).strip()
+    disp = re.sub(r"^[☆▲△◇★◎○]+", "", disp)
+    disp = re.sub(r"\s*\(?\d{2}\.\d\)?\s*$", "", disp).strip()
+    disp = re.sub(r"\s+", "", disp)
+    if disp and not (name == disp or (len(disp) == 1 and name.startswith(disp))):
+        return ""
+    return name
+
+
+def _jm_jockey_id_from_href(href):
+    """出走表の騎手プロフィールへのURLから騎手IDだけ抽出する。"""
+    href = html.unescape(str(href or ""))
+    match = re.search(r"/jockey/(?:result/recent/)?(\d{5,6})(?:/|[?#]|$)", href)
+    if not match:
+        match = re.search(r"(?:[?&]|^)jockey_id=(\d{5,6})(?:[&#]|$)", href)
+    return match.group(1) if match else ""
+
+
 def mobile_jockey_from_shutuba_row(tr, jockey_column_index=None, header_column_count=None):
     """出馬表1行の明示された騎手列・リンクだけを使用する。馬番や馬名からは推測しない。"""
     # 最も強い根拠は騎手プロフィールへのリンク。名前と斤量の混在にも対応。
     links = tr.select('a[href*="/jockey/"], a[href*="jockey_id="]')
+    # 複数の異なる騎手IDを含む行では、セルの文字を連結して誤認しない。
+    ids_in_row={jid for a in links if (jid := _jm_jockey_id_from_href(a.get("href", "")))}
+    if len(ids_in_row)>1:
+        return "", "騎手リンクID複数・要確認"
     candidates = []
     for a in links:
         for val in (a.get_text(" ", strip=True), a.get('title'), a.get('aria-label')):
@@ -9219,7 +9282,25 @@ def mobile_jockey_from_shutuba_row(tr, jockey_column_index=None, header_column_c
         return candidates[0], "騎手専用セル"
     if len(candidates)>1:
         return "", "騎手専用セルの名前が複数・要確認"
-    return "", "騎手欄から氏名を識別できません"
+
+    # 出走表では漢字1文字姓が「原」「幸」に省略されることがある。
+    # 氏名の長さ制限を緩めず、同行の騎手URLのIDから本人を確認する。
+    jockey_links = []
+    for anchor in links:
+        jid = _jm_jockey_id_from_href(anchor.get("href", ""))
+        if jid:
+            jockey_links.append((jid,anchor.get_text(" ",strip=True)))
+    unique_ids = {jid for jid,_ in jockey_links}
+    if len(unique_ids)==1:
+        jid = next(iter(unique_ids))
+        visible = next((t for i,t in jockey_links if i==jid and t.strip()), "")
+        verified = _jm_jockey_profile_name(jid,visible)
+        if verified:
+            return verified, f"騎手ID照合({jid})"
+        return "", f"騎手ID{jid}の氏名検証不可"
+    if len(unique_ids)>1:
+        return "", "騎手リンクID複数・要確認"
+    return "", "騎手欄から氏名を識別できません（騎手IDなし）"
 
 
 def _jm_corner(value, field):
@@ -11391,7 +11472,7 @@ def calculate_ai_indices(horses_data):
 
 
 # --- GitHub Private repository persistence ---
-APP_VERSION = "dual-model-5.6-jockey-name-recovery-20261121"
+APP_VERSION = "dual-model-5.7-jockey-id-recovery-20261121"
 
 def score_old_model(horses):
     data = []
