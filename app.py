@@ -10042,6 +10042,30 @@ def jm_public_umapia_index(soup):
     return found
 
 
+def jm_public_match_rider_id(name, index):
+    """ウマピアの正式氏名と出走表の短縮表記を安全に照合する。
+
+    完全一致を優先し、短縮表記は候補が一人だけの場合のみ採用。
+    イニシャル付き外国人騎手は同じイニシャルでのみ照合する。
+    """
+    short = _jm_rider_name(name)
+    if not short:
+        return None
+    if short in index:
+        return index[short]
+    candidates = []
+    for full, rider_id in index.items():
+        full = _jm_rider_name(full)
+        if not full or not rider_id:
+            continue
+        # 「佐々木」→「佐々木大輔」、「戸崎圭」→「戸崎圭太」等。
+        # 先頭一致かつ短縮表記が2文字以上の場合だけ許容。
+        if len(short) >= 2 and full.startswith(short) and len(full) > len(short):
+            candidates.append(rider_id)
+    unique = set(candidates)
+    return next(iter(unique)) if len(unique) == 1 else None
+
+
 def jm_public_umapia_rides(soup, name):
     """騎手別成績の見出しを照合し、通過順位を別の数値欄から推定しない。"""
     aliases = {
@@ -10212,7 +10236,7 @@ def jm_public_enrich(races, target_date, selected_rid=None, max_riders=JM_PUBLIC
     # 年度一覧はその年の騎乗者のみを掲載することがある。
     # 当年一覧にない騎手は過年度の公式公開一覧でも氏名の完全一致を確認する。
     # IDは実際の騎手リンクからのみ取得し、名前や年から推測しない。
-    unresolved=[nm for nm in requested if nm not in index]
+    unresolved=[nm for nm in requested if jm_public_match_rider_id(nm,index) is None]
     if unresolved:
         for previous_year in (target_date.year-1, target_date.year-2, target_date.year-3):
             try:
@@ -10223,11 +10247,12 @@ def jm_public_enrich(races, target_date, selected_rid=None, max_riders=JM_PUBLIC
             for nm in unresolved:
                 if nm in older:
                     index.setdefault(nm,older[nm])
-            unresolved=[nm for nm in unresolved if nm not in index]
+            unresolved=[nm for nm in unresolved if jm_public_match_rider_id(nm,index) is None]
             if not unresolved:
                 break
-    available=[(nm,index[nm]) for nm in requested if nm in index]
-    absent=[nm for nm in requested if nm not in index]
+    resolved_ids={nm:jm_public_match_rider_id(nm,index) for nm in requested}
+    available=[(nm,resolved_ids[nm]) for nm in requested if resolved_ids[nm]]
+    absent=[nm for nm in requested if not resolved_ids[nm]]
     if absent:
         errors.append('騎手ID未照合（一覧の不足・表記差など）: '+','.join(absent[:14]))
     def retrieve(item):
@@ -10246,7 +10271,7 @@ def jm_public_enrich(races, target_date, selected_rid=None, max_riders=JM_PUBLIC
             if not prior:
                 errors.append(nm+': 開催日前の有効な4角位置が0件')
                 continue
-            fresh={'rides':prior,'jockey_id':index[nm],
+            fresh={'rides':prior,'jockey_id':resolved_ids[nm],
                    'source':'ウマピア騎手詳細','fetched_at':datetime.datetime.now(TRIO_JST).isoformat()}
             prev_style=_jm_umapia_profile_style(profiles.get(nm),target_date)
             fresh_style=_jm_umapia_profile_style(fresh,target_date)
