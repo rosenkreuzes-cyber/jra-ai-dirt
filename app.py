@@ -10053,6 +10053,14 @@ def jm_public_match_rider_id(name, index):
         return None
     if short in index:
         return index[short]
+    # 公開個別ページで正式氏名・IDを確認済みの略称のみ明示対応。
+    # 一覧の表記が変わっても、別騎手への曖昧な前方一致を避ける。
+    confirmed_aliases = {'鮫島駿': ('鮫島克駿', '1157')}
+    if short in confirmed_aliases:
+        full, verified_id = confirmed_aliases[short]
+        if full in index and str(index[full]) != verified_id:
+            return None  # 同じ正式氏名で異なるIDがあれば採用しない
+        return verified_id
     candidates = []
     for full, rider_id in index.items():
         full = _jm_rider_name(full)
@@ -13475,10 +13483,12 @@ with st.expander("🏇 ウマピア｜騎手タイプの照合・再取得", exp
         public_rid=st.selectbox('騎手情報を補完するレース',list(available_races),
              format_func=lambda rid:available_races[rid].get('race_name') or rid,
              key='public_jockey_selected_race')
-        if st.button('このレースのウマピア騎手タイプを再取得',key='public_jockey_fetch',use_container_width=True):
+        if st.button('当日全レースのウマピア騎手タイプを再取得',key='public_jockey_fetch',use_container_width=True):
             try:
+                # 選択中のレースだけでなく、同日全ダートレースの騎手を補完する。
+                # 取得したプロフィールは開催日別に保持し、全レースの採点を更新。
                 report=jm_public_enrich(public_races,available_races[public_rid].get('race_date'),
-                                        selected_rid=public_rid,force_refresh=True)
+                                        selected_rid=None,force_refresh=True)
                 try:
                     mobile_save_github()
                 except Exception as exc:
