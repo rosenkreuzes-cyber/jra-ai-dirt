@@ -10209,6 +10209,23 @@ def jm_public_enrich(races, target_date, selected_rid=None, max_riders=JM_PUBLIC
             known_ids[_jm_name(nm)]=rid
     for nm,rid in known_ids.items():
         index.setdefault(nm,rid)
+    # 年度一覧はその年の騎乗者のみを掲載することがある。
+    # 当年一覧にない騎手は過年度の公式公開一覧でも氏名の完全一致を確認する。
+    # IDは実際の騎手リンクからのみ取得し、名前や年から推測しない。
+    unresolved=[nm for nm in requested if nm not in index]
+    if unresolved:
+        for previous_year in (target_date.year-1, target_date.year-2, target_date.year-3):
+            try:
+                older=jm_public_index_cached(previous_year)
+            except Exception as exc:
+                errors.append(f'ウマピア{previous_year}年一覧: '+str(exc)[:110])
+                continue
+            for nm in unresolved:
+                if nm in older:
+                    index.setdefault(nm,older[nm])
+            unresolved=[nm for nm in unresolved if nm not in index]
+            if not unresolved:
+                break
     available=[(nm,index[nm]) for nm in requested if nm in index]
     absent=[nm for nm in requested if nm not in index]
     if absent:
