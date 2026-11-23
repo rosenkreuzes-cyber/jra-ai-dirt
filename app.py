@@ -49,7 +49,6 @@ st.title("🏇 JRA 黄金パターン AI ダッシュボード【年次補正時
 with st.sidebar:
     st.header("⚙️ 設定")
     min_coverage = st.slider("最低過去走データ保有率 (%)", 50, 100, 75, 5)
-    min_gap = st.slider("上位4頭と5位の最低指数差（※旧AIのみ適用）", 0.0, 20.0, 3.0, 0.5)
     min_confidence = st.slider("推奨最低評価点（的中確率ではありません）", 40, 95, 90, 5)
     max_recommendations = st.slider("1日あたりの指数候補表示上限（購入数ではありません）", 1, 5, 5)
     min_top_history = st.slider("上位4頭の最低過去走数", 1, 4, 4)
@@ -11596,7 +11595,7 @@ def choose_dual(day):
     return selected[:max_recommendations], excluded
 
 
-# 旧AI用スクリーニング（指数差ギャップチェックあり）
+# 旧AI用スクリーニング（断層は表示のみ・判定不使用）
 def screen_scored_race_old(race, df):
     if not race.get("identified", True):
         return None, "レース識別不可", df
@@ -11621,13 +11620,11 @@ def screen_scored_race_old(race, df):
     if top_dirt < min_top_dirt:
         return None, "上位4頭のダート経験不足", df
     gap = float(df.iloc[3]["ai_score"] - df.iloc[4]["ai_score"])
-    if gap < min_gap:
-        return None, f"指数差不足 ({gap:.1f})", df
     avg_runs = float(top["history_count"].mean())
     quality = min(100., .25 * coverage + .20 * dirt_coverage +
                   .20 * min(100., avg_runs / 4 * 100) +
                   .15 * (top_dirt / 4 * 100) +
-                  .20 * min(100., gap / 12 * 100))
+                  0.0) / 0.80  # 断層を評価から除外し、残り4項目を100点換算
     if quality < min_confidence:
         return None, f"評価点不足 ({quality:.0f})", df
     return {"score": round(quality), "gap": round(gap, 1), "coverage": round(coverage),
@@ -12448,7 +12445,7 @@ if st.session_state.get("mobile_scraped_races"):
             f"過去走{len(st.session_state.get('mobile_histories', []))}件）。"
             "条件変更・Drive更新でも保持します。")
 
-settings = {"min_coverage": min_coverage, "min_gap": min_gap,
+settings = {"min_coverage": min_coverage,
     "min_confidence": min_confidence, "max_recommendations": max_recommendations,
     "min_top_history": min_top_history, "min_top_dirt": min_top_dirt}
 
@@ -14151,107 +14148,5 @@ with t4:
                 st.dataframe(pd.DataFrame(paired_stats), hide_index=True, use_container_width=True)
             st.markdown("**保存履歴の明細**")
             st.dataframe(df_hist.drop(columns=["レースID"]), hide_index=True, use_container_width=True)
-            st.info("新AIの過去成績が0件でも、結果確定後に再計算した予想を過去の確定予想として補完しません。")
     except Exception as e:
         st.error("長期成績の取得に失敗: " + str(e))
-
-    with st.expander("🧪 新AIの事後検証成績（正式成績とは別）"):
-        try:
-            retro_rows = []
-            for folder in github_list_directories("retrospective"):
-                for path in list_files(folder):
-                    if not path.endswith(".json"):
-                        continue
-                    retro, _ = get_record(path)
-                    if not retro or retro.get("classification") != "事後検証":
-                        continue
-                    rid = retro.get("race_id")
-                    result = results.get(rid)
-                    top4 = retro.get("top4", [])
-                    if len(top4) != 4:
-                        continue
-                    hit, stake, paid = outcome({"top4": top4, "bet_unit": retro.get("bet_unit", 100)}, result) if result else (None,None,None)
-                    retro_rows.append({"レース": retro.get("race_name"), "日付": retro.get("race_date"),
-                        "新AI推奨4頭": ",".join(map(str,top4)), "状態": "未登録" if result is None else ("的中" if hit else "不的中"),
-                        "投資額": stake, "払戻額": paid})
-            if retro_rows:
-                df_retro = pd.DataFrame(retro_rows)
-                st.dataframe(df_retro, hide_index=True, use_container_width=True)
-                completed = df_retro[df_retro["状態"].isin(["的中","不的中"])]
-                if not completed.empty:
-                    stake_total = int(completed["投資額"].sum()); paid_total = int(completed["払戻額"].sum())
-                    st.write(f"事後検証：{len(completed)}件 / 的中率 {(completed['状態']=='的中').mean()*100:.1f}% / 回収率 {paid_total/stake_total*100:.1f}%" if stake_total else "投資額なし")
-            else:
-                st.info("事後検証の保存履歴はまだありません。")
-        except Exception as exc:
-            st.warning("事後検証履歴を取得できません: " + str(exc))
-
-    with st.expander("🧹 10月17日・18日の結果だけリセット（予想は保護）"):
-        st.warning("対象は2026-10-17（土）と2026-10-18（日）の確定結果のみです。旧AIの確定予想と新AIの保存予想は変更しません。")
-        st.caption("実行前に結果JSONをGitHubの backups/ に複製します。予想履歴の重複は自動削除しません。")
-        if st.button("対象結果と重複予想を確認", key="preview_oct_reset"):
-            try:
-                current_results = []
-                for folder in github_list_directories("results"):
-                    for path in list_files(folder):
-                        rec, _ = get_record(path)
-                        if rec and rec.get("race_date") in RESET_DATES:
-                            current_results.append({"日付": rec["race_date"], "レース": rec.get("race_id"), "結果保存先": path})
-                st.session_state["oct_reset_preview"] = current_results
-                st.session_state["oct_prediction_preview"] = inspect_duplicate_predictions()
-            except Exception as exc:
-                st.error("事前確認失敗: " + str(exc))
-        if "oct_reset_preview" in st.session_state:
-            preview = st.session_state["oct_reset_preview"]
-            st.write(f"リセット対象の結果ファイル: {len(preview)}件")
-            if preview:
-                st.dataframe(pd.DataFrame(preview), hide_index=True)
-            predictions_preview = st.session_state.get("oct_prediction_preview", [])
-            if predictions_preview:
-                df_dup = pd.DataFrame(predictions_preview)
-                dup = df_dup[df_dup.duplicated("レースID", keep=False)].sort_values("レースID")
-                st.write(f"予想履歴の重複候補: {len(dup)}ファイル（削除しません）")
-                if not dup.empty:
-                    st.dataframe(dup, hide_index=True)
-            st.warning("開催日・芝ダートの履歴照合が未完了のため、結果削除は安全ロック中です。予想履歴は保持されます。")
-            phrase = st.text_input("実行確認：『結果だけリセット』と入力", key="oct_reset_phrase")
-            if st.button("バックアップ後、対象結果をリセット", key="oct_reset_execute", disabled=True):
-                # Safety lock: must audit historical race/date mappings before destructive reset.
-                try:
-                    deleted, backup = reset_results_with_backup()
-                    st.success(f"結果 {len(deleted)}件をリセットしました。バックアップ先: {backup}")
-                    st.session_state.pop("oct_reset_preview", None)
-                    st.session_state.pop("oct_prediction_preview", None)
-                    st.rerun()
-                except Exception as exc:
-                    st.error("処理を停止しました。GitHubの backups/ と results/ を確認してください: " + str(exc))
-
-    with st.expander("🗑️ 予想履歴を手動削除（GitHub）"):
-        st.warning("削除すると予想履歴が消えます。結果登録データは削除しません。")
-        target_date = st.date_input("削除対象日", value=datetime.date(2026,10,19), key="delete_date")
-        if st.button("削除候補を取得", key="load_delete"):
-            try:
-                st.session_state["delete_candidates"] = list_prediction_files_for_date(target_date.isoformat())
-                st.session_state["delete_date_loaded"] = target_date.isoformat()
-            except Exception as e:
-                st.error(str(e))
-        candidates = st.session_state.get("delete_candidates", []) if st.session_state.get("delete_date_loaded") == target_date.isoformat() else []
-        selected = []
-        for item in candidates:
-            rec = item["record"]
-            if st.checkbox(f"{rec.get('race_date')} {rec.get('race_name')} / {item['path']}", key="del_"+item["path"]):
-                selected.append(item)
-        st.caption(f"選択中：{len(selected)}件")
-        confirm = st.text_input("削除する場合は『削除』と入力", key="delete_confirm")
-        if st.button("選択した予想履歴を削除", disabled=not selected or confirm != "削除", key="delete_now"):
-            success = 0
-            for item in selected:
-                try:
-                    rec = item["record"]
-                    delete_record_safely(item["path"], rec["race_id"], rec["race_date"])
-                    success += 1
-                except Exception as e:
-                    st.error(f"{item['path']}: {e}")
-            st.success(f"{success}件を削除しました")
-            st.session_state.pop("delete_candidates", None)
-            st.rerun()
