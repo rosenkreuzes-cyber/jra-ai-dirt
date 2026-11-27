@@ -10321,7 +10321,7 @@ def jm_public_enrich(races, target_date, selected_rid=None, max_riders=JM_PUBLIC
     return report
 
 
-def mobile_race_list(soup, target_date, min_race=6, max_race=12):
+def mobile_race_list(soup, target_date, min_race=1, max_race=12):
     """リンクだけでなく、ページ内JSON・埋込データのレースIDも検索。"""
     source = str(soup)
     ids = re.findall(r"(?:race_id(?:=|[\\\"': ]+)|[\\\"'])(20\d{10})(?:[\\\"'&]|$)", source)
@@ -10369,7 +10369,7 @@ def mobile_schedule_venues(target_date, session):
 
 # 取得エンジンの稼働版を画面・診断・バックアップへ表示する。
 # 旧版か新版か区別できない状態での調査を防ぐ。
-MOBILE_FETCH_BUILD = "2026-11-08-verified-id-v3"
+MOBILE_FETCH_BUILD = "2026-11-28-all-races-v4"
 
 # この2開催日はJRA公式の開催情報および実在する出走表IDを照合済み。
 # 対象日以外に適用しない。候補生成後も個別出走表側の開催日を検証する。
@@ -10379,7 +10379,7 @@ MOBILE_CONFIRMED_SESSIONS = {
 }
 
 
-def mobile_discover_race_ids(target_date, session, min_race=6, max_race=12):
+def mobile_discover_race_ids(target_date, session, min_race=1, max_race=12):
     """取得一覧が空でも、確認済み開催日のID探索を妨げない。
 
     重要: 2026/11/08の確定開催IDはnetkeiba一覧ページより先に生成する。
@@ -10389,7 +10389,7 @@ def mobile_discover_race_ids(target_date, session, min_race=6, max_race=12):
     log = [f"取得エンジン={MOBILE_FETCH_BUILD}"]
     sessions = MOBILE_CONFIRMED_SESSIONS.get(target_date)
 
-    # この分岐はネットワーク通信が失敗しても必ず候補21件（3場 x 7R）を返す。
+    # この分岐はネットワーク通信が失敗しても必ず候補36件（3場 x 12R）を返す。
     if sessions:
         result = []
         for venue, kai, day in sessions:
@@ -11311,7 +11311,7 @@ def mobile_repair_race_histories(target_date, race_id, force_all=False):
                                    if h.get('year_clock_time_score') is None]
     return result
 
-def mobile_fetch_date(target_date, min_race=6, max_race=12):
+def mobile_fetch_date(target_date, min_race=1, max_race=12):
     """レース一覧・出走表・過去成績を取得して、アプリ既存形式に変換。"""
     import concurrent.futures
     session = mobile_browser_session()
